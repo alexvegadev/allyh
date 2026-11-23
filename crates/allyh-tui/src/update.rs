@@ -189,6 +189,7 @@ fn build_updater(config: &UpdateConfig, install_mode: bool) -> Result<github::As
         .show_download_progress(install_mode && config.show_progress)
         .no_confirm(config.no_confirm)
         .check_install_path_writable(install_mode)
+        .verify_release_digest(true)
         .timeout(REQUEST_TIMEOUT)
         .retries(REQUEST_RETRIES);
 

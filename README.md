@@ -54,7 +54,23 @@ AllyH is a lightweight, out-of-tree operating system around [`rig-core`](https:/
 
 ## Quick Start
 
-### Prerequisites
+### Install Prebuilt Binary
+
+**Linux / macOS:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/alexvegadev/allyh/main/scripts/install.sh | sh
+```
+
+**Windows (PowerShell):**
+
+```powershell
+irm https://raw.githubusercontent.com/alexvegadev/allyh/main/scripts/install.ps1 | iex
+```
+
+Both installers automatically detect your platform, verify the `SHA256SUMS` digest from the GitHub Release, and install the `allyh` binary (`~/.local/bin` on Linux/macOS, `%LOCALAPPDATA%\allyh\bin` on Windows). You can override the version or destination with `ALLYH_VERSION` (e.g. `v0.2.0`) and `ALLYH_INSTALL_DIR`.
+
+### Prerequisites (Building from Source)
 
 - Supported platforms: **Linux**, **macOS**, and **Windows**
 - Rust toolchain (Edition 2024 / Cargo) and a C compiler for bundled `libgit2` / `tree-sitter` crates
