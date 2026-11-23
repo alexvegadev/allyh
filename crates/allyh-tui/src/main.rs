@@ -3,6 +3,7 @@ mod cli;
 mod highlight;
 mod theme;
 mod ui;
+mod update;
 
 use std::io;
 
@@ -22,7 +23,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use crate::app::{AppState, FocusPane};
-use crate::cli::CliArgs;
+use crate::cli::{CliArgs, CliCommand};
 use crate::highlight::MarkdownHighlighter;
 
 fn restore_terminal_state() {
@@ -80,6 +81,10 @@ async fn main() -> Result<()> {
         .init();
 
     let args = CliArgs::parse();
+
+    if let Some(CliCommand::Update(update_args)) = args.command {
+        return update::run_cli(update_args).await;
+    }
 
     let mut cfg = OrchestratorConfig::new(&args.repo);
     cfg.scope_id = args.scope.clone();

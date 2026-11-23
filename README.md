@@ -74,6 +74,20 @@ cargo run -p allyh-tui -- \
   --worker-model local:qwen2.5-coder-9b@http://localhost:9931/v1
 ```
 
+### Self-Update
+
+AllyH supports in-place updates from GitHub Releases via the `update` subcommand:
+
+```bash
+# Check whether a newer release is available without installing
+allyh update --check
+
+# Download and install the latest release (pass --yes to skip prompts, --tag <TAG> for a specific release)
+allyh update
+```
+
+Set `GH_TOKEN` / `GITHUB_TOKEN` (or pass `--token`) to avoid unauthenticated GitHub API rate limits or update from a private repository.
+
 ### Configuration
 
 #### CLI Options
