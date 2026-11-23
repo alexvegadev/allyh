@@ -1,0 +1,28 @@
+[package]
+name = "allyh-tui"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "allyh"
+path = "src/main.rs"
+
+[dependencies]
+tokio.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }
+crossterm.workspace = true
+tui-textarea.workspace = true
+syntect.workspace = true
+
+allyh-memory.workspace = true
+allyh-env.workspace = true
+allyh-tools.workspace = true
+allyh-core.workspace = true

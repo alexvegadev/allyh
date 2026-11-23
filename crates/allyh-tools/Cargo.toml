@@ -1,0 +1,23 @@
+[package]
+name = "allyh-tools"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+sha2.workspace = true
+hex.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+rig-core.workspace = true
+
+allyh-memory.workspace = true
+allyh-env.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

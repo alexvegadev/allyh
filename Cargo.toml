@@ -1,0 +1,63 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/allyh-memory",
+    "crates/allyh-env",
+    "crates/allyh-tools",
+    "crates/allyh-core",
+    "crates/allyh-tui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["AllyH Contributors"]
+
+[workspace.dependencies]
+# Core async & serialization
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+sha2 = "0.10"
+hex = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+anyhow = "1"
+dirs = "6"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+async-trait = "0.1"
+tempfile = "3"
+
+# AI & Memory stack
+rig-core = "0.46"
+rig-lancedb = "0.46"
+lancedb = "0.30"
+arrow-array = "58"
+arrow-schema = "58"
+
+# Environment & Code Analysis
+notify = "8"
+git2 = { version = "0.20", default-features = false }
+tree-sitter = "0.25"
+tree-sitter-rust = "0.24"
+walkdir = "2"
+similar = "2"
+
+# TUI
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+tui-textarea = "0.7"
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+clap = { version = "4", features = ["derive", "env"] }
+
+# Internal workspace crates
+allyh-memory = { path = "crates/allyh-memory" }
+allyh-env = { path = "crates/allyh-env" }
+allyh-tools = { path = "crates/allyh-tools" }
+allyh-core = { path = "crates/allyh-core" }

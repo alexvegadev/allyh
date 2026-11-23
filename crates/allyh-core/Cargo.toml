@@ -1,0 +1,26 @@
+[package]
+name = "allyh-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+reqwest.workspace = true
+rig-core.workspace = true
+rig-lancedb.workspace = true
+
+allyh-memory.workspace = true
+allyh-env.workspace = true
+allyh-tools.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+git2.workspace = true
