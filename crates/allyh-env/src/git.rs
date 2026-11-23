@@ -4,6 +4,7 @@ use git2::{DiffOptions, Repository, StatusOptions};
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
+use crate::path::{canonicalize_normalized, path_to_slash_string, strip_root_prefix, strip_verbatim_prefix};
 
 /// Snapshot of a repository's current Git state.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -26,7 +27,7 @@ pub struct GitTracker {
 impl GitTracker {
     pub fn new(repo_root: impl Into<PathBuf>) -> Self {
         Self {
-            repo_root: repo_root.into(),
+            repo_root: strip_verbatim_prefix(&repo_root.into()),
         }
     }
 
@@ -40,9 +41,8 @@ impl GitTracker {
         {
             return url.trim().to_string();
         }
-        let canonical = std::fs::canonicalize(&self.repo_root)
-            .unwrap_or_else(|_| self.repo_root.clone());
-        canonical.to_string_lossy().replace('\\', "/")
+        let canonical = canonicalize_normalized(&self.repo_root);
+        path_to_slash_string(&canonical)
     }
 
     /// Inspect the current Git repository state. Non-git workspaces return a clean fallback.
@@ -166,7 +166,7 @@ impl GitTracker {
 
     /// Normalize a path relative to the repository root using forward slashes.
     pub fn relative_path(&self, path: &Path) -> Option<String> {
-        let rel = path.strip_prefix(&self.repo_root).ok()?;
-        Some(rel.to_string_lossy().replace('\\', "/"))
+        let canonical_root = canonicalize_normalized(&self.repo_root);
+        strip_root_prefix(path, &self.repo_root, &canonical_root)
     }
 }

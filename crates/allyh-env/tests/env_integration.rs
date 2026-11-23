@@ -101,3 +101,62 @@ async fn test_out_of_band_edit_detection_and_reindexing() {
     assert!(!ego.center_definitions.is_empty());
     assert!(ego.hop1_neighbors.iter().any(|e| e.to_symbol == "alpha"));
 }
+
+#[tokio::test]
+async fn test_cross_platform_safe_path_and_verbatim_normalization() {
+    use std::path::Path;
+    use allyh_env::{EnvError, strip_verbatim_prefix};
+
+    assert_eq!(
+        strip_verbatim_prefix(Path::new(r"\\?\C:\Users\demo\repo")),
+        Path::new(r"C:\Users\demo\repo")
+    );
+    assert_eq!(
+        strip_verbatim_prefix(Path::new(r"\\?\UNC\server\share\repo")),
+        Path::new(r"\\server\share\repo")
+    );
+
+    let tmp = TempDir::new().expect("tmp");
+    let repo_dir = tmp.path().join("repo");
+    let db_dir = tmp.path().join("db");
+    std::fs::create_dir_all(repo_dir.join("src")).expect("mkdir");
+
+    let store = MemoryStore::connect(
+        StorageConfig::from_local_path(&db_dir),
+        Arc::new(DeterministicHashEmbedder),
+    )
+    .await
+    .expect("connect");
+
+    let monitor = EnvironmentMonitor::new(
+        &repo_dir,
+        compute_repo_id(&repo_dir.to_string_lossy()),
+        DEFAULT_SCOPE_ID,
+        store,
+    );
+
+    // Valid relative paths with forward slashes, backslashes, `./`, or `..` in filename
+    let (rel1, _) = monitor.resolve_safe_path(r".\src\foo..bar.rs").expect("valid path");
+    assert_eq!(rel1, "src/foo..bar.rs");
+
+    let (rel2, _) = monitor.resolve_safe_path("src/./lib.rs").expect("valid curdir");
+    assert_eq!(rel2, "src/lib.rs");
+
+    // Cross-platform path escapes must all be rejected
+    for bad in [
+        "../outside.rs",
+        "src/../../outside.rs",
+        "/etc/passwd",
+        r"\Windows\System32",
+        r"C:\Windows\System32",
+        "C:relative_escape.rs",
+        "C:/escape.rs",
+        "",
+        ".",
+    ] {
+        assert!(
+            matches!(monitor.resolve_safe_path(bad), Err(EnvError::PathEscape(_))),
+            "expected PathEscape for `{bad}`"
+        );
+    }
+}

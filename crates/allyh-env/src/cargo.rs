@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
 use crate::error::{EnvError, Result};
+use crate::path::strip_verbatim_prefix;
 
 /// Verification mode supported by [`CargoRunner`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,7 +119,7 @@ pub struct CargoRunner {
 impl CargoRunner {
     pub fn new(repo_root: impl Into<PathBuf>) -> Self {
         Self {
-            repo_root: repo_root.into(),
+            repo_root: strip_verbatim_prefix(&repo_root.into()),
         }
     }
 
@@ -156,7 +157,10 @@ impl CargoRunner {
             args.push(pkg.trim().to_string());
         }
 
-        let output = Command::new("cargo")
+        let cargo_bin = std::env::var_os("CARGO")
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| std::ffi::OsString::from("cargo"));
+        let output = Command::new(cargo_bin)
             .args(&args)
             .current_dir(&self.repo_root)
             .output()

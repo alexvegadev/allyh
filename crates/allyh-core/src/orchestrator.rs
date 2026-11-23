@@ -700,9 +700,9 @@ impl AllyHOrchestrator {
                     },
                     UserCommand::PinMemory(id) => {
                         let pinned = self.toggle_pin_memory(&id);
+                        let short_id: String = id.chars().take(8).collect();
                         let _ = ui_tx.send(UiEvent::SystemNotice(format!(
-                            "Memory `{}` {}",
-                            &id[..id.len().min(8)],
+                            "Memory `{short_id}` {}",
                             if pinned { "pinned" } else { "unpinned" }
                         )));
                         if let Ok(snap) = self.inspector_snapshot().await {
@@ -714,12 +714,12 @@ impl AllyHOrchestrator {
                         reason,
                     } => match self.invalidate_memory(&decision_id).await {
                         Ok(n) => {
+                            let short_id: String = decision_id.chars().take(8).collect();
                             let suffix = reason
                                 .map(|r| format!(" ({r})"))
                                 .unwrap_or_default();
                             let _ = ui_tx.send(UiEvent::SystemNotice(format!(
-                                "Logically invalidated {n} memory record(s) for `{}`{suffix}",
-                                &decision_id[..decision_id.len().min(8)]
+                                "Logically invalidated {n} memory record(s) for `{short_id}`{suffix}"
                             )));
                             if let Ok(snap) = self.inspector_snapshot().await {
                                 let _ = ui_tx.send(UiEvent::InspectorUpdated(snap));

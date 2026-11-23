@@ -1,5 +1,5 @@
 //! AllyH out-of-tree LanceDB memory engine:
-//! - Configurable local disk (`~/.local/share/allyh/db`) or shared object store (`s3://...`) URI
+//! - Configurable OS-native local disk directory or shared object store (`s3://...`) URI
 //! - Apache Arrow schemas for `sessions`, `architectural_decisions`, `tasks`, and `code_graph_snapshots`
 //! - Hybrid vector + BM25 FTS search partitioned by `repo_id` and `scope_id`
 //! - Write-gated bi-temporal conflict consolidator (`ADD` / `UPDATE` / `INVALIDATE` / `NOOP`)
@@ -12,7 +12,9 @@ pub mod error;
 pub mod schema;
 pub mod store;
 
-pub use config::{DEFAULT_SCOPE_ID, StorageBackendKind, StorageConfig, compute_repo_id};
+pub use config::{
+    DEFAULT_SCOPE_ID, StorageBackendKind, StorageConfig, compute_repo_id, expand_local_uri,
+};
 pub use consolidator::{
     CandidateDecision, ConflictJudge, ConsolidationAction, ConsolidationOutcome,
     HeuristicConflictJudge, MemoryConsolidator, SleepJob, SleepTimeWorkerHandle, WorkerStatus,

@@ -101,3 +101,61 @@ async fn test_aci_write_gate_and_stale_hash_rejection() {
     assert_ne!(ok.new_sha256, initial_hash);
     assert!(ok.diff_summary.contains("world"));
 }
+
+#[tokio::test]
+async fn test_edit_by_hash_preserves_windows_crlf_with_lf_snippets() {
+    let tmp = TempDir::new().expect("tmp");
+    let repo_dir = tmp.path().join("repo");
+    let db_dir = tmp.path().join("db");
+    std::fs::create_dir_all(repo_dir.join("src")).expect("mkdir");
+    let lib_path = repo_dir.join("src").join("lib.rs");
+    std::fs::write(&lib_path, "pub fn a() -> i32 {\r\n    1\r\n}\r\n").expect("write crlf");
+
+    let store = MemoryStore::connect(
+        StorageConfig::from_local_path(&db_dir),
+        Arc::new(DeterministicHashEmbedder),
+    )
+    .await
+    .expect("connect");
+
+    let env = Arc::new(EnvironmentMonitor::new(
+        &repo_dir,
+        compute_repo_id(&repo_dir.to_string_lossy()),
+        DEFAULT_SCOPE_ID,
+        store.clone(),
+    ));
+    env.sync_and_collect_delta(1, false).await.expect("sync");
+
+    let writes_enabled = Arc::new(AtomicBool::new(true));
+    let toolset = AciToolset::new(env, store, writes_enabled, false);
+
+    let inspected = toolset
+        .inspect_tool()
+        .execute(InspectSymbolArgs {
+            query: "a".into(),
+            hops: Some(1),
+            start_line: None,
+            end_line: None,
+        })
+        .await
+        .expect("inspect");
+    let hash = inspected.matched_files[0].sha256_hash.clone();
+
+    // Model sends LF-only target/replacement snippets for a CRLF file on disk
+    toolset
+        .edit_tool()
+        .execute(EditByHashArgs {
+            file_path: "src/lib.rs".into(),
+            expected_sha256: Some(hash),
+            target_snippet: Some("pub fn a() -> i32 {\n    1\n}".into()),
+            replacement_snippet: Some("pub fn a() -> i32 {\n    2\n}".into()),
+            full_content: None,
+            create_if_missing: None,
+            cargo_package: None,
+        })
+        .await
+        .expect("crlf edit should succeed");
+
+    let updated = std::fs::read_to_string(&lib_path).expect("read updated");
+    assert_eq!(updated, "pub fn a() -> i32 {\r\n    2\r\n}\r\n");
+}

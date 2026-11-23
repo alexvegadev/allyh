@@ -221,3 +221,34 @@ async fn test_lancedb_bitemporal_isolation_and_task_gate() {
     assert_eq!(report.tasks_count, 1);
     assert_eq!(report.code_snapshots_count, 1);
 }
+
+#[test]
+fn test_cross_platform_uri_expansion_and_repo_id_normalization() {
+    use allyh_memory::expand_local_uri;
+
+    // Remote URIs stay untouched
+    assert_eq!(
+        expand_local_uri("s3://allyh-bucket/shared-db"),
+        "s3://allyh-bucket/shared-db"
+    );
+
+    // Tilde expansion resolves against home directory with both `/` and `\`
+    if let Some(home) = dirs::home_dir() {
+        let expected = home.join("allyh").join("db").to_string_lossy().into_owned();
+        assert_eq!(expand_local_uri("~/allyh/db"), expected);
+        assert_eq!(expand_local_uri(r"~\allyh\db"), expected);
+        assert_eq!(
+            StorageConfig::from_uri("~/allyh/db").uri,
+            expected
+        );
+    }
+
+    // Windows verbatim prefixes, backslashes, and trailing slashes produce identical repo_id
+    let standard = compute_repo_id("C:/Users/dev/project");
+    let backslash = compute_repo_id(r"C:\Users\dev\project");
+    let verbatim = compute_repo_id(r"\\?\C:\Users\dev\project");
+    let trailing = compute_repo_id("C:/Users/dev/project/");
+    assert_eq!(standard, backslash);
+    assert_eq!(standard, verbatim);
+    assert_eq!(standard, trailing);
+}

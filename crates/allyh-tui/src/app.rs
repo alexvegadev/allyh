@@ -312,7 +312,7 @@ impl AppState {
                     }
                     help.push_str(
                         "\n### Shortcuts\n\
-                        - Enter sends. Alt+Enter adds a line.\n\
+                        - Enter sends. Alt+Enter, Shift+Enter, or Ctrl+J adds a line.\n\
                         - Tab / Shift+Tab change focus. Esc returns to the prompt.\n\
                         - In the command list, Up/Down select and Tab completes. Esc dismisses.\n\
                         - In chat or plan review, use arrows, PgUp/PgDn, Home or End.\n\

@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use allyh_memory::{CodeGraphSnapshot, MemoryStore};
@@ -15,6 +15,10 @@ use crate::cargo::{CargoRunner, CargoVerificationReport, VerificationKind};
 use crate::error::{EnvError, Result};
 use crate::git::{GitState, GitTracker};
 use crate::graph::{EgoGraph, RustIndexer};
+use crate::path::{
+    canonicalize_normalized, has_windows_drive_prefix, path_to_slash_string, strip_root_prefix,
+    strip_verbatim_prefix,
+};
 
 /// Filesystem change notification emitted by the live `notify` watcher.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,7 +97,12 @@ impl LiveFsWatcher {
         repo_root: PathBuf,
         tx: mpsc::UnboundedSender<FsChangeEvent>,
     ) -> Result<Self> {
-        let root_clone = repo_root.clone();
+        let raw_root = strip_verbatim_prefix(&repo_root);
+        let canonical_root = canonicalize_normalized(&raw_root);
+        let watch_root = canonical_root.clone();
+        let raw_root_cb = raw_root.clone();
+        let canonical_root_cb = canonical_root.clone();
+
         let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
             let Ok(event) = res else {
                 return;
@@ -105,12 +114,9 @@ impl LiveFsWatcher {
                 _ => return,
             };
             for path in event.paths {
-                let rel = path
-                    .strip_prefix(&root_clone)
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                if should_ignore_rel_path(&rel) {
+                let rel = strip_root_prefix(&path, &raw_root_cb, &canonical_root_cb)
+                    .unwrap_or_else(|| path_to_slash_string(&path));
+                if rel.is_empty() || should_ignore_rel_path(&rel) {
                     continue;
                 }
                 let _ = tx.send(FsChangeEvent {
@@ -121,7 +127,7 @@ impl LiveFsWatcher {
             }
         })?;
 
-        watcher.watch(&repo_root, RecursiveMode::Recursive)?;
+        watcher.watch(&watch_root, RecursiveMode::Recursive)?;
         Ok(Self { _watcher: watcher })
     }
 }
@@ -149,7 +155,7 @@ impl EnvironmentMonitor {
         scope_id: impl Into<String>,
         store: MemoryStore,
     ) -> Self {
-        let root = repo_root.into();
+        let root = strip_verbatim_prefix(&repo_root.into());
         let git = GitTracker::new(&root);
         let cargo = CargoRunner::new(&root);
         Self {
@@ -215,17 +221,68 @@ impl EnvironmentMonitor {
         }
     }
 
-    /// Resolve and validate a relative path so tools never escape the repository root.
+    /// Resolve and validate a relative path so tools never escape the repository root
+    /// across Windows, macOS, and Linux (blocking absolute paths, drive-relative paths,
+    /// parent traversal `..`, and symlinks pointing outside the repository root).
     pub fn resolve_safe_path(&self, rel_path: &str) -> Result<(String, PathBuf)> {
-        let normalized = normalize_rel_path(rel_path);
-        if normalized.is_empty()
-            || normalized.starts_with('/')
-            || normalized.contains("..")
-            || Path::new(&normalized).is_absolute()
+        let raw_trimmed = rel_path.trim();
+        if raw_trimmed.is_empty()
+            || raw_trimmed.starts_with('/')
+            || raw_trimmed.starts_with('\\')
+            || has_windows_drive_prefix(raw_trimmed)
         {
             return Err(EnvError::PathEscape(rel_path.to_string()));
         }
-        Ok((normalized.clone(), self.repo_root.join(&normalized)))
+
+        let slash_form = raw_trimmed.replace('\\', "/");
+        if Path::new(&slash_form).is_absolute() || has_windows_drive_prefix(&slash_form) {
+            return Err(EnvError::PathEscape(rel_path.to_string()));
+        }
+
+        let mut segments: Vec<String> = Vec::new();
+        let mut abs_path = self.repo_root.clone();
+        for comp in Path::new(&slash_form).components() {
+            match comp {
+                Component::CurDir => continue,
+                Component::Normal(seg) => {
+                    let s = seg.to_string_lossy();
+                    if s.is_empty() || has_windows_drive_prefix(&s) {
+                        return Err(EnvError::PathEscape(rel_path.to_string()));
+                    }
+                    segments.push(s.into_owned());
+                    abs_path.push(seg);
+                }
+                Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                    return Err(EnvError::PathEscape(rel_path.to_string()));
+                }
+            }
+        }
+
+        if segments.is_empty() {
+            return Err(EnvError::PathEscape(rel_path.to_string()));
+        }
+
+        // Prevent symlink escapes for existing targets or their nearest existing ancestor.
+        if let Ok(canon_root) = std::fs::canonicalize(&self.repo_root) {
+            let canon_root = strip_verbatim_prefix(&canon_root);
+            let mut probe = abs_path.as_path();
+            while !probe.exists() {
+                match probe.parent() {
+                    Some(parent) => probe = parent,
+                    None => break,
+                }
+            }
+            if probe.exists()
+                && let Ok(canon_probe) = std::fs::canonicalize(probe)
+            {
+                let canon_probe = strip_verbatim_prefix(&canon_probe);
+                if !canon_probe.starts_with(&canon_root) {
+                    return Err(EnvError::PathEscape(rel_path.to_string()));
+                }
+            }
+        }
+
+        Ok((segments.join("/"), abs_path))
     }
 
     /// Compute SHA-256 hex digest of a file's bytes.
@@ -418,7 +475,9 @@ impl EnvironmentMonitor {
         let mut files = Vec::new();
         for entry in WalkDir::new(&self.repo_root)
             .into_iter()
-            .filter_entry(|e| !is_ignored_entry(e.file_name().to_str().unwrap_or("")))
+            .filter_entry(|e| {
+                e.depth() == 0 || !is_ignored_entry(e.file_name().to_str().unwrap_or(""))
+            })
             .flatten()
         {
             if !entry.file_type().is_file() {
@@ -490,7 +549,11 @@ fn is_ignored_entry(name: &str) -> bool {
 }
 
 fn should_ignore_rel_path(rel: &str) -> bool {
-    rel.starts_with(".git/")
+    let rel = rel.trim_start_matches("./");
+    rel.is_empty()
+        || rel == ".git"
+        || rel == "target"
+        || rel.starts_with(".git/")
         || rel.starts_with("target/")
         || rel.contains("/target/")
         || rel.contains("/.git/")

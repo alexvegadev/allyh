@@ -8,7 +8,7 @@ AllyH is a lightweight, out-of-tree operating system around [`rig-core`](https:/
 
 ## Key Capabilities
 
-- **Out-of-Tree LanceDB State:** Stores episodic sessions, architectural invariants, structured task queues, and code graph snapshots outside the target repo—either on local disk (`~/.local/share/allyh/db`) or shared object storage (`s3://`, `gs://`, `az://`) partitioned by `(repo_id, scope_id)`.
+- **Out-of-Tree LanceDB State:** Stores episodic sessions, architectural invariants, structured task queues, and code graph snapshots outside the target repo—either in the OS-native local data directory (Linux: `~/.local/share/allyh/db`, macOS: `~/Library/Application Support/allyh/db`, Windows: `%LOCALAPPDATA%\allyh\db`) or shared object storage (`s3://`, `gs://`, `az://`) partitioned by `(repo_id, scope_id)`.
 - **Bi-Temporal, Conflict-Aware Memory:** New decisions pass through a pre-write hybrid search (`vector` + BM25 FTS) and conflict gate (`ADD`, `UPDATE`, `INVALIDATE`, `NOOP`). Superseded rules are logically invalidated via `invalid_at` / `superseded_by` rather than hard-deleted or left to collide.
 - **Interactive Control Gate:** Enforces a strict `Discovery → Plan Approval → Execution` state machine. Write tools remain locked until you explicitly approve a plan (`[Approve Plan]` / `[Refine]`), and tasks cannot transition to `verified` without a passing `cargo` verification proof.
 - **Prescriptive ACI Tools:** Compact `rig-core` tools (`inspect_symbol`, `edit_by_hash`, `run_verification`) reject stale file reads via SHA-256 verification and automatically append structured `cargo check --message-format=json` diagnostics to every edit.
@@ -56,12 +56,13 @@ AllyH is a lightweight, out-of-tree operating system around [`rig-core`](https:/
 
 ### Prerequisites
 
-- Rust toolchain (Edition 2024 / Cargo)
+- Supported platforms: **Linux**, **macOS**, and **Windows**
+- Rust toolchain (Edition 2024 / Cargo) and a C compiler for bundled `libgit2` / `tree-sitter` crates
 
 ### Build & Run
 
 ```bash
-# Run against the current repository (local LanceDB at ~/.local/share/allyh/db)
+# Run against the current repository (local LanceDB in your OS local data directory)
 cargo run -p allyh-tui -- --repo .
 
 # Connect to a shared S3 / MinIO LanceDB backend with an isolated agent scope
@@ -80,7 +81,7 @@ cargo run -p allyh-tui -- \
 | Flag | Environment Variable | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `-r, --repo <PATH>` | — | `.` | Target repository directory |
-| `--db-uri <URI>` | `ALLYH_DB_URI` | `~/.local/share/allyh/db` | Local path or `s3://`, `gs://`, `az://` LanceDB URI |
+| `--db-uri <URI>` | `ALLYH_DB_URI` | OS local data dir (`allyh/db`) | Local path (supports `~/` expansion) or `s3://`, `gs://`, `az://` LanceDB URI |
 | `--scope <SCOPE>` | `ALLYH_SCOPE_ID` | `default` | Multi-agent or team memory partition scope |
 | `--model <SPEC>` | `ALLYH_MODEL` | Auto-detected | Primary model (`anthropic:<id>`, `openai:<id>`, `local:<id>[@url]`, `offline`) |
 | `--worker-model <SPEC>` | `ALLYH_WORKER_MODEL` | Auto-detected | Local background worker model for compaction & consolidation |
@@ -115,7 +116,7 @@ When no API keys or local servers are configured, AllyH runs cleanly in determin
 
 ### Keybindings
 
-- **Prompt input:** `Enter` send · `Alt+Enter` / `Shift+Enter` newline
+- **Prompt input:** `Enter` send · `Alt+Enter` / `Shift+Enter` / `Ctrl+J` newline
 - **Global:** `Tab` cycle focus (Input → Memories → Chat) · `Ctrl+T` or `F2` expand/collapse ACI Tool Cards · `Ctrl+C` quit
 - **Activated Memories sidebar:** `↑`/`↓` (`k`/`j`) select · `p` pin/unpin · `x` logically invalidate
 - **Plan Approval modal:** `A` / `Enter` approve plan & unlock writes · `R` / `Esc` refine & remain read-only

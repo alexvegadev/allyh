@@ -434,7 +434,13 @@ fn extract_signature(node: Node<'_>, source: &[u8]) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     if collapsed.len() > 140 {
-        format!("{}...", &collapsed[..137])
+        let cut = collapsed
+            .char_indices()
+            .take_while(|(idx, _)| *idx <= 137)
+            .last()
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        format!("{}...", &collapsed[..cut])
     } else {
         collapsed
     }

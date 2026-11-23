@@ -103,16 +103,29 @@ impl EditByHashTool {
 
         let updated_content = if let Some(full) = args.full_content {
             full
-        } else if let (Some(target), Some(replacement)) =
-            (args.target_snippet.as_deref(), args.replacement_snippet.as_deref())
-        {
-            if !previous_content.contains(target) {
+        } else if let (Some(target), Some(replacement)) = (
+            args.target_snippet.as_deref(),
+            args.replacement_snippet.as_deref(),
+        ) {
+            if previous_content.contains(target) {
+                previous_content.replacen(target, replacement, 1)
+            } else if previous_content.contains("\r\n") {
+                // Preserve Windows CRLF files when models emit LF-only snippets from `inspect_symbol`.
+                let crlf_target = to_crlf(target);
+                if !previous_content.contains(&crlf_target) {
+                    return Err(ToolError::EditTargetNotFound {
+                        file_path: rel_path,
+                        reason: "target_snippet was not found verbatim in file".to_string(),
+                    });
+                }
+                let crlf_replacement = to_crlf(replacement);
+                previous_content.replacen(&crlf_target, &crlf_replacement, 1)
+            } else {
                 return Err(ToolError::EditTargetNotFound {
                     file_path: rel_path,
                     reason: "target_snippet was not found verbatim in file".to_string(),
                 });
             }
-            previous_content.replacen(target, replacement, 1)
         } else {
             return Err(ToolError::InvalidArgs(
                 "provide either full_content or both target_snippet and replacement_snippet"
@@ -197,4 +210,8 @@ impl Tool for EditByHashTool {
     ) -> Result<Self::Output, Self::Error> {
         self.execute(args).await
     }
+}
+
+fn to_crlf(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\n', "\r\n")
 }

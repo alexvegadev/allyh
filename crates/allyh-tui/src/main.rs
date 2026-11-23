@@ -7,9 +7,11 @@ mod ui;
 use std::io;
 
 use allyh_core::{AllyHOrchestrator, HybridRouter, ModelProfile, OrchestratorConfig, UserCommand};
+use allyh_env::canonicalize_normalized;
 use allyh_memory::StorageConfig;
 use anyhow::{Context, Result};
 use clap::Parser;
+use crossterm::cursor::Show;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -22,6 +24,50 @@ use ratatui::backend::CrosstermBackend;
 use crate::app::{AppState, FocusPane};
 use crate::cli::CliArgs;
 use crate::highlight::MarkdownHighlighter;
+
+fn restore_terminal_state() {
+    let _ = disable_raw_mode();
+    let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
+}
+
+struct TerminalGuard {
+    terminal: Terminal<CrosstermBackend<io::Stdout>>,
+}
+
+impl TerminalGuard {
+    fn enter() -> Result<Self> {
+        enable_raw_mode().context("enable raw mode")?;
+        let mut stdout = io::stdout();
+        if let Err(err) = execute!(stdout, EnterAlternateScreen) {
+            let _ = disable_raw_mode();
+            return Err(err).context("enter alternate screen");
+        }
+        let backend = CrosstermBackend::new(stdout);
+        match Terminal::new(backend) {
+            Ok(terminal) => Ok(Self { terminal }),
+            Err(err) => {
+                restore_terminal_state();
+                Err(err).context("create ratatui terminal")
+            }
+        }
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        let _ = self.terminal.show_cursor();
+    }
+}
+
+fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal_state();
+        previous(info);
+    }));
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -61,7 +107,7 @@ async fn main() -> Result<()> {
         .context("failed to build initial inspector snapshot")?;
 
     let (cmd_tx, mut ui_rx) = orchestrator.spawn_actor();
-    let repo_path = args.repo.canonicalize().unwrap_or(args.repo);
+    let repo_path = canonicalize_normalized(&args.repo);
     let repo_name = repo_path
         .file_name()
         .unwrap_or(repo_path.as_os_str())
@@ -69,19 +115,16 @@ async fn main() -> Result<()> {
     let mut app = AppState::new(initial_snapshot, repo_name.into_owned());
     let highlighter = MarkdownHighlighter::new();
 
-    enable_raw_mode().context("enable raw mode")?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen).context("enter alternate screen")?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend).context("create ratatui terminal")?;
-
-    let run_res = run_tui_loop(&mut terminal, &mut app, &highlighter, &cmd_tx, &mut ui_rx).await;
-
-    let _ = disable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
-    let _ = terminal.show_cursor();
-
-    run_res
+    install_panic_hook();
+    let mut guard = TerminalGuard::enter()?;
+    run_tui_loop(
+        &mut guard.terminal,
+        &mut app,
+        &highlighter,
+        &cmd_tx,
+        &mut ui_rx,
+    )
+    .await
 }
 
 async fn run_tui_loop(
@@ -122,12 +165,14 @@ fn handle_terminal_event(
     let Event::Key(key) = event else {
         return;
     };
-    if key.kind != KeyEventKind::Press {
+    if key.kind == KeyEventKind::Release {
         return;
     }
 
     // Global quit shortcut
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('c' | 'C'))
+    {
         app.should_quit = true;
         let _ = cmd_tx.send(UserCommand::Shutdown);
         return;
@@ -149,7 +194,8 @@ fn handle_terminal_event(
         return;
     }
 
-    if (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('t'))
+    if (key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('t' | 'T')))
         || key.code == KeyCode::F(2)
     {
         app.toggle_tool_cards();
@@ -220,7 +266,8 @@ fn handle_pane_key(
         FocusPane::Input => match key.code {
             KeyCode::Enter
                 if !key.modifiers.contains(KeyModifiers::ALT)
-                    && !key.modifiers.contains(KeyModifiers::SHIFT) =>
+                    && !key.modifiers.contains(KeyModifiers::SHIFT)
+                    && !key.modifiers.contains(KeyModifiers::CONTROL) =>
             {
                 let text = app.take_input_text();
                 if let Some(cmd) = app.parse_submission(&text) {
@@ -228,6 +275,9 @@ fn handle_pane_key(
                 }
             }
             KeyCode::Enter => {
+                app.input.insert_newline();
+            }
+            KeyCode::Char('j' | 'J') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 app.input.insert_newline();
             }
             _ => {
@@ -467,5 +517,52 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(UserCommand::RefinePlan(_))));
         press(&mut app, &tx, KeyCode::Char('a'));
         assert!(matches!(rx.try_recv(), Ok(UserCommand::ApprovePlan)));
+    }
+
+    #[test]
+    fn cross_platform_key_events_support_repeat_ctrl_j_and_ignore_release() {
+        let mut app = AppState::new(sample_snapshot(ControlGateState::Discovery), "demo".into());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // Key repeat (emitted on Windows & Kitty-protocol terminals) must work
+        handle_terminal_event(
+            Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Char('a'),
+                KeyModifiers::NONE,
+                KeyEventKind::Repeat,
+            )),
+            &mut app,
+            &tx,
+        );
+        // Key release (emitted on Windows) must be ignored
+        handle_terminal_event(
+            Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Char('z'),
+                KeyModifiers::NONE,
+                KeyEventKind::Release,
+            )),
+            &mut app,
+            &tx,
+        );
+        // Ctrl+J inserts a newline on terminals where Alt+Enter is intercepted
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL)),
+            &mut app,
+            &tx,
+        );
+        app.input.insert_str("b");
+        press(&mut app, &tx, KeyCode::Enter);
+        assert!(
+            matches!(rx.try_recv(), Ok(UserCommand::SendPrompt(text)) if text == "a\nb")
+        );
+
+        // Uppercase Ctrl+C (e.g. with Caps Lock on Windows) still quits cleanly
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::CONTROL)),
+            &mut app,
+            &tx,
+        );
+        assert!(app.should_quit);
+        assert!(matches!(rx.try_recv(), Ok(UserCommand::Shutdown)));
     }
 }
