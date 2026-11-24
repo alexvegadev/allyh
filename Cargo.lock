@@ -55,7 +55,7 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
 name = "allyh-core"
-version = "0.1.0"
+version = "0.2.2"
 dependencies = [
  "allyh-env",
  "allyh-memory",
@@ -78,7 +78,7 @@ dependencies = [
 
 [[package]]
 name = "allyh-env"
-version = "0.1.0"
+version = "0.2.2"
 dependencies = [
  "allyh-memory",
  "chrono",
@@ -100,7 +100,7 @@ dependencies = [
 
 [[package]]
 name = "allyh-memory"
-version = "0.1.0"
+version = "0.2.2"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -125,7 +125,7 @@ dependencies = [
 
 [[package]]
 name = "allyh-tools"
-version = "0.1.0"
+version = "0.2.2"
 dependencies = [
  "allyh-env",
  "allyh-memory",
@@ -145,7 +145,7 @@ dependencies = [
 
 [[package]]
 name = "allyh-tui"
-version = "0.1.0"
+version = "0.2.2"
 dependencies = [
  "allyh-core",
  "allyh-env",
