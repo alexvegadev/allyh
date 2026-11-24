@@ -13,15 +13,15 @@ pub struct CliArgs {
     pub command: Option<CliCommand>,
 
     /// Target repository directory (defaults to current working directory).
-    #[arg(short, long, default_value = ".")]
+    #[arg(short, long, global = true, default_value = ".")]
     pub repo: PathBuf,
 
     /// Out-of-tree LanceDB storage URI (local path or `s3://...` / `gs://...` / `az://...`).
-    #[arg(long, env = "ALLYH_DB_URI")]
+    #[arg(long, global = true, env = "ALLYH_DB_URI")]
     pub db_uri: Option<String>,
 
     /// Partition scope identifier for multi-agent isolation or shared team state.
-    #[arg(long, env = "ALLYH_SCOPE_ID", default_value = "default")]
+    #[arg(long, global = true, env = "ALLYH_SCOPE_ID", default_value = "default")]
     pub scope: String,
 
     /// Primary reasoning model spec (e.g. `anthropic:claude-sonnet-4-6`, `openai:gpt-4o`, `local:qwen-35b@http://localhost:9931/v1`, `offline`).
@@ -46,6 +46,74 @@ pub struct CliArgs {
 pub enum CliCommand {
     /// Check for and install a newer AllyH release from GitHub.
     Update(UpdateArgs),
+    /// Manage reusable procedural skills stored in LanceDB for this repository.
+    Skills(SkillsArgs),
+}
+
+/// Options for `allyh skills`.
+#[derive(Debug, Clone, Args)]
+pub struct SkillsArgs {
+    #[command(subcommand)]
+    pub action: SkillsCommand,
+}
+
+/// Subcommands under `allyh skills`.
+#[derive(Debug, Clone, Subcommand)]
+pub enum SkillsCommand {
+    /// List all registered skills for the repository partition.
+    #[command(visible_alias = "ls")]
+    List {
+        /// Output machine-readable JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Show the full metadata and instructions of a registered skill.
+    Show {
+        /// Skill name, normalized slug, or full id.
+        name: String,
+        /// Output machine-readable JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Register or update a skill directly from the command line.
+    Add {
+        /// Short, unique skill name (e.g. `add-lancedb-table`).
+        name: String,
+        /// One-line summary of what the skill accomplishes.
+        #[arg(short, long, default_value = "")]
+        description: String,
+        /// Inline instructions text (mutually exclusive with `--file`).
+        #[arg(short, long, conflicts_with = "file")]
+        instructions: Option<String>,
+        /// Read instructions body from a file (mutually exclusive with `--instructions`).
+        #[arg(short, long, conflicts_with = "instructions")]
+        file: Option<PathBuf>,
+        /// Trigger keywords or phrases (repeatable).
+        #[arg(short = 't', long = "trigger")]
+        triggers: Vec<String>,
+    },
+    /// Import a `SKILL.md` file (YAML frontmatter + Markdown body) into LanceDB.
+    Import {
+        /// Path to the `SKILL.md` file to import.
+        path: PathBuf,
+        /// Override the skill name parsed from the file.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Export a stored skill as a portable `SKILL.md` document.
+    Export {
+        /// Skill name, normalized slug, or full id.
+        name: String,
+        /// Destination file path (prints to stdout when omitted).
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+    },
+    /// Remove a skill from LanceDB.
+    #[command(visible_aliases = ["rm", "delete"])]
+    Remove {
+        /// Skill name, normalized slug, or full id.
+        name: String,
+    },
 }
 
 /// Options for `allyh update`.
@@ -124,5 +192,88 @@ mod tests {
         assert_eq!(update.tag.as_deref(), Some("v0.2.0"));
         assert_eq!(update.repo_owner, "acme");
         assert_eq!(update.repo_name, "allyh-custom");
+    }
+
+    #[test]
+    fn parses_skills_subcommands_with_global_flags() {
+        let list_args = CliArgs::try_parse_from([
+            "allyh",
+            "skills",
+            "list",
+            "--json",
+            "--repo",
+            "workspace",
+            "--scope",
+            "team-a",
+        ])
+        .expect("parse skills list");
+        assert_eq!(list_args.repo, PathBuf::from("workspace"));
+        assert_eq!(list_args.scope, "team-a");
+        assert!(matches!(
+            list_args.command,
+            Some(CliCommand::Skills(SkillsArgs {
+                action: SkillsCommand::List { json: true }
+            }))
+        ));
+
+        let add_args = CliArgs::try_parse_from([
+            "allyh",
+            "skills",
+            "add",
+            "release-flow",
+            "--description",
+            "Release checklist",
+            "--instructions",
+            "Run tests then tag.",
+            "--trigger",
+            "release",
+            "--trigger",
+            "publish",
+        ])
+        .expect("parse skills add");
+        match add_args.command {
+            Some(CliCommand::Skills(SkillsArgs {
+                action:
+                    SkillsCommand::Add {
+                        name,
+                        description,
+                        instructions,
+                        file,
+                        triggers,
+                    },
+            })) => {
+                assert_eq!(name, "release-flow");
+                assert_eq!(description, "Release checklist");
+                assert_eq!(instructions.as_deref(), Some("Run tests then tag."));
+                assert!(file.is_none());
+                assert_eq!(triggers, vec!["release", "publish"]);
+            }
+            other => panic!("unexpected parsed command: {other:?}"),
+        }
+
+        let import_args = CliArgs::try_parse_from([
+            "allyh",
+            "skills",
+            "import",
+            "docs/SKILL.md",
+            "--name",
+            "custom-name",
+        ])
+        .expect("parse skills import");
+        assert!(matches!(
+            import_args.command,
+            Some(CliCommand::Skills(SkillsArgs {
+                action: SkillsCommand::Import { ref path, ref name }
+            })) if path == &PathBuf::from("docs/SKILL.md") && name.as_deref() == Some("custom-name")
+        ));
+
+        let remove_args =
+            CliArgs::try_parse_from(["allyh", "skills", "rm", "release-flow"]).expect("parse rm");
+        assert!(matches!(
+            remove_args.command,
+            Some(CliCommand::Skills(SkillsArgs {
+                action: SkillsCommand::Remove { ref name }
+            })) if name == "release-flow"
+        ));
     }
 }

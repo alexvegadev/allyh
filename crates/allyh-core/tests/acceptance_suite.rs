@@ -296,3 +296,125 @@ async fn test_control_gate_and_non_destructive_compaction() {
     }
 }
 
+#[tokio::test]
+async fn test_skills_progressive_disclosure_and_actor_commands() {
+    use allyh_core::{UiEvent, UserCommand};
+
+    let tmp = TempDir::new().expect("tempdir");
+    let db_dir = tmp.path().join("db");
+    let repo_a_dir = tmp.path().join("repo_a");
+    let repo_b_dir = tmp.path().join("repo_b");
+    std::fs::create_dir_all(repo_a_dir.join("src")).expect("mkdir a");
+    std::fs::create_dir_all(repo_b_dir.join("src")).expect("mkdir b");
+    std::fs::write(repo_a_dir.join("src/lib.rs"), "pub fn a() {}\n").expect("write a");
+    std::fs::write(repo_b_dir.join("src/lib.rs"), "pub fn b() {}\n").expect("write b");
+
+    // Save a skill in Session A (Discovery mode)
+    {
+        let session_a = AllyHOrchestrator::initialize(
+            make_config(&repo_a_dir, &db_dir, "default"),
+            offline_router(),
+            None,
+        )
+        .await
+        .expect("init A");
+
+        let (saved, created) = session_a
+            .save_skill(
+                "add-lancedb-table",
+                "Steps to register a new LanceDB table",
+                "SECRET_STEP_42: Update schema.rs and store.rs together.",
+                vec!["new lancedb table".into()],
+            )
+            .await
+            .expect("save skill");
+        assert!(created);
+        assert_eq!(saved.name, "add-lancedb-table");
+    }
+
+    // Reopen Session B -> progressive disclosure
+    let mut session_b = AllyHOrchestrator::initialize(
+        make_config(&repo_a_dir, &db_dir, "default"),
+        offline_router(),
+        None,
+    )
+    .await
+    .expect("init B");
+
+    let snap = session_b.inspector_snapshot().await.expect("snap");
+    assert_eq!(snap.skills_count, 1);
+
+    // 1. Unrelated prompt: catalog is present, full instructions are NOT expanded
+    let turn_unrelated = session_b
+        .handle_prompt("Explain how error formatting works", None)
+        .await
+        .expect("turn unrelated");
+    assert!(turn_unrelated.preamble.text.contains("## Available Skills (LanceDB)"));
+    assert!(turn_unrelated.preamble.text.contains("`add-lancedb-table`"));
+    assert!(!turn_unrelated.preamble.text.contains("SECRET_STEP_42"));
+
+    // 2. Trigger-matching prompt: full instructions ARE expanded automatically
+    let turn_matched = session_b
+        .handle_prompt("We need a new lancedb table for telemetry", None)
+        .await
+        .expect("turn matched");
+    assert!(turn_matched.preamble.text.contains("## Active Skill Instructions"));
+    assert!(turn_matched.preamble.text.contains("SECRET_STEP_42"));
+
+    // 3. Pinning expands instructions even for unrelated prompts
+    let (_, pinned) = session_b
+        .toggle_pin_skill("add-lancedb-table")
+        .await
+        .expect("pin")
+        .expect("skill exists");
+    assert!(pinned);
+    let turn_pinned = session_b
+        .handle_prompt("Say hello", None)
+        .await
+        .expect("turn pinned");
+    assert!(turn_pinned.preamble.text.contains("SECRET_STEP_42"));
+
+    // 4. Separate repo stays isolated
+    let mut session_repo_b = AllyHOrchestrator::initialize(
+        make_config(&repo_b_dir, &db_dir, "default"),
+        offline_router(),
+        None,
+    )
+    .await
+    .expect("init repo B");
+    assert_eq!(session_repo_b.inspector_snapshot().await.expect("snap b").skills_count, 0);
+    let turn_b = session_repo_b
+        .handle_prompt("We need a new lancedb table", None)
+        .await
+        .expect("turn b");
+    assert!(!turn_b.preamble.text.contains("add-lancedb-table"));
+
+    // 5. Actor commands round-trip
+    let (cmd_tx, mut ui_rx) = session_b.spawn_actor();
+    // Consume initial snapshot
+    let _ = ui_rx.recv().await;
+
+    cmd_tx.send(UserCommand::RequestSkills).unwrap();
+    let ev = ui_rx.recv().await.expect("skills list event");
+    assert!(matches!(
+        ev,
+        UiEvent::SkillsList { ref skills, ref pinned_ids }
+            if skills.len() == 1 && pinned_ids.contains(&skills[0].id)
+    ));
+
+    cmd_tx.send(UserCommand::ShowSkill("add-lancedb-table".into())).unwrap();
+    let ev = ui_rx.recv().await.expect("skill detail event");
+    assert!(matches!(
+        ev,
+        UiEvent::SkillDetail { ref skill, pinned: true } if skill.name == "add-lancedb-table"
+    ));
+
+    cmd_tx.send(UserCommand::RemoveSkill("add-lancedb-table".into())).unwrap();
+    let notice = ui_rx.recv().await.expect("remove notice");
+    assert!(matches!(notice, UiEvent::SystemNotice(msg) if msg.contains("Removed skill")));
+    let updated_snap = ui_rx.recv().await.expect("updated snap");
+    assert!(matches!(updated_snap, UiEvent::InspectorUpdated(s) if s.skills_count == 0));
+
+    cmd_tx.send(UserCommand::Shutdown).unwrap();
+}
+

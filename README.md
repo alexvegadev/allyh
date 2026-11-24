@@ -11,7 +11,8 @@ AllyH is a lightweight, out-of-tree operating system around [`rig-core`](https:/
 - **Out-of-Tree LanceDB State:** Stores episodic sessions, architectural invariants, structured task queues, and code graph snapshots outside the target repo—either in the OS-native local data directory (Linux: `~/.local/share/allyh/db`, macOS: `~/Library/Application Support/allyh/db`, Windows: `%LOCALAPPDATA%\allyh\db`) or shared object storage (`s3://`, `gs://`, `az://`) partitioned by `(repo_id, scope_id)`.
 - **Bi-Temporal, Conflict-Aware Memory:** New decisions pass through a pre-write hybrid search (`vector` + BM25 FTS) and conflict gate (`ADD`, `UPDATE`, `INVALIDATE`, `NOOP`). Superseded rules are logically invalidated via `invalid_at` / `superseded_by` rather than hard-deleted or left to collide.
 - **Interactive Control Gate:** Enforces a strict `Discovery → Plan Approval → Execution` state machine. Write tools remain locked until you explicitly approve a plan (`[Approve Plan]` / `[Refine]`), and tasks cannot transition to `verified` without a passing `cargo` verification proof.
-- **Prescriptive ACI Tools:** Compact `rig-core` tools (`inspect_symbol`, `edit_by_hash`, `run_verification`) reject stale file reads via SHA-256 verification and automatically append structured `cargo check --message-format=json` diagnostics to every edit.
+- **Prescriptive ACI Tools:** Compact `rig-core` tools (`inspect_symbol`, `edit_by_hash`, `run_verification`, `get_skill`, `add_skill`) reject stale file reads via SHA-256 verification and automatically append structured `cargo check --message-format=json` diagnostics to every edit.
+- **Reusable Procedural Skills (Progressive Disclosure):** Store repo-scoped procedures in LanceDB (`skills` table), inject a lightweight skill catalog into every turn's preamble, expand full instructions automatically when pinned or trigger-matched (or lazily via `get_skill`), and manage or import/export `SKILL.md` files from both the TUI (`/skills`) and CLI (`allyh skills`).
 - **Live Environment & RepoGraph Awareness:** Combines `notify` filesystem watching, `git2` status/diffs, SHA-256 out-of-band edit detection, and incremental `tree-sitter-rust` indexing to inject concise diffs and 1-hop/2-hop symbol *ego-graphs* into each turn's preamble.
 - **Hybrid Routing & Sleep-Time Compute:** Routes primary reasoning to frontier APIs (Anthropic / OpenAI) or large local models, while delegating non-destructive history compaction, conflict judging, and idle LanceDB fragment optimization to a fast local OpenAI-compatible worker (`llama.cpp` / Ollama) with deterministic offline fallbacks.
 
@@ -44,9 +45,9 @@ AllyH is a lightweight, out-of-tree operating system around [`rig-core`](https:/
 
 | Crate | Responsibility |
 | :--- | :--- |
-| `crates/allyh-memory` | LanceDB connection manager (local & object store), Apache Arrow schemas (`sessions`, `architectural_decisions`, `tasks`, `code_graph_snapshots`), hybrid vector + BM25 search, bi-temporal consolidator, and read-only sleep-time worker. |
+| `crates/allyh-memory` | LanceDB connection manager (local & object store), Apache Arrow schemas (`sessions`, `architectural_decisions`, `tasks`, `code_graph_snapshots`, `skills`), `SKILL.md` parser/renderer, hybrid vector + BM25 search, bi-temporal consolidator, and read-only sleep-time worker. |
 | `crates/allyh-env` | `notify` FS watcher, `git2` tracker, SHA-256 out-of-band edit detector, `tree-sitter-rust` RepoGraph indexer, and `cargo --message-format=json` diagnostics runner. |
-| `crates/allyh-tools` | Compact ACI `rig_core::tool::Tool` implementations (`inspect_symbol`, `edit_by_hash`, `run_verification`) with write-gate enforcement and post-edit compiler hooks. |
+| `crates/allyh-tools` | Compact ACI `rig_core::tool::Tool` implementations (`inspect_symbol`, `edit_by_hash`, `run_verification`, `get_skill`, `add_skill`) with write-gate enforcement and post-edit compiler hooks. |
 | `crates/allyh-core` | Tokio orchestrator actor, `ControlGate`, `HybridRouter`, `DynamicPreambleAssembler`, non-destructive `CompactingHistory`, and local LLM conflict judge. |
 | `crates/allyh-tui` | `allyh` binary: 60 FPS Ratatui split-pane UI, `syntect` Markdown/code highlighting, collapsible Tool Cards, Coherence Inspector sidebar, and interactive gate modals. |
 
@@ -88,6 +89,27 @@ cargo run -p allyh-tui -- \
   --scope agent-1 \
   --model anthropic:claude-sonnet-4-6 \
   --worker-model local:qwen2.5-coder-9b@http://localhost:9931/v1
+```
+
+### Managing Skills from the CLI
+
+Inspect, author, and import/export reusable procedural skills without launching the TUI (honors `--repo`, `--db-uri`, and `--scope`):
+
+```bash
+# List registered skills for the current repository
+allyh skills list
+allyh skills list --json
+
+# View a skill's full instructions
+allyh skills show add-lancedb-table
+
+# Register a skill directly or import/export portable SKILL.md files
+allyh skills add release-flow -d "Release checklist" -i "1. Bump Cargo.toml. 2. Run cargo test." -t release
+allyh skills import path/to/SKILL.md
+allyh skills export release-flow --out release-flow/SKILL.md
+
+# Remove a skill
+allyh skills remove release-flow
 ```
 
 ### Self-Update
@@ -140,6 +162,7 @@ When no API keys or local servers are configured, AllyH runs cleanly in determin
 | `/plan <goal>` | Open the interactive Plan Approval Gate modal (`[Approve Plan]` / `[Refine]`) |
 | `/model <spec>` | Switch the active reasoning model at runtime |
 | `/memories` | List active architectural invariants from LanceDB (`invalid_at IS NULL`) |
+| `/skills` | List registered skills (`show <name>`, `pin <name>`, `import <path>`, `remove <name>`) |
 | `/pin <id-prefix>` | Pin or unpin an invariant so it is always injected into the preamble |
 | `/invalidate <id-prefix>` | Logically invalidate a stale rule (`invalid_at = NOW()`) |
 | `/db-status` | Show active LanceDB URI, backend type, partition IDs, and table row counts |

@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::edit::{EditByHashArgs, EditByHashTool};
 use crate::error::ToolError;
 use crate::inspect::{InspectSymbolArgs, InspectSymbolTool};
-use crate::skill::{AddSkillArgs, AddSkillTool};
+use crate::skill::{AddSkillArgs, AddSkillTool, GetSkillArgs, GetSkillTool};
 use crate::verify::{RunVerificationArgs, RunVerificationTool};
 
 /// Compact execution card emitted after every ACI tool invocation for the TUI and audit log.
@@ -24,14 +24,15 @@ pub struct ToolExecutionRecord {
     pub output_json: serde_json::Value,
 }
 
-/// Bundled compact ACI toolset (`inspect_symbol`, `edit_by_hash`, `run_verification`)
-/// sharing the same repository monitor, LanceDB store, and write-approval gate.
+/// Bundled compact ACI toolset (`inspect_symbol`, `edit_by_hash`, `run_verification`,
+/// `get_skill`, `add_skill`) sharing the same repository monitor, LanceDB store, and write gate.
 #[derive(Clone)]
 pub struct AciToolset {
     inspect: InspectSymbolTool,
     edit: EditByHashTool,
     verify: RunVerificationTool,
     skill: AddSkillTool,
+    get_skill: GetSkillTool,
     writes_enabled: Arc<AtomicBool>,
 }
 
@@ -46,7 +47,8 @@ impl AciToolset {
             inspect: InspectSymbolTool::new(Arc::clone(&env), store.clone()),
             edit: EditByHashTool::new(Arc::clone(&env), Arc::clone(&writes_enabled), auto_cargo_check),
             verify: RunVerificationTool::new(Arc::clone(&env), store.clone()),
-            skill: AddSkillTool::new(env, store, Arc::clone(&writes_enabled)),
+            skill: AddSkillTool::new(Arc::clone(&env), store.clone()),
+            get_skill: GetSkillTool::new(env, store),
             writes_enabled,
         }
     }
@@ -73,6 +75,10 @@ impl AciToolset {
 
     pub fn skill_tool(&self) -> &AddSkillTool {
         &self.skill
+    }
+
+    pub fn get_skill_tool(&self) -> &GetSkillTool {
+        &self.get_skill
     }
 
     /// Return `rig-core` [`ToolDefinition`]s exposed to the active completion model.
@@ -103,8 +109,16 @@ impl AciToolset {
             .with_annotations(self.edit.annotations()),
         );
 
-        // Expose `add_skill` definition always; the tool enforces the write-approval gate
-        // at execution time before persisting a reusable procedural skill.
+        // Expose `get_skill` (read-only progressive disclosure) and `add_skill` (out-of-tree
+        // LanceDB persistence, allowed in Discovery and Execution modes).
+        defs.push(
+            ToolDefinition::new(
+                ToolName::new(GetSkillTool::NAME).expect("valid tool name"),
+                self.get_skill.description(),
+                self.get_skill.parameters(),
+            )
+            .with_annotations(self.get_skill.annotations()),
+        );
         defs.push(
             ToolDefinition::new(
                 ToolName::new(AddSkillTool::NAME).expect("valid tool name"),
@@ -239,6 +253,46 @@ impl AciToolset {
                 Err(err) => failed_record(
                     tool_name,
                     "run_verification(invalid args)",
+                    ToolError::InvalidArgs(err.to_string()),
+                ),
+            },
+            GetSkillTool::NAME => match serde_json::from_value::<GetSkillArgs>(args) {
+                Ok(parsed) => {
+                    let requested = parsed.name.clone();
+                    match self.get_skill.call(&mut ctx, parsed).await {
+                        Ok(out) => {
+                            let line_count = out.instructions.lines().count().max(1);
+                            let header = format!(
+                                "get_skill({}) -> {line_count} line(s)",
+                                out.name
+                            );
+                            let json_val = serde_json::to_value(&out).unwrap_or_default();
+                            let triggers = if out.triggers.is_empty() {
+                                String::new()
+                            } else {
+                                format!("\nTriggers: {}", out.triggers.join(", "))
+                            };
+                            let rendered = format!(
+                                "{header}\nDescription: {}{triggers}\n\n{}",
+                                out.description, out.instructions
+                            );
+                            (
+                                ToolExecutionRecord {
+                                    tool_name: tool_name.to_string(),
+                                    compact_header: header,
+                                    succeeded: true,
+                                    output_text: rendered.clone(),
+                                    output_json: json_val,
+                                },
+                                ToolOutput::text(rendered),
+                            )
+                        }
+                        Err(err) => failed_record(tool_name, &format!("get_skill({requested})"), err),
+                    }
+                }
+                Err(err) => failed_record(
+                    tool_name,
+                    "get_skill(invalid args)",
                     ToolError::InvalidArgs(err.to_string()),
                 ),
             },

@@ -23,8 +23,8 @@ use crate::schema::{
     TABLE_SKILLS, TABLE_TASKS, TaskRecord, TaskStatus, VerificationProof,
     architectural_decisions_schema, batch_to_decisions, batch_to_sessions, batch_to_skills,
     batch_to_snapshots, batch_to_tasks, code_graph_snapshots_schema, decisions_to_batch,
-    sessions_schema, sessions_to_batch, skills_schema, skills_to_batch, snapshots_to_batch,
-    tasks_schema, tasks_to_batch,
+    normalize_skill_slug, sessions_schema, sessions_to_batch, skill_id, skills_schema,
+    skills_to_batch, snapshots_to_batch, tasks_schema, tasks_to_batch,
 };
 
 /// Minimum row count required by LanceDB before training an IVF-PQ vector index.
@@ -552,6 +552,60 @@ impl MemoryStore {
         Ok(())
     }
 
+    /// Validate, normalize, and upsert a reusable skill, preserving `created_at` on updates.
+    /// Returns `(record, created)`.
+    pub async fn save_skill(
+        &self,
+        repo_id: &str,
+        scope_id: &str,
+        name: &str,
+        description: &str,
+        instructions: &str,
+        triggers: Vec<String>,
+    ) -> Result<(SkillRecord, bool)> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(MemoryError::InvalidSkill(
+                "skill 'name' must not be empty".to_string(),
+            ));
+        }
+        let instructions = instructions.trim();
+        if instructions.is_empty() {
+            return Err(MemoryError::InvalidSkill(
+                "skill 'instructions' must not be empty".to_string(),
+            ));
+        }
+
+        let id = skill_id(repo_id, scope_id, name)?;
+        let mut cleaned_triggers = Vec::new();
+        for trigger in triggers {
+            let t = trigger.trim();
+            if !t.is_empty() && !cleaned_triggers.iter().any(|existing: &String| existing.eq_ignore_ascii_case(t)) {
+                cleaned_triggers.push(t.to_string());
+            }
+        }
+
+        let existing = self.get_skill(repo_id, scope_id, &id).await?;
+        let raw_now = Utc::now();
+        let now = DateTime::from_timestamp_micros(raw_now.timestamp_micros()).unwrap_or(raw_now);
+        let created_at = existing.as_ref().map(|s| s.created_at).unwrap_or(now);
+        let created = existing.is_none();
+
+        let record = SkillRecord {
+            id,
+            repo_id: repo_id.to_string(),
+            scope_id: scope_id.to_string(),
+            name: name.to_string(),
+            description: description.trim().to_string(),
+            instructions: instructions.to_string(),
+            triggers: cleaned_triggers,
+            created_at,
+            updated_at: now,
+        };
+        self.upsert_skill(&record).await?;
+        Ok((record, created))
+    }
+
     /// List all skills registered for a repo/scope, newest-updated first.
     pub async fn list_skills(&self, repo_id: &str, scope_id: &str) -> Result<Vec<SkillRecord>> {
         let table = self.open_table(TABLE_SKILLS).await?;
@@ -574,6 +628,89 @@ impl MemoryStore {
         }
         skills.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         Ok(skills)
+    }
+
+    /// Look up a single skill within `(repo_id, scope_id)` by exact id, derived slug id,
+    /// case-insensitive name, or normalized slug.
+    pub async fn get_skill(
+        &self,
+        repo_id: &str,
+        scope_id: &str,
+        name_or_id: &str,
+    ) -> Result<Option<SkillRecord>> {
+        let needle = name_or_id.trim();
+        if needle.is_empty() {
+            return Ok(None);
+        }
+        let derived_id = skill_id(repo_id, scope_id, needle).ok();
+        let needle_slug = normalize_skill_slug(needle);
+
+        let skills = self.list_skills(repo_id, scope_id).await?;
+        Ok(skills.into_iter().find(|s| {
+            s.id == needle
+                || derived_id.as_deref() == Some(s.id.as_str())
+                || s.name.eq_ignore_ascii_case(needle)
+                || (!needle_slug.is_empty() && normalize_skill_slug(&s.name) == needle_slug)
+        }))
+    }
+
+    /// Permanently delete a skill within `(repo_id, scope_id)` by name or id.
+    /// Returns the removed record if it existed.
+    pub async fn delete_skill(
+        &self,
+        repo_id: &str,
+        scope_id: &str,
+        name_or_id: &str,
+    ) -> Result<Option<SkillRecord>> {
+        let Some(skill) = self.get_skill(repo_id, scope_id, name_or_id).await? else {
+            return Ok(None);
+        };
+        let table = self.open_table(TABLE_SKILLS).await?;
+        let filter = format!(
+            "repo_id = '{}' AND scope_id = '{}' AND id = '{}'",
+            escape_sql_literal(repo_id),
+            escape_sql_literal(scope_id),
+            escape_sql_literal(&skill.id)
+        );
+        table.delete(&filter).await?;
+        Ok(Some(skill))
+    }
+
+    /// Deterministically match skills relevant to `query` using trigger phrases, skill names,
+    /// and lexical token overlap. Returns up to `top_k` highest-scoring matches.
+    pub async fn match_skills(
+        &self,
+        repo_id: &str,
+        scope_id: &str,
+        query: &str,
+        top_k: usize,
+    ) -> Result<Vec<SkillRecord>> {
+        if top_k == 0 || query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let skills = self.list_skills(repo_id, scope_id).await?;
+        if skills.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let query_lower = query.to_ascii_lowercase();
+        let query_tokens: Vec<String> = tokenize_skill_text(&query_lower);
+
+        let mut scored: Vec<(SkillRecord, f32)> = skills
+            .into_iter()
+            .filter_map(|skill| {
+                let score = score_skill_match(&skill, &query_lower, &query_tokens);
+                (score >= 1.5).then_some((skill, score))
+            })
+            .collect();
+
+        scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.0.updated_at.cmp(&a.0.updated_at))
+        });
+        scored.truncate(top_k);
+        Ok(scored.into_iter().map(|(s, _)| s).collect())
     }
 
     // -----------------------------------------------------------------------
@@ -701,6 +838,7 @@ impl MemoryStore {
         let invalidated_decisions_count = all_decisions.len() - active_decisions_count;
         let tasks = self.list_tasks(repo_id, scope_id).await?;
         let snapshots = self.list_code_snapshots(repo_id, scope_id).await?;
+        let skills = self.list_skills(repo_id, scope_id).await?;
 
         Ok(DbStatusReport {
             uri: self.config.uri.clone(),
@@ -712,6 +850,74 @@ impl MemoryStore {
             invalidated_decisions_count,
             tasks_count: tasks.len(),
             code_snapshots_count: snapshots.len(),
+            skills_count: skills.len(),
         })
     }
+}
+
+fn tokenize_skill_text(text: &str) -> Vec<String> {
+    text.to_ascii_lowercase()
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|t| t.len() >= 3)
+        .map(str::to_string)
+        .collect()
+}
+
+fn score_skill_match(skill: &SkillRecord, query_lower: &str, query_tokens: &[String]) -> f32 {
+    let mut score = 0.0f32;
+    let name_lower = skill.name.to_ascii_lowercase();
+    let slug = normalize_skill_slug(&skill.name);
+
+    if (!name_lower.is_empty() && query_lower.contains(&name_lower))
+        || (!slug.is_empty() && query_lower.contains(&slug))
+    {
+        score += 6.0;
+    }
+
+    for trigger in &skill.triggers {
+        let t_lower = trigger.trim().to_ascii_lowercase();
+        if t_lower.is_empty() {
+            continue;
+        }
+        if query_lower.contains(&t_lower) {
+            score += 5.0;
+        } else {
+            let t_tokens = tokenize_skill_text(&t_lower);
+            if !t_tokens.is_empty() {
+                let hits = t_tokens
+                    .iter()
+                    .filter(|tok| query_tokens.iter().any(|q| q == *tok))
+                    .count();
+                if hits > 0 {
+                    score += 2.5 * (hits as f32 / t_tokens.len() as f32);
+                }
+            }
+        }
+    }
+
+    if !query_tokens.is_empty() {
+        let name_tokens = tokenize_skill_text(&name_lower);
+        if !name_tokens.is_empty() {
+            let hits = name_tokens
+                .iter()
+                .filter(|tok| query_tokens.iter().any(|q| q == *tok))
+                .count();
+            if hits > 0 {
+                score += 2.0 * (hits as f32 / name_tokens.len() as f32);
+            }
+        }
+
+        let desc_tokens = tokenize_skill_text(&skill.description);
+        if !desc_tokens.is_empty() {
+            let hits = query_tokens
+                .iter()
+                .filter(|q| desc_tokens.iter().any(|d| d == *q))
+                .count();
+            if hits >= 2 {
+                score += 1.8 * (hits as f32 / query_tokens.len().min(desc_tokens.len()) as f32);
+            }
+        }
+    }
+
+    score
 }

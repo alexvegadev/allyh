@@ -135,6 +135,36 @@ pub struct SkillRecord {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Normalize a human-readable skill name into a stable lowercase kebab-case slug.
+pub fn normalize_skill_slug(name: &str) -> String {
+    let mut slug = String::new();
+    let mut last_was_dash = false;
+    for ch in name.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            last_was_dash = false;
+        } else if !slug.is_empty() && !last_was_dash {
+            slug.push('-');
+            last_was_dash = true;
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    slug
+}
+
+/// Derive a stable, collision-resistant skill id from `(repo_id, scope_id, name)`.
+pub fn skill_id(repo_id: &str, scope_id: &str, name: &str) -> Result<String> {
+    let slug = normalize_skill_slug(name);
+    if slug.is_empty() {
+        return Err(MemoryError::InvalidSkill(
+            "skill 'name' must contain at least one ASCII letter or digit".to_string(),
+        ));
+    }
+    Ok(format!("{repo_id}:{scope_id}:{slug}"))
+}
+
 /// Code integrity and RepoGraph snapshot stored in `code_graph_snapshots`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodeGraphSnapshot {
@@ -160,6 +190,7 @@ pub struct DbStatusReport {
     pub invalidated_decisions_count: usize,
     pub tasks_count: usize,
     pub code_snapshots_count: usize,
+    pub skills_count: usize,
 }
 
 // ---------------------------------------------------------------------------

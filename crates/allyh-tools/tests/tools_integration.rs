@@ -159,3 +159,67 @@ async fn test_edit_by_hash_preserves_windows_crlf_with_lf_snippets() {
     let updated = std::fs::read_to_string(&lib_path).expect("read updated");
     assert_eq!(updated, "pub fn a() -> i32 {\r\n    2\r\n}\r\n");
 }
+
+#[tokio::test]
+async fn test_skill_tools_work_in_discovery_mode_and_dispatch() {
+    let tmp = TempDir::new().expect("tmp");
+    let repo_dir = tmp.path().join("repo");
+    let db_dir = tmp.path().join("db");
+    std::fs::create_dir_all(repo_dir.join("src")).expect("mkdir");
+    std::fs::write(repo_dir.join("src/lib.rs"), "pub fn ok() -> bool { true }\n").expect("write");
+
+    let store = MemoryStore::connect(
+        StorageConfig::from_local_path(&db_dir),
+        Arc::new(DeterministicHashEmbedder),
+    )
+    .await
+    .expect("connect");
+
+    let env = Arc::new(EnvironmentMonitor::new(
+        &repo_dir,
+        compute_repo_id(&repo_dir.to_string_lossy()),
+        DEFAULT_SCOPE_ID,
+        store.clone(),
+    ));
+
+    // Discovery mode: writes_enabled = false
+    let writes_enabled = Arc::new(AtomicBool::new(false));
+    let toolset = AciToolset::new(env, store, writes_enabled, false);
+
+    let defs = toolset.definitions();
+    assert!(defs.iter().any(|d| d.name.as_str() == "add_skill"));
+    assert!(defs.iter().any(|d| d.name.as_str() == "get_skill"));
+
+    // add_skill is allowed in Discovery mode (out-of-tree LanceDB write)
+    let (add_rec, _) = toolset
+        .dispatch(
+            "add_skill",
+            serde_json::json!({
+                "name": "release-checklist",
+                "description": "Verify version and changelog before tagging",
+                "instructions": "1. Bump Cargo.toml.\n2. Run cargo test --workspace.",
+                "triggers": ["release", "tag version"]
+            }),
+        )
+        .await;
+    assert!(add_rec.succeeded, "add_skill should succeed in Discovery mode: {}", add_rec.output_text);
+    assert!(add_rec.compact_header.contains("created"));
+
+    // get_skill loads full instructions on demand in Discovery mode
+    let (get_rec, _) = toolset
+        .dispatch(
+            "get_skill",
+            serde_json::json!({ "name": "release-checklist" }),
+        )
+        .await;
+    assert!(get_rec.succeeded);
+    assert!(get_rec.output_text.contains("Bump Cargo.toml."));
+    assert!(get_rec.output_text.contains("tag version"));
+
+    // Unknown skill gives a helpful error listing available skills
+    let (missing_rec, _) = toolset
+        .dispatch("get_skill", serde_json::json!({ "name": "nope" }))
+        .await;
+    assert!(!missing_rec.succeeded);
+    assert!(missing_rec.output_text.contains("release-checklist"));
+}

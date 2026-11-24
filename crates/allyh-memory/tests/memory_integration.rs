@@ -252,3 +252,116 @@ fn test_cross_platform_uri_expansion_and_repo_id_normalization() {
     assert_eq!(standard, verbatim);
     assert_eq!(standard, trailing);
 }
+
+#[tokio::test]
+async fn test_skills_crud_matching_and_partition_isolation() {
+    use allyh_memory::{MemoryError, normalize_skill_slug};
+
+    let dir = TempDir::new().expect("tempdir");
+    let store = MemoryStore::connect(
+        StorageConfig::from_local_path(dir.path().join("db")),
+        Arc::new(DeterministicHashEmbedder),
+    )
+    .await
+    .expect("connect");
+
+    let repo_a = compute_repo_id("/repos/skills-alpha");
+    let repo_b = compute_repo_id("/repos/skills-beta");
+
+    assert_eq!(normalize_skill_slug("Add  LanceDB!! Table"), "add-lancedb-table");
+    assert_eq!(normalize_skill_slug("---"), "");
+
+    // Punctuation-only names are rejected cleanly
+    let bad = store
+        .save_skill(&repo_a, DEFAULT_SCOPE_ID, "---", "desc", "steps", vec![])
+        .await;
+    assert!(matches!(bad, Err(MemoryError::InvalidSkill(_))));
+
+    // Create skill
+    let (created_rec, created) = store
+        .save_skill(
+            &repo_a,
+            DEFAULT_SCOPE_ID,
+            "add-lancedb-table",
+            "Add a new Apache Arrow table to LanceDB",
+            "1. Define Arrow schema.\n2. Register table in store.rs.",
+            vec!["new table".into(), "lancedb schema".into(), "new table".into()],
+        )
+        .await
+        .expect("create skill");
+    assert!(created);
+    assert_eq!(created_rec.triggers, vec!["new table", "lancedb schema"]);
+
+    // Update preserves created_at
+    let (updated_rec, created_again) = store
+        .save_skill(
+            &repo_a,
+            DEFAULT_SCOPE_ID,
+            "add-lancedb-table",
+            "Add a new Arrow table to LanceDB",
+            "1. Define Arrow schema.\n2. Register table in store.rs.\n3. Add tests.",
+            vec!["new table".into(), "lancedb schema".into()],
+        )
+        .await
+        .expect("update skill");
+    assert!(!created_again);
+    assert_eq!(updated_rec.created_at, created_rec.created_at);
+    assert!(updated_rec.instructions.contains("Add tests."));
+
+    // Lookup by exact name, case-insensitive name, slug, and id
+    assert!(
+        store
+            .get_skill(&repo_a, DEFAULT_SCOPE_ID, "ADD-LANCEDB-TABLE")
+            .await
+            .expect("get ci")
+            .is_some()
+    );
+    assert!(
+        store
+            .get_skill(&repo_a, DEFAULT_SCOPE_ID, &updated_rec.id)
+            .await
+            .expect("get id")
+            .is_some()
+    );
+
+    // Partition isolation across repos and scopes
+    assert!(store.list_skills(&repo_b, DEFAULT_SCOPE_ID).await.expect("repo b").is_empty());
+    assert!(store.list_skills(&repo_a, "other-scope").await.expect("other scope").is_empty());
+
+    // Trigger matching
+    let matched = store
+        .match_skills(&repo_a, DEFAULT_SCOPE_ID, "How do I add a new table here?", 3)
+        .await
+        .expect("match");
+    assert_eq!(matched.len(), 1);
+    assert_eq!(matched[0].name, "add-lancedb-table");
+
+    let unmatched = store
+        .match_skills(&repo_a, DEFAULT_SCOPE_ID, "Fix CSS button alignment", 3)
+        .await
+        .expect("unmatched");
+    assert!(unmatched.is_empty());
+
+    // DbStatusReport includes skills_count
+    let report = store
+        .status_report(&repo_a, DEFAULT_SCOPE_ID)
+        .await
+        .expect("status");
+    assert_eq!(report.skills_count, 1);
+
+    // Delete skill
+    let removed = store
+        .delete_skill(&repo_a, DEFAULT_SCOPE_ID, "add-lancedb-table")
+        .await
+        .expect("delete");
+    assert!(removed.is_some());
+    assert!(store.list_skills(&repo_a, DEFAULT_SCOPE_ID).await.expect("empty").is_empty());
+    assert_eq!(
+        store
+            .status_report(&repo_a, DEFAULT_SCOPE_ID)
+            .await
+            .expect("status after delete")
+            .skills_count,
+        0
+    );
+}

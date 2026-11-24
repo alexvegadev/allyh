@@ -188,8 +188,11 @@ fn render_welcome(frame: &mut Frame<'_>, area: Rect) {
     } else if available >= 2 {
         lines.push(Line::raw(""));
     }
-    if available < 4 {
-        let shortcuts = if area.width >= 33 {
+    let remaining = usize::from(area.height).saturating_sub(lines.len());
+    if remaining < 4 {
+        let shortcuts = if area.width >= 43 {
+            "/plan <goal>   /memories   /skills   /help"
+        } else if area.width >= 33 {
             "/plan <goal>   /memories   /help"
         } else {
             "/help"
@@ -199,6 +202,7 @@ fn render_welcome(frame: &mut Frame<'_>, area: Rect) {
         for (command, description) in [
             ("/plan <goal>", "Propose a change"),
             ("/memories", "Review project decisions"),
+            ("/skills", "Browse reusable skills"),
             ("/help", "Browse commands"),
         ] {
             lines.push(Line::from(vec![
@@ -237,6 +241,7 @@ fn render_inspector(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         field("Build", snapshot.build_status.as_str()),
         field("Storage", snapshot.storage_backend_label.as_str()),
         field("Scope", snapshot.scope_id.as_str()),
+        field("Skills", snapshot.skills_count.to_string()),
         field(
             "Partition",
             snapshot.repo_id.chars().take(12).collect::<String>(),
