@@ -73,7 +73,7 @@ Both installers automatically detect your platform, verify the `SHA256SUMS` dige
 ### Prerequisites (Building from Source)
 
 - Supported platforms: **Linux**, **macOS**, and **Windows**
-- Rust toolchain (Edition 2024 / Cargo) and a C compiler for bundled `libgit2` / `tree-sitter` crates
+- Rust toolchain (Edition 2024 / Cargo), `protoc` (Protocol Buffers compiler, required by LanceDB), and a C compiler for bundled `libgit2` / `tree-sitter` crates
 
 ### Build & Run
 
