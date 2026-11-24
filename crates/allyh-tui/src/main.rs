@@ -9,7 +9,7 @@ use std::io;
 
 use allyh_core::{AllyHOrchestrator, HybridRouter, ModelProfile, OrchestratorConfig, UserCommand};
 use allyh_env::canonicalize_normalized;
-use allyh_memory::StorageConfig;
+use allyh_memory::{EmbeddingProfile, StorageConfig};
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossterm::cursor::Show;
@@ -103,7 +103,15 @@ async fn main() -> Result<()> {
         );
     }
 
-    let orchestrator = AllyHOrchestrator::initialize(cfg, router, None)
+    let embedding_profile = match &args.embedding_model {
+        Some(spec) => {
+            EmbeddingProfile::parse_spec(spec).context("invalid --embedding-model spec")?
+        }
+        None => EmbeddingProfile::from_env(),
+    };
+    let embedder = embedding_profile.build_provider();
+
+    let orchestrator = AllyHOrchestrator::initialize(cfg, router, Some(embedder))
         .await
         .context("failed to initialize AllyH orchestrator")?;
     let initial_snapshot = orchestrator

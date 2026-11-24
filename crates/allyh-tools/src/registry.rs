@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::edit::{EditByHashArgs, EditByHashTool};
 use crate::error::ToolError;
 use crate::inspect::{InspectSymbolArgs, InspectSymbolTool};
+use crate::skill::{AddSkillArgs, AddSkillTool};
 use crate::verify::{RunVerificationArgs, RunVerificationTool};
 
 /// Compact execution card emitted after every ACI tool invocation for the TUI and audit log.
@@ -30,6 +31,7 @@ pub struct AciToolset {
     inspect: InspectSymbolTool,
     edit: EditByHashTool,
     verify: RunVerificationTool,
+    skill: AddSkillTool,
     writes_enabled: Arc<AtomicBool>,
 }
 
@@ -43,7 +45,8 @@ impl AciToolset {
         Self {
             inspect: InspectSymbolTool::new(Arc::clone(&env), store.clone()),
             edit: EditByHashTool::new(Arc::clone(&env), Arc::clone(&writes_enabled), auto_cargo_check),
-            verify: RunVerificationTool::new(env, store),
+            verify: RunVerificationTool::new(Arc::clone(&env), store.clone()),
+            skill: AddSkillTool::new(env, store, Arc::clone(&writes_enabled)),
             writes_enabled,
         }
     }
@@ -66,6 +69,10 @@ impl AciToolset {
 
     pub fn verify_tool(&self) -> &RunVerificationTool {
         &self.verify
+    }
+
+    pub fn skill_tool(&self) -> &AddSkillTool {
+        &self.skill
     }
 
     /// Return `rig-core` [`ToolDefinition`]s exposed to the active completion model.
@@ -94,6 +101,17 @@ impl AciToolset {
                 self.edit.parameters(),
             )
             .with_annotations(self.edit.annotations()),
+        );
+
+        // Expose `add_skill` definition always; the tool enforces the write-approval gate
+        // at execution time before persisting a reusable procedural skill.
+        defs.push(
+            ToolDefinition::new(
+                ToolName::new(AddSkillTool::NAME).expect("valid tool name"),
+                self.skill.description(),
+                self.skill.parameters(),
+            )
+            .with_annotations(self.skill.annotations()),
         );
         defs
     }
@@ -221,6 +239,39 @@ impl AciToolset {
                 Err(err) => failed_record(
                     tool_name,
                     "run_verification(invalid args)",
+                    ToolError::InvalidArgs(err.to_string()),
+                ),
+            },
+            AddSkillTool::NAME => match serde_json::from_value::<AddSkillArgs>(args) {
+                Ok(parsed) => match self.skill.execute(parsed).await {
+                    Ok(out) => {
+                        let verb = if out.created { "created" } else { "updated" };
+                        let header = format!(
+                            "add_skill({}) -> {verb}, {} trigger(s)",
+                            out.name,
+                            out.triggers.len()
+                        );
+                        let json_val = serde_json::to_value(&out).unwrap_or_default();
+                        let rendered = format!(
+                            "{header}\nid: {}\nrepo: {} / scope: {}\nupdated_at: {}",
+                            out.id, out.repo_id, out.scope_id, out.updated_at
+                        );
+                        (
+                            ToolExecutionRecord {
+                                tool_name: tool_name.to_string(),
+                                compact_header: header,
+                                succeeded: true,
+                                output_text: rendered.clone(),
+                                output_json: json_val,
+                            },
+                            ToolOutput::text(rendered),
+                        )
+                    }
+                    Err(err) => failed_record(tool_name, "add_skill", err),
+                },
+                Err(err) => failed_record(
+                    tool_name,
+                    "add_skill(invalid args)",
                     ToolError::InvalidArgs(err.to_string()),
                 ),
             },

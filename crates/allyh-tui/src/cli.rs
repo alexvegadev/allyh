@@ -32,6 +32,10 @@ pub struct CliArgs {
     #[arg(long, env = "ALLYH_WORKER_MODEL")]
     pub worker_model: Option<String>,
 
+    /// Embedding model spec (e.g. `local:Qwen3-Embedding-0.6B`, `ollama:nomic-embed-text`, `voyage:voyage-code-3`, `jina:jina-embeddings-v3`, `gemini:gemini-embedding-001`, `openai:text-embedding-3-small`, `offline`).
+    #[arg(long, env = "ALLYH_EMBEDDING_MODEL")]
+    pub embedding_model: Option<String>,
+
     /// Disable automatic post-edit `cargo check --message-format=json`.
     #[arg(long, default_value_t = false)]
     pub no_auto_check: bool,
@@ -78,10 +82,21 @@ mod tests {
 
     #[test]
     fn parses_default_tui_invocation_without_subcommand() {
-        let args = CliArgs::try_parse_from(["allyh", "--repo", "workspace", "--no-auto-check"])
-            .expect("parse default CLI args");
+        let args = CliArgs::try_parse_from([
+            "allyh",
+            "--repo",
+            "workspace",
+            "--embedding-model",
+            "local:Qwen3-Embedding-0.6B",
+            "--no-auto-check",
+        ])
+        .expect("parse default CLI args");
         assert!(args.command.is_none());
         assert_eq!(args.repo, PathBuf::from("workspace"));
+        assert_eq!(
+            args.embedding_model.as_deref(),
+            Some("local:Qwen3-Embedding-0.6B")
+        );
         assert!(args.no_auto_check);
     }
 

@@ -18,6 +18,7 @@ pub const TABLE_SESSIONS: &str = "sessions";
 pub const TABLE_ARCHITECTURAL_DECISIONS: &str = "architectural_decisions";
 pub const TABLE_TASKS: &str = "tasks";
 pub const TABLE_CODE_GRAPH_SNAPSHOTS: &str = "code_graph_snapshots";
+pub const TABLE_SKILLS: &str = "skills";
 
 /// Episodic session summary record stored in `sessions`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -114,6 +115,23 @@ pub struct TaskRecord {
     pub acceptance_criteria: Vec<String>,
     pub status: TaskStatus,
     pub last_error_trace: Option<String>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Reusable procedural skill stored in `skills`.
+///
+/// A skill captures a named, reusable procedure (instructions + optional trigger hints)
+/// that the agent can register once and recall across turns and sessions.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillRecord {
+    pub id: String,
+    pub repo_id: String,
+    pub scope_id: String,
+    pub name: String,
+    pub description: String,
+    pub instructions: String,
+    pub triggers: Vec<String>,
+    pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -215,6 +233,20 @@ pub fn code_graph_snapshots_schema() -> SchemaRef {
         Field::new("symbols", DataType::Utf8, false),
         Field::new("dependencies", string_list_type(), false),
         Field::new("vector", vector_type(), false),
+    ]))
+}
+
+pub fn skills_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("repo_id", DataType::Utf8, false),
+        Field::new("scope_id", DataType::Utf8, false),
+        Field::new("name", DataType::Utf8, false),
+        Field::new("description", DataType::Utf8, false),
+        Field::new("instructions", DataType::Utf8, false),
+        Field::new("triggers", string_list_type(), false),
+        Field::new("created_at", timestamp_utc(), false),
+        Field::new("updated_at", timestamp_utc(), false),
     ]))
 }
 
@@ -495,6 +527,69 @@ pub fn batch_to_tasks(batch: &RecordBatch) -> Result<Vec<TaskRecord>> {
             } else {
                 Some(error_traces.value(i).to_string())
             },
+            updated_at: micros_to_utc(updated_at.value(i)),
+        });
+    }
+    Ok(out)
+}
+
+pub fn skills_to_batch(records: &[SkillRecord]) -> Result<RecordBatch> {
+    let schema = skills_schema();
+    let ids = StringArray::from_iter_values(records.iter().map(|r| r.id.as_str()));
+    let repo_ids = StringArray::from_iter_values(records.iter().map(|r| r.repo_id.as_str()));
+    let scope_ids = StringArray::from_iter_values(records.iter().map(|r| r.scope_id.as_str()));
+    let names = StringArray::from_iter_values(records.iter().map(|r| r.name.as_str()));
+    let descriptions = StringArray::from_iter_values(records.iter().map(|r| r.description.as_str()));
+    let instructions = StringArray::from_iter_values(records.iter().map(|r| r.instructions.as_str()));
+    let triggers_vec: Vec<Vec<String>> = records.iter().map(|r| r.triggers.clone()).collect();
+    let triggers = build_string_list_array(&triggers_vec);
+    let created_at = TimestampMicrosecondArray::from_iter_values(
+        records.iter().map(|r| r.created_at.timestamp_micros()),
+    )
+    .with_timezone("UTC");
+    let updated_at = TimestampMicrosecondArray::from_iter_values(
+        records.iter().map(|r| r.updated_at.timestamp_micros()),
+    )
+    .with_timezone("UTC");
+
+    Ok(RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(ids),
+            Arc::new(repo_ids),
+            Arc::new(scope_ids),
+            Arc::new(names),
+            Arc::new(descriptions),
+            Arc::new(instructions),
+            Arc::new(triggers),
+            Arc::new(created_at),
+            Arc::new(updated_at),
+        ],
+    )?)
+}
+
+pub fn batch_to_skills(batch: &RecordBatch) -> Result<Vec<SkillRecord>> {
+    let ids = col_str(batch, "id")?;
+    let repo_ids = col_str(batch, "repo_id")?;
+    let scope_ids = col_str(batch, "scope_id")?;
+    let names = col_str(batch, "name")?;
+    let descriptions = col_str(batch, "description")?;
+    let instructions = col_str(batch, "instructions")?;
+    let triggers = col_list(batch, "triggers")?;
+    let created_at = col_ts(batch, "created_at")?;
+    let updated_at = col_ts(batch, "updated_at")?;
+
+    let mut out = Vec::with_capacity(batch.num_rows());
+    for i in 0..batch.num_rows() {
+        out.push(SkillRecord {
+            id: ids.value(i).to_string(),
+            repo_id: repo_ids.value(i).to_string(),
+            scope_id: scope_ids.value(i).to_string(),
+            name: names.value(i).to_string(),
+            description: descriptions.value(i).to_string(),
+            instructions: instructions.value(i).to_string(),
+            triggers: read_string_list(triggers, i),
+            created_at: micros_to_utc(created_at.value(i)),
             updated_at: micros_to_utc(updated_at.value(i)),
         });
     }

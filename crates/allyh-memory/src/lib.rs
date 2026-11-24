@@ -20,13 +20,15 @@ pub use consolidator::{
     HeuristicConflictJudge, MemoryConsolidator, SleepJob, SleepTimeWorkerHandle, WorkerStatus,
 };
 pub use embeddings::{
-    DeterministicHashEmbedder, EmbeddingProvider, OpenAiCompatibleEmbedder, cosine_similarity,
+    DEFAULT_LOCAL_EMBEDDING_BASE_URL, DEFAULT_LOCAL_EMBEDDING_MODEL,
+    DEFAULT_OLLAMA_EMBEDDING_BASE_URL, DeterministicHashEmbedder, EmbeddingProfile,
+    EmbeddingProvider, EmbeddingProviderKind, OpenAiCompatibleEmbedder, cosine_similarity,
     fit_embedding_dim,
 };
 pub use error::{MemoryError, Result};
 pub use schema::{
     ArchitecturalDecision, CodeGraphSnapshot, DbStatusReport, EMBEDDING_DIM, ScoredDecision,
-    SessionRecord, TABLE_ARCHITECTURAL_DECISIONS, TABLE_CODE_GRAPH_SNAPSHOTS, TABLE_SESSIONS,
-    TABLE_TASKS, TaskRecord, TaskStatus, VerificationProof,
+    SessionRecord, SkillRecord, TABLE_ARCHITECTURAL_DECISIONS, TABLE_CODE_GRAPH_SNAPSHOTS,
+    TABLE_SESSIONS, TABLE_SKILLS, TABLE_TASKS, TaskRecord, TaskStatus, VerificationProof,
 };
 pub use store::MemoryStore;

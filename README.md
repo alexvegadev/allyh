@@ -115,13 +115,17 @@ Set `GH_TOKEN` / `GITHUB_TOKEN` (or pass `--token`) to avoid unauthenticated Git
 | `--scope <SCOPE>` | `ALLYH_SCOPE_ID` | `default` | Multi-agent or team memory partition scope |
 | `--model <SPEC>` | `ALLYH_MODEL` | Auto-detected | Primary model (`anthropic:<id>`, `openai:<id>`, `local:<id>[@url]`, `offline`) |
 | `--worker-model <SPEC>` | `ALLYH_WORKER_MODEL` | Auto-detected | Local background worker model for compaction & consolidation |
+| `--embedding-model <SPEC>` | `ALLYH_EMBEDDING_MODEL` | Auto-detected | Embedding model (`local:<id>[@url]`, `ollama:<id>[@url]`, `voyage:<id>`, `jina:<id>`, `gemini:<id>`, `openai:<id>`, `offline`) |
 | `--no-auto-check` | — | `false` | Disable automatic post-edit `cargo check` |
 
 #### Provider Environment Variables
 
 - **Anthropic:** `ANTHROPIC_API_KEY` (optional `ANTHROPIC_BASE_URL`)
 - **OpenAI:** `OPENAI_API_KEY` (optional `OPENAI_BASE_URL`)
-- **Local OpenAI-compatible server (`llama.cpp` / Ollama):** `ALLYH_LOCAL_BASE_URL` or `LLAMACPP_API_BASE_URL` (defaults to `http://localhost:9931/v1`), `ALLYH_LOCAL_MODEL`, optional `LLAMACPP_API_KEY`
+- **Local OpenAI-compatible server (`llama.cpp` / Ollama):** `ALLYH_LOCAL_BASE_URL` or `LLAMACPP_API_BASE_URL` (defaults to `http://localhost:9931/v1`), `ALLYH_LOCAL_MODEL`, optional `LLAMACPP_API_KEY`, optional `OLLAMA_HOST` (defaults to `http://localhost:11434/v1` for `ollama:` specs)
+- **Embeddings (optional; auto-falls back to deterministic offline hashing):** `ALLYH_EMBEDDING_MODEL`, `ALLYH_EMBEDDING_BASE_URL`, `ALLYH_EMBEDDING_API_KEY`, or provider keys `VOYAGE_API_KEY`, `JINA_API_KEY`, `GEMINI_API_KEY` / `GOOGLE_API_KEY`, `OPENAI_API_KEY`. Vectors wider than 384 dims are Matryoshka (MRL) prefix-truncated and L2-normalized automatically.
+  - Recommended local specs: `local:Qwen3-Embedding-0.6B`, `ollama:nomic-embed-text`, or `local:bge-small-en-v1.5`
+  - Recommended free-tier API specs: `voyage:voyage-code-3`, `jina:jina-embeddings-v3`, or `gemini:gemini-embedding-001`
 
 When no API keys or local servers are configured, AllyH runs cleanly in deterministic offline mode so you can inspect the TUI, LanceDB state, and workflow locally.
 

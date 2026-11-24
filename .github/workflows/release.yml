@@ -125,6 +125,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
         run: |
           extra_args=()
           if [[ "${GITHUB_REF_NAME}" == *-* ]]; then

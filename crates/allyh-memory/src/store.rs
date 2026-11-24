@@ -19,11 +19,12 @@ use crate::embeddings::{EmbeddingProvider, cosine_similarity};
 use crate::error::{MemoryError, Result};
 use crate::schema::{
     ArchitecturalDecision, CodeGraphSnapshot, DbStatusReport, ScoredDecision, SessionRecord,
-    TABLE_ARCHITECTURAL_DECISIONS, TABLE_CODE_GRAPH_SNAPSHOTS, TABLE_SESSIONS, TABLE_TASKS,
-    TaskRecord, TaskStatus, VerificationProof, architectural_decisions_schema, batch_to_decisions,
-    batch_to_sessions, batch_to_snapshots, batch_to_tasks, code_graph_snapshots_schema,
-    decisions_to_batch, sessions_schema, sessions_to_batch, snapshots_to_batch, tasks_schema,
-    tasks_to_batch,
+    SkillRecord, TABLE_ARCHITECTURAL_DECISIONS, TABLE_CODE_GRAPH_SNAPSHOTS, TABLE_SESSIONS,
+    TABLE_SKILLS, TABLE_TASKS, TaskRecord, TaskStatus, VerificationProof,
+    architectural_decisions_schema, batch_to_decisions, batch_to_sessions, batch_to_skills,
+    batch_to_snapshots, batch_to_tasks, code_graph_snapshots_schema, decisions_to_batch,
+    sessions_schema, sessions_to_batch, skills_schema, skills_to_batch, snapshots_to_batch,
+    tasks_schema, tasks_to_batch,
 };
 
 /// Minimum row count required by LanceDB before training an IVF-PQ vector index.
@@ -101,6 +102,12 @@ impl MemoryStore {
                 .execute()
                 .await?;
         }
+        if !existing.iter().any(|n| n == TABLE_SKILLS) {
+            self.connection
+                .create_empty_table(TABLE_SKILLS, skills_schema())
+                .execute()
+                .await?;
+        }
 
         // Best-effort scalar / FTS index initialization.
         if let Err(err) = self.ensure_indexes().await {
@@ -121,6 +128,7 @@ impl MemoryStore {
             TABLE_ARCHITECTURAL_DECISIONS,
             TABLE_TASKS,
             TABLE_CODE_GRAPH_SNAPSHOTS,
+            TABLE_SKILLS,
         ] {
             let table = self.open_table(table_name).await?;
             let count = table.count_rows(None).await?;
@@ -527,6 +535,48 @@ impl MemoryStore {
     }
 
     // -----------------------------------------------------------------------
+    // Skills (Reusable Procedural Knowledge)
+    // -----------------------------------------------------------------------
+
+    /// Insert or update a reusable skill, keyed by its stable `id`.
+    pub async fn upsert_skill(&self, skill: &SkillRecord) -> Result<()> {
+        let table = self.open_table(TABLE_SKILLS).await?;
+        let batch = skills_to_batch(std::slice::from_ref(skill))?;
+        let schema = batch.schema();
+        let reader = Box::new(RecordBatchIterator::new(vec![Ok(batch)], schema));
+        let mut merge = table.merge_insert(&["id"]);
+        merge
+            .when_matched_update_all(None)
+            .when_not_matched_insert_all();
+        merge.execute(reader).await?;
+        Ok(())
+    }
+
+    /// List all skills registered for a repo/scope, newest-updated first.
+    pub async fn list_skills(&self, repo_id: &str, scope_id: &str) -> Result<Vec<SkillRecord>> {
+        let table = self.open_table(TABLE_SKILLS).await?;
+        let filter = format!(
+            "repo_id = '{}' AND scope_id = '{}'",
+            escape_sql_literal(repo_id),
+            escape_sql_literal(scope_id)
+        );
+        let batches = table
+            .query()
+            .only_if(filter)
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let mut skills = Vec::new();
+        for batch in &batches {
+            skills.extend(batch_to_skills(batch)?);
+        }
+        skills.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        Ok(skills)
+    }
+
+    // -----------------------------------------------------------------------
     // Code Graph Snapshots (RepoGraph + File Integrity)
     // -----------------------------------------------------------------------
 
@@ -629,6 +679,7 @@ impl MemoryStore {
             TABLE_ARCHITECTURAL_DECISIONS,
             TABLE_TASKS,
             TABLE_CODE_GRAPH_SNAPSHOTS,
+            TABLE_SKILLS,
         ] {
             let table = self.open_table(table_name).await?;
             if table.count_rows(None).await? > 0 {
