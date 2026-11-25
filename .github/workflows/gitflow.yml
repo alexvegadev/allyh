@@ -1,0 +1,44 @@
+name: GitFlow
+
+on:
+  pull_request:
+    branches: [main, develop]
+    types: [opened, reopened, synchronize, edited, ready_for_review]
+
+permissions: {}
+
+jobs:
+  branch-routing:
+    name: GitFlow branch routing
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate pull request branches
+        shell: bash
+        env:
+          BASE_BRANCH: ${{ github.base_ref }}
+          HEAD_BRANCH: ${{ github.head_ref }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          BASE_REPOSITORY: ${{ github.repository }}
+        run: |
+          case "$BASE_BRANCH" in
+            main)
+              if [[ "$HEAD_REPOSITORY" == "$BASE_REPOSITORY" ]]; then
+                case "$HEAD_BRANCH" in
+                  release/*|hotfix/*) exit 0 ;;
+                esac
+              fi
+              echo '::error::Open PRs into main from a release/* or hotfix/* branch in this repository.'
+              ;;
+            develop)
+              if [[ "$HEAD_REPOSITORY" == "$BASE_REPOSITORY" ]]; then
+                case "$HEAD_BRANCH" in
+                  main|release/*|hotfix/*) exit 0 ;;
+                esac
+              fi
+              case "$HEAD_BRANCH" in
+                feature/*|fix/*|docs/*|chore/*|refactor/*|test/*|build/*|ci/*|perf/*|style/*|revert/*|dependabot/*|renovate/*) exit 0 ;;
+              esac
+              echo '::error::Open contributions into develop from a topic branch such as feature/*, fix/*, or docs/*. Sync releases and hotfixes from this repository.'
+              ;;
+          esac
+          exit 1
