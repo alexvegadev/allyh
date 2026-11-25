@@ -1,5 +1,5 @@
 use allyh_env::{EgoGraph, EnvDelta};
-use allyh_memory::{ScoredDecision, TaskRecord, TaskStatus};
+use allyh_memory::{ScoredDecision, SkillRecord, TaskRecord, TaskStatus};
 use serde::{Deserialize, Serialize};
 
 use crate::gate::ControlGateState;
@@ -20,6 +20,8 @@ pub struct PreambleInputs<'a> {
     pub env_delta: &'a EnvDelta,
     pub tasks: &'a [TaskRecord],
     pub memories: &'a [ScoredDecision],
+    pub available_skills: &'a [SkillRecord],
+    pub active_skills: &'a [SkillRecord],
     pub ego_graphs: &'a [EgoGraph],
     pub rolling_summary: Option<&'a str>,
 }
@@ -39,6 +41,7 @@ impl DynamicPreambleAssembler {
              Operating Rules:\n\
              - Enforce all active Architectural Invariants below without requiring in-repo Markdown plans.\n\
              - Always inspect symbols (`inspect_symbol`) to obtain fresh SHA-256 hashes before calling `edit_by_hash`.\n\
+             - When a skill in the Available Skills catalog applies, call `get_skill` to load its full procedure; use `add_skill` to persist new reusable workflows.\n\
              - Work incrementally on the single active `in_progress` task and verify with `run_verification`.",
             &inputs.repo_id[..inputs.repo_id.len().min(12)],
             inputs.scope_id,
@@ -97,7 +100,39 @@ impl DynamicPreambleAssembler {
             sections.push(lines.join("\n"));
         }
 
-        // 4. Compact 1-hop RepoGraph Neighborhoods
+        // 4. Reusable Skills (Progressive Disclosure: compact catalog + expanded active skills)
+        if !inputs.available_skills.is_empty() {
+            let mut lines = vec!["## Available Skills (LanceDB)".to_string()];
+            for skill in inputs.available_skills {
+                let triggers = if skill.triggers.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [triggers: {}]", skill.triggers.join(", "))
+                };
+                let desc = if skill.description.is_empty() {
+                    "Reusable procedural skill"
+                } else {
+                    skill.description.as_str()
+                };
+                lines.push(format!("- `{}`: {desc}{triggers}", skill.name));
+            }
+            sections.push(lines.join("\n"));
+        }
+
+        if !inputs.active_skills.is_empty() {
+            let mut blocks = vec!["## Active Skill Instructions".to_string()];
+            for skill in inputs.active_skills {
+                let mut block = format!("### {}", skill.name);
+                if !skill.description.is_empty() {
+                    block.push_str(&format!("\n_{}_", skill.description));
+                }
+                block.push_str(&format!("\n{}", skill.instructions.trim()));
+                blocks.push(block);
+            }
+            sections.push(blocks.join("\n\n"));
+        }
+
+        // 5. Compact 1-hop RepoGraph Neighborhoods
         let mut graph_blocks = Vec::new();
         for ego in inputs.ego_graphs {
             let rendered = ego.render_compact();

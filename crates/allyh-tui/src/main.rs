@@ -1,6 +1,7 @@
 mod app;
 mod cli;
 mod highlight;
+mod skills_cli;
 mod theme;
 mod ui;
 mod update;
@@ -82,8 +83,19 @@ async fn main() -> Result<()> {
 
     let args = CliArgs::parse();
 
-    if let Some(CliCommand::Update(update_args)) = args.command {
-        return update::run_cli(update_args).await;
+    if let Some(command) = args.command {
+        return match command {
+            CliCommand::Update(update_args) => update::run_cli(update_args).await,
+            CliCommand::Skills(skills_args) => {
+                skills_cli::run_cli(
+                    skills_args,
+                    &args.repo,
+                    args.db_uri.as_deref(),
+                    &args.scope,
+                )
+                .await
+            }
+        };
     }
 
     let mut cfg = OrchestratorConfig::new(&args.repo);
@@ -126,6 +138,7 @@ async fn main() -> Result<()> {
         .unwrap_or(repo_path.as_os_str())
         .to_string_lossy();
     let mut app = AppState::new(initial_snapshot, repo_name.into_owned());
+    app.repo_root = repo_path;
     let highlighter = MarkdownHighlighter::new();
 
     install_panic_hook();
@@ -323,6 +336,7 @@ mod tests {
             gate_state,
             active_tasks: Vec::new(),
             activated_memories: Vec::new(),
+            skills_count: 0,
             active_model_label: "API: claude-sonnet-4-6".into(),
             worker_model_label: "Local 9B".into(),
             worker_status: WorkerStatus::Idle,
@@ -577,5 +591,93 @@ mod tests {
         );
         assert!(app.should_quit);
         assert!(matches!(rx.try_recv(), Ok(UserCommand::Shutdown)));
+    }
+
+    #[test]
+    fn test_skills_slash_commands_and_workspace_count() {
+        use std::collections::HashSet;
+
+        use allyh_core::UiEvent;
+        use allyh_memory::SkillRecord;
+        use chrono::Utc;
+
+        let mut snap = sample_snapshot(ControlGateState::Discovery);
+        snap.skills_count = 3;
+        let mut app = AppState::new(snap, "allyh".into());
+
+        // Slash command parsing for all /skills variants
+        assert!(matches!(
+            app.parse_submission("/skills"),
+            Some(UserCommand::RequestSkills)
+        ));
+        assert!(matches!(
+            app.parse_submission("/skills list"),
+            Some(UserCommand::RequestSkills)
+        ));
+        assert!(matches!(
+            app.parse_submission("/skills show release-flow"),
+            Some(UserCommand::ShowSkill(ref s)) if s == "release-flow"
+        ));
+        assert!(matches!(
+            app.parse_submission("/skill release-flow"),
+            Some(UserCommand::ShowSkill(ref s)) if s == "release-flow"
+        ));
+        assert!(matches!(
+            app.parse_submission("/skills pin release-flow"),
+            Some(UserCommand::PinSkill(ref s)) if s == "release-flow"
+        ));
+        assert!(matches!(
+            app.parse_submission("/skills remove release-flow"),
+            Some(UserCommand::RemoveSkill(ref s)) if s == "release-flow"
+        ));
+
+        // Importing a SKILL.md from disk produces UserCommand::UpsertSkill
+        let unique = format!(
+            "allyh-skill-import-test-{}.md",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let temp_skill = std::env::temp_dir().join(unique);
+        std::fs::write(
+            &temp_skill,
+            "---\nname: imported-skill\ndescription: Imported from file\ntriggers:\n  - import test\n---\nDo step one.\n",
+        )
+        .expect("write temp skill");
+        let import_cmd = app.parse_submission(&format!("/skills import {}", temp_skill.display()));
+        let _ = std::fs::remove_file(&temp_skill);
+        assert!(matches!(
+            import_cmd,
+            Some(UserCommand::UpsertSkill { ref name, ref triggers, .. })
+                if name == "imported-skill" && triggers == &vec!["import test".to_string()]
+        ));
+
+        // Render SkillsList + Workspace count in Inspector
+        let skill = SkillRecord {
+            id: "r:s:release-flow".into(),
+            repo_id: "r".into(),
+            scope_id: "s".into(),
+            name: "release-flow".into(),
+            description: "Release checklist".into(),
+            instructions: "1. Run cargo test.".into(),
+            triggers: vec!["release".into()],
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let mut pinned_ids = HashSet::new();
+        pinned_ids.insert(skill.id.clone());
+        app.apply_ui_event(UiEvent::SkillsList {
+            skills: vec![skill],
+            pinned_ids,
+        });
+
+        let highlighter = MarkdownHighlighter::new();
+        let rendered = screen(&mut app, &highlighter, 120, 36);
+        assert!(rendered.contains("Registered Skills (1)"));
+        assert!(rendered.contains("release-flow"));
+        assert!(rendered.contains("[PINNED]"));
+        assert!(rendered.contains("Skills"));
+        assert!(rendered.contains("3"));
     }
 }

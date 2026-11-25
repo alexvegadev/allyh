@@ -13,5 +13,7 @@ pub use inspect::{
     InspectSymbolArgs, InspectSymbolOutput, InspectSymbolTool, InspectedFileSnippet,
 };
 pub use registry::{AciToolset, ToolExecutionRecord};
-pub use skill::{AddSkillArgs, AddSkillOutput, AddSkillTool};
+pub use skill::{
+    AddSkillArgs, AddSkillOutput, AddSkillTool, GetSkillArgs, GetSkillOutput, GetSkillTool,
+};
 pub use verify::{RunVerificationArgs, RunVerificationOutput, RunVerificationTool};

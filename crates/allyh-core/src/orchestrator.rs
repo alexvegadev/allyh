@@ -7,8 +7,8 @@ use std::time::Duration;
 use allyh_env::{EnvDelta, EnvironmentMonitor, LiveFsWatcher};
 use allyh_memory::{
     CandidateDecision, ConsolidationOutcome, DbStatusReport, DeterministicHashEmbedder,
-    EmbeddingProvider, MemoryConsolidator, MemoryStore, ScoredDecision, SessionRecord, SleepJob,
-    SleepTimeWorkerHandle, StorageConfig, TaskRecord, WorkerStatus, compute_repo_id,
+    EmbeddingProvider, MemoryConsolidator, MemoryStore, ScoredDecision, SessionRecord, SkillRecord,
+    SleepJob, SleepTimeWorkerHandle, StorageConfig, TaskRecord, WorkerStatus, compute_repo_id,
 };
 use allyh_tools::{AciToolset, ToolExecutionRecord};
 use chrono::Utc;
@@ -38,6 +38,7 @@ pub struct InspectorSnapshot {
     pub gate_state: ControlGateState,
     pub active_tasks: Vec<TaskRecord>,
     pub activated_memories: Vec<ScoredDecision>,
+    pub skills_count: usize,
     pub active_model_label: String,
     pub worker_model_label: String,
     pub worker_status: WorkerStatus,
@@ -60,6 +61,16 @@ pub enum UserCommand {
     },
     RecordDecision(CandidateDecision),
     RequestMemories,
+    RequestSkills,
+    ShowSkill(String),
+    PinSkill(String),
+    RemoveSkill(String),
+    UpsertSkill {
+        name: String,
+        description: String,
+        instructions: String,
+        triggers: Vec<String>,
+    },
     RequestDbStatus,
     RefreshEnv { run_build_check: bool },
     CompactNow,
@@ -79,6 +90,14 @@ pub enum UiEvent {
     InspectorUpdated(InspectorSnapshot),
     WorkerStatusChanged(WorkerStatus),
     MemoriesList(Vec<ScoredDecision>),
+    SkillsList {
+        skills: Vec<SkillRecord>,
+        pinned_ids: HashSet<String>,
+    },
+    SkillDetail {
+        skill: SkillRecord,
+        pinned: bool,
+    },
     DbStatus(DbStatusReport),
     SystemNotice(String),
     Error(String),
@@ -134,6 +153,7 @@ pub struct AllyHOrchestrator {
     router: HybridRouter,
     history: CompactingHistory,
     pinned_decision_ids: HashSet<String>,
+    pinned_skill_ids: HashSet<String>,
     last_env_delta: EnvDelta,
     last_activated_memories: Vec<ScoredDecision>,
     last_preamble_tokens: u64,
@@ -231,6 +251,7 @@ impl AllyHOrchestrator {
             router,
             history: CompactingHistory::new(prior_summary),
             pinned_decision_ids: HashSet::new(),
+            pinned_skill_ids: HashSet::new(),
             last_env_delta: initial_delta,
             last_activated_memories: initial_active,
             last_preamble_tokens: 0,
@@ -326,6 +347,71 @@ impl AllyHOrchestrator {
         Ok(self.store.status_report(&self.repo_id, &self.scope_id).await?)
     }
 
+    /// List all skills registered for this `(repo_id, scope_id)` partition.
+    pub async fn list_skills(&self) -> Result<Vec<SkillRecord>> {
+        Ok(self.store.list_skills(&self.repo_id, &self.scope_id).await?)
+    }
+
+    /// Look up a single skill by name, slug, or id.
+    pub async fn get_skill(&self, name_or_id: &str) -> Result<Option<SkillRecord>> {
+        Ok(self
+            .store
+            .get_skill(&self.repo_id, &self.scope_id, name_or_id)
+            .await?)
+    }
+
+    /// Create or update a skill in LanceDB (user-initiated; works in Discovery mode).
+    pub async fn save_skill(
+        &self,
+        name: &str,
+        description: &str,
+        instructions: &str,
+        triggers: Vec<String>,
+    ) -> Result<(SkillRecord, bool)> {
+        Ok(self
+            .store
+            .save_skill(
+                &self.repo_id,
+                &self.scope_id,
+                name,
+                description,
+                instructions,
+                triggers,
+            )
+            .await?)
+    }
+
+    /// Remove a skill by name, slug, or id from LanceDB.
+    pub async fn remove_skill(&mut self, name_or_id: &str) -> Result<Option<SkillRecord>> {
+        let removed = self
+            .store
+            .delete_skill(&self.repo_id, &self.scope_id, name_or_id)
+            .await?;
+        if let Some(ref skill) = removed {
+            self.pinned_skill_ids.remove(&skill.id);
+        }
+        Ok(removed)
+    }
+
+    /// Pin or unpin a skill so its full instructions are always injected into the preamble.
+    pub async fn toggle_pin_skill(&mut self, name_or_id: &str) -> Result<Option<(SkillRecord, bool)>> {
+        let Some(skill) = self.get_skill(name_or_id).await? else {
+            return Ok(None);
+        };
+        let pinned = if self.pinned_skill_ids.contains(&skill.id) {
+            self.pinned_skill_ids.remove(&skill.id);
+            false
+        } else {
+            self.pinned_skill_ids.insert(skill.id.clone());
+            true
+        };
+        Ok(Some((skill, pinned)))
+    }
+
+    pub fn pinned_skill_ids(&self) -> &HashSet<String> {
+        &self.pinned_skill_ids
+    }
+
     /// Refresh environment delta (`git2`, SHA-256 hash comparison, incremental `tree-sitter` indexing).
     pub async fn refresh_env(&mut self, run_build_check: bool) -> Result<EnvDelta> {
         let delta = self
@@ -339,6 +425,11 @@ impl AllyHOrchestrator {
     /// Build the live [`InspectorSnapshot`] displayed in the TUI sidebar & status bar.
     pub async fn inspector_snapshot(&self) -> Result<InspectorSnapshot> {
         let tasks = self.store.list_tasks(&self.repo_id, &self.scope_id).await?;
+        let skills_count = self
+            .store
+            .list_skills(&self.repo_id, &self.scope_id)
+            .await?
+            .len();
         let mut memories = self.last_activated_memories.clone();
         for m in &mut memories {
             m.pinned = self.pinned_decision_ids.contains(&m.decision.id);
@@ -372,6 +463,7 @@ impl AllyHOrchestrator {
             gate_state: self.gate.state().clone(),
             active_tasks: tasks,
             activated_memories: memories,
+            skills_count,
             active_model_label: self.router.primary().label.clone(),
             worker_model_label: self.router.local_worker().label.clone(),
             worker_status: self.sleep_worker.status(),
@@ -405,8 +497,24 @@ impl AllyHOrchestrator {
         // 2. Hybrid search active architectural decisions + merge pinned rules.
         let memories = self.refresh_activated_memories(prompt).await?;
 
-        // 3. Gather active tasks and 1-hop RepoGraph ego-graphs.
+        // 3. Gather active tasks, reusable skills (catalog + pinned/matched), and 1-hop ego-graphs.
         let tasks = self.store.list_tasks(&self.repo_id, &self.scope_id).await?;
+        let available_skills = self.store.list_skills(&self.repo_id, &self.scope_id).await?;
+        let mut active_skills: Vec<SkillRecord> = available_skills
+            .iter()
+            .filter(|s| self.pinned_skill_ids.contains(&s.id))
+            .cloned()
+            .collect();
+        let matched_skills = self
+            .store
+            .match_skills(&self.repo_id, &self.scope_id, prompt, 3)
+            .await?;
+        for skill in matched_skills {
+            if !active_skills.iter().any(|s| s.id == skill.id) {
+                active_skills.push(skill);
+            }
+        }
+
         let sym_queries = DynamicPreambleAssembler::extract_symbol_queries(prompt, &env_delta);
         let mut ego_graphs = Vec::new();
         for q in &sym_queries {
@@ -424,6 +532,8 @@ impl AllyHOrchestrator {
             env_delta: &env_delta,
             tasks: &tasks,
             memories: &memories,
+            available_skills: &available_skills,
+            active_skills: &active_skills,
             ego_graphs: &ego_graphs,
             rolling_summary: Some(self.history.rolling_summary()),
         });
@@ -753,6 +863,104 @@ impl AllyHOrchestrator {
                             let _ = ui_tx.send(UiEvent::Error(err.to_string()));
                         }
                     },
+                    UserCommand::RequestSkills => match self.list_skills().await {
+                        Ok(skills) => {
+                            let _ = ui_tx.send(UiEvent::SkillsList {
+                                skills,
+                                pinned_ids: self.pinned_skill_ids.clone(),
+                            });
+                        }
+                        Err(err) => {
+                            let _ = ui_tx.send(UiEvent::Error(err.to_string()));
+                        }
+                    },
+                    UserCommand::ShowSkill(name_or_id) => match self.get_skill(&name_or_id).await {
+                        Ok(Some(skill)) => {
+                            let pinned = self.pinned_skill_ids.contains(&skill.id);
+                            let _ = ui_tx.send(UiEvent::SkillDetail { skill, pinned });
+                        }
+                        Ok(None) => {
+                            let _ = ui_tx.send(UiEvent::Error(format!(
+                                "Skill '{name_or_id}' not found. Run /skills to see registered skills."
+                            )));
+                        }
+                        Err(err) => {
+                            let _ = ui_tx.send(UiEvent::Error(err.to_string()));
+                        }
+                    },
+                    UserCommand::PinSkill(name_or_id) => {
+                        match self.toggle_pin_skill(&name_or_id).await {
+                            Ok(Some((skill, pinned))) => {
+                                let _ = ui_tx.send(UiEvent::SystemNotice(format!(
+                                    "Skill `{}` {}",
+                                    skill.name,
+                                    if pinned {
+                                        "pinned (always expanded in preamble)"
+                                    } else {
+                                        "unpinned"
+                                    }
+                                )));
+                                if let Ok(snap) = self.inspector_snapshot().await {
+                                    let _ = ui_tx.send(UiEvent::InspectorUpdated(snap));
+                                }
+                            }
+                            Ok(None) => {
+                                let _ = ui_tx.send(UiEvent::Error(format!(
+                                    "Skill '{name_or_id}' not found. Run /skills to see registered skills."
+                                )));
+                            }
+                            Err(err) => {
+                                let _ = ui_tx.send(UiEvent::Error(err.to_string()));
+                            }
+                        }
+                    }
+                    UserCommand::RemoveSkill(name_or_id) => {
+                        match self.remove_skill(&name_or_id).await {
+                            Ok(Some(skill)) => {
+                                let _ = ui_tx.send(UiEvent::SystemNotice(format!(
+                                    "Removed skill `{}`.",
+                                    skill.name
+                                )));
+                                if let Ok(snap) = self.inspector_snapshot().await {
+                                    let _ = ui_tx.send(UiEvent::InspectorUpdated(snap));
+                                }
+                            }
+                            Ok(None) => {
+                                let _ = ui_tx.send(UiEvent::Error(format!(
+                                    "Skill '{name_or_id}' not found. Run /skills to see registered skills."
+                                )));
+                            }
+                            Err(err) => {
+                                let _ = ui_tx.send(UiEvent::Error(err.to_string()));
+                            }
+                        }
+                    }
+                    UserCommand::UpsertSkill {
+                        name,
+                        description,
+                        instructions,
+                        triggers,
+                    } => {
+                        match self
+                            .save_skill(&name, &description, &instructions, triggers)
+                            .await
+                        {
+                            Ok((skill, created)) => {
+                                let verb = if created { "Saved" } else { "Updated" };
+                                let _ = ui_tx.send(UiEvent::SystemNotice(format!(
+                                    "{verb} skill `{}` ({} trigger(s)).",
+                                    skill.name,
+                                    skill.triggers.len()
+                                )));
+                                if let Ok(snap) = self.inspector_snapshot().await {
+                                    let _ = ui_tx.send(UiEvent::InspectorUpdated(snap));
+                                }
+                            }
+                            Err(err) => {
+                                let _ = ui_tx.send(UiEvent::Error(err.to_string()));
+                            }
+                        }
+                    }
                     UserCommand::RequestDbStatus => match self.db_status().await {
                         Ok(report) => {
                             let _ = ui_tx.send(UiEvent::DbStatus(report));

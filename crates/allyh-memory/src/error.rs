@@ -29,6 +29,9 @@ pub enum MemoryError {
 
     #[error("Invalid storage configuration: {0}")]
     Config(String),
+
+    #[error("Invalid skill definition: {0}")]
+    InvalidSkill(String),
 }
 
 pub type Result<T> = std::result::Result<T, MemoryError>;

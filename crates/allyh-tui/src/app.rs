@@ -1,5 +1,7 @@
+use std::path::PathBuf;
+
 use allyh_core::{AllyHOrchestrator, ControlGateState, InspectorSnapshot, UiEvent, UserCommand};
-use allyh_memory::WorkerStatus;
+use allyh_memory::{WorkerStatus, load_skill_markdown_file};
 use allyh_tools::ToolExecutionRecord;
 use crossterm::event::KeyCode;
 use ratatui::style::Style;
@@ -17,6 +19,7 @@ pub const COMMANDS: &[SlashCommand] = &[
     SlashCommand::new("/plan", "<goal>", "Propose a change for approval"),
     SlashCommand::new("/model", "[spec]", "Show or switch the reasoning model"),
     SlashCommand::new("/memories", "", "List active project decisions"),
+    SlashCommand::new("/skills", "[cmd]", "List, show, pin, import, or remove skills"),
     SlashCommand::new("/pin", "[id]", "Pin or unpin a decision"),
     SlashCommand::new("/invalidate", "[id]", "Retire a decision"),
     SlashCommand::new("/db-status", "", "Inspect storage and table counts"),
@@ -107,6 +110,7 @@ pub enum ChatEntry {
 /// Complete client-side TUI state driven by `UiEvent`s from `allyh-core`.
 pub struct AppState {
     pub repo_name: String,
+    pub repo_root: PathBuf,
     pub entries: Vec<ChatEntry>,
     pub inspector: InspectorSnapshot,
     pub input: TextArea<'static>,
@@ -124,6 +128,7 @@ impl AppState {
     pub fn new(initial_inspector: InspectorSnapshot, repo_name: String) -> Self {
         Self {
             repo_name,
+            repo_root: PathBuf::from("."),
             entries: Vec::new(),
             inspector: initial_inspector,
             input: composer(),
@@ -250,6 +255,7 @@ impl AppState {
                     Some(UserCommand::ProposePlan(plan))
                 }
                 "memories" => Some(UserCommand::RequestMemories),
+                "skills" | "skill" => self.parse_skills_command(cmd.as_str(), arg),
                 "invalidate" => {
                     if arg.is_empty() {
                         if let Some(id) = self.selected_memory_id() {
@@ -437,13 +443,73 @@ impl AppState {
                     )));
                 }
             }
+            UiEvent::SkillsList { skills, pinned_ids } => {
+                if skills.is_empty() {
+                    self.entries.push(ChatEntry::System(
+                        "No skills registered for this repository partition.\n\
+                         Import one with `/skills import <path/to/SKILL.md>`, run `allyh skills add`, or ask AllyH to save one with `add_skill`."
+                            .to_string(),
+                    ));
+                } else {
+                    let rendered = skills
+                        .iter()
+                        .map(|s| {
+                            let pin = if pinned_ids.contains(&s.id) {
+                                " [PINNED]"
+                            } else {
+                                ""
+                            };
+                            let desc = if s.description.is_empty() {
+                                "No description"
+                            } else {
+                                s.description.as_str()
+                            };
+                            let triggers = if s.triggers.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" _(triggers: {})_", s.triggers.join(", "))
+                            };
+                            format!("- `{}`{pin} — {desc}{triggers}", s.name)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    self.entries.push(ChatEntry::System(format!(
+                        "### Registered Skills ({})\n{rendered}\n\n\
+                         _Use `/skills show <name>`, `/skills pin <name>`, or `/skills remove <name>`._",
+                        skills.len()
+                    )));
+                }
+            }
+            UiEvent::SkillDetail { skill, pinned } => {
+                let pin_badge = if pinned { " [PINNED]" } else { "" };
+                let triggers = if skill.triggers.is_empty() {
+                    "none".to_string()
+                } else {
+                    skill.triggers.join(", ")
+                };
+                let desc = if skill.description.is_empty() {
+                    "—"
+                } else {
+                    skill.description.as_str()
+                };
+                self.entries.push(ChatEntry::System(format!(
+                    "### Skill: `{}`{pin_badge}\n\
+                     - **Description:** {desc}\n\
+                     - **Triggers:** {triggers}\n\
+                     - **Updated:** {}\n\n\
+                     {}",
+                    skill.name,
+                    skill.updated_at.format("%Y-%m-%d %H:%M UTC"),
+                    skill.instructions
+                )));
+            }
             UiEvent::DbStatus(report) => {
                 self.entries.push(ChatEntry::System(format!(
                     "### LanceDB Status ({})\n\
                      - URI: `{}`\n\
                      - Repo Partition: `{}` | Scope: `{}`\n\
                      - Sessions: {} | Active Rules: {} | Superseded/Invalidated: {}\n\
-                     - Tasks: {} | Code Graph Snapshots: {}",
+                     - Tasks: {} | Skills: {} | Code Graph Snapshots: {}",
                     report.backend_label,
                     report.uri,
                     &report.repo_id[..report.repo_id.len().min(12)],
@@ -452,6 +518,7 @@ impl AppState {
                     report.active_decisions_count,
                     report.invalidated_decisions_count,
                     report.tasks_count,
+                    report.skills_count,
                     report.code_snapshots_count,
                 )));
             }
@@ -477,5 +544,101 @@ impl AppState {
             WorkerStatus::Consolidating => "Consolidating",
             WorkerStatus::Optimizing => "Optimizing",
         }
+    }
+
+    fn parse_skills_command(&mut self, cmd: &str, arg: &str) -> Option<UserCommand> {
+        let trimmed = arg.trim();
+        if trimmed.is_empty() {
+            return Some(UserCommand::RequestSkills);
+        }
+
+        let mut parts = trimmed.splitn(2, char::is_whitespace);
+        let sub = parts.next().unwrap_or("").to_ascii_lowercase();
+        let rest = parts.next().unwrap_or("").trim();
+
+        match sub.as_str() {
+            "list" | "ls" => Some(UserCommand::RequestSkills),
+            "show" | "view" | "get" => {
+                if rest.is_empty() {
+                    self.entries.push(ChatEntry::System(
+                        "Usage: /skills show <name>".to_string(),
+                    ));
+                    None
+                } else {
+                    Some(UserCommand::ShowSkill(rest.to_string()))
+                }
+            }
+            "pin" | "unpin" => {
+                if rest.is_empty() {
+                    self.entries.push(ChatEntry::System(
+                        "Usage: /skills pin <name>".to_string(),
+                    ));
+                    None
+                } else {
+                    Some(UserCommand::PinSkill(rest.to_string()))
+                }
+            }
+            "remove" | "rm" | "delete" => {
+                if rest.is_empty() {
+                    self.entries.push(ChatEntry::System(
+                        "Usage: /skills remove <name>".to_string(),
+                    ));
+                    None
+                } else {
+                    Some(UserCommand::RemoveSkill(rest.to_string()))
+                }
+            }
+            "import" => {
+                let raw_path = rest.trim_matches(|c| c == '"' || c == '\'').trim();
+                if raw_path.is_empty() {
+                    self.entries.push(ChatEntry::System(
+                        "Usage: /skills import <path-to-SKILL.md>".to_string(),
+                    ));
+                    return None;
+                }
+                let candidate = PathBuf::from(raw_path);
+                let resolved = if candidate.is_absolute() || candidate.exists() {
+                    candidate
+                } else {
+                    self.repo_root.join(&candidate)
+                };
+                match load_skill_markdown_file(&resolved) {
+                    Ok(doc) => Some(UserCommand::UpsertSkill {
+                        name: doc.name,
+                        description: doc.description,
+                        instructions: doc.instructions,
+                        triggers: doc.triggers,
+                    }),
+                    Err(err) => {
+                        self.entries.push(ChatEntry::Error(format!(
+                            "Failed to import skill from '{}': {err}",
+                            resolved.display()
+                        )));
+                        None
+                    }
+                }
+            }
+            "help" => {
+                self.push_skills_usage();
+                None
+            }
+            _ if cmd == "skill" => Some(UserCommand::ShowSkill(trimmed.to_string())),
+            _ => {
+                self.push_skills_usage();
+                None
+            }
+        }
+    }
+
+    fn push_skills_usage(&mut self) {
+        self.entries.push(ChatEntry::System(
+            "### Skills Commands\n\
+             - `/skills`  List all skills for this repository\n\
+             - `/skills show <name>`  View a skill's full instructions (or `/skill <name>`)\n\
+             - `/skills pin <name>`  Pin or unpin a skill in the dynamic preamble\n\
+             - `/skills import <path>`  Import a `SKILL.md` file into LanceDB\n\
+             - `/skills remove <name>`  Delete a skill from LanceDB"
+                .to_string(),
+        ));
     }
 }

@@ -10,6 +10,7 @@ pub mod consolidator;
 pub mod embeddings;
 pub mod error;
 pub mod schema;
+pub mod skill_doc;
 pub mod store;
 
 pub use config::{
@@ -30,5 +31,9 @@ pub use schema::{
     ArchitecturalDecision, CodeGraphSnapshot, DbStatusReport, EMBEDDING_DIM, ScoredDecision,
     SessionRecord, SkillRecord, TABLE_ARCHITECTURAL_DECISIONS, TABLE_CODE_GRAPH_SNAPSHOTS,
     TABLE_SESSIONS, TABLE_SKILLS, TABLE_TASKS, TaskRecord, TaskStatus, VerificationProof,
+    normalize_skill_slug, skill_id,
+};
+pub use skill_doc::{
+    SkillDocument, load_skill_markdown_file, parse_skill_markdown, render_skill_markdown,
 };
 pub use store::MemoryStore;
