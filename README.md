@@ -4,6 +4,23 @@
 
 AllyH is a lightweight, out-of-tree operating system around [`rig-core`](https://crates.io/crates/rig-core) and [LanceDB](https://lancedb.com/). It prevents long-running context drift across coding sessions without polluting your repository with static Markdown plans—combining bi-temporal architectural memory, hybrid vector + full-text retrieval, `tree-sitter` dependency ego-graphs, SHA-256 edit integrity checks, prescriptive compiler feedback, and explicit plan approval gates inside a 60 FPS Ratatui terminal interface.
 
+## Screenshots
+
+Captured in an offline demo workspace with sample data.
+
+![AllyH workspace showing the conversation, prompt, and inspector](screens/01-workspace.png)
+
+<details>
+<summary>See the skills catalog, skill details, and plan approval</summary>
+
+![Reusable skills catalog with example triggers](screens/02-skills.png)
+
+![API review skill with its trigger and instructions](screens/03-skill-details.png)
+
+![Plan review in AllyH with writes locked pending approval](screens/04-plan-approval.png)
+
+</details>
+
 ---
 
 ## Key Capabilities
