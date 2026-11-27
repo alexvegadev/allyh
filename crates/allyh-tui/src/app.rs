@@ -25,6 +25,7 @@ pub const COMMANDS: &[SlashCommand] = &[
     SlashCommand::new("/invalidate", "[id]", "Retire a decision"),
     SlashCommand::new("/db-status", "", "Inspect storage and table counts"),
     SlashCommand::new("/config", "[cmd]", "Inspect or override polyglot verification config"),
+    SlashCommand::new("/lsp", "[cmd]", "Show LSP bridge status or restart servers"),
     SlashCommand::new("/compact", "", "Compact conversation history"),
     SlashCommand::new("/refresh", "", "Rescan files and run project check"),
     SlashCommand::new("/help", "", "Show commands and shortcuts"),
@@ -310,6 +311,7 @@ impl AppState {
                 }
                 "db-status" => Some(UserCommand::RequestDbStatus),
                 "config" => self.parse_config_command(arg),
+                "lsp" => self.parse_lsp_command(arg),
                 "compact" => Some(UserCommand::CompactNow),
                 "refresh" => Some(UserCommand::RefreshEnv {
                     run_build_check: true,
@@ -693,6 +695,42 @@ impl AppState {
                 );
                 self.entries.push(ChatEntry::System(msg));
             }
+            UiEvent::LspStatus(statuses) => {
+                if statuses.is_empty() {
+                    self.entries.push(ChatEntry::System(
+                        "### LSP Semantic Bridge\n\
+                         No LSP binaries detected on PATH (`rust-analyzer`, `vtsls`, `pyright`, `gopls`, `clangd`).\n\
+                         _Using tree-sitter RepoGraph + CLI verifiers seamlessly._"
+                            .to_string(),
+                    ));
+                } else {
+                    let rows = statuses
+                        .iter()
+                        .map(|s| {
+                            let err_note = s
+                                .last_error
+                                .as_deref()
+                                .map(|e| format!(" — error: {e}"))
+                                .unwrap_or_default();
+                            format!(
+                                "- `{}` (`{}`) [{}] — {} open doc(s), {} diag file(s), {} restart(s){err_note}",
+                                s.server_name,
+                                s.family,
+                                s.state.as_str(),
+                                s.open_documents,
+                                s.cached_diagnostic_files,
+                                s.restart_count
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    self.entries.push(ChatEntry::System(format!(
+                        "### LSP Semantic Bridge ({})\n{rows}\n\n\
+                         _Use `/lsp restart [lang]` to restart an LSP server._",
+                        statuses.len()
+                    )));
+                }
+            }
             UiEvent::SystemNotice(msg) => {
                 self.entries.push(ChatEntry::System(msg));
             }
@@ -944,6 +982,32 @@ impl AppState {
                      - `/config set-lint <cmd>`  Set a custom lint command\n\
                      - `/config set-test <cmd>`  Set a custom test command\n\
                      - `/config reset`  Restore automatic polyglot detection"
+                        .to_string(),
+                ));
+                None
+            }
+        }
+    }
+
+    fn parse_lsp_command(&mut self, arg: &str) -> Option<UserCommand> {
+        let trimmed = arg.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("status") {
+            return Some(UserCommand::RequestLspStatus);
+        }
+        let mut parts = trimmed.splitn(2, char::is_whitespace);
+        let sub = parts.next().unwrap_or("").to_ascii_lowercase();
+        let rest = parts.next().unwrap_or("").trim();
+
+        match sub.as_str() {
+            "restart" => {
+                let fam = (!rest.is_empty()).then(|| rest.to_string());
+                Some(UserCommand::RestartLsp(fam))
+            }
+            _ => {
+                self.entries.push(ChatEntry::System(
+                    "### LSP Commands\n\
+                     - `/lsp` or `/lsp status`  Show discovered/running LSP servers\n\
+                     - `/lsp restart [lang]`  Restart all LSP servers or one language family (e.g. `rust`, `typescript`, `python`, `go`)"
                         .to_string(),
                 ));
                 None

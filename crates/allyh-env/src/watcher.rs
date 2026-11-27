@@ -17,6 +17,10 @@ use crate::error::{EnvError, Result};
 use crate::git::{GitState, GitTracker};
 use crate::graph::{EgoGraph, RepoGraph};
 use crate::lang::{LanguageRegistry, SourceLanguage};
+use crate::lsp::{
+    DEFAULT_LSP_DIAGNOSTIC_WAIT, LspManager, LspServerStatus, collect_lsp_diagnostics_report,
+    enrich_ego_graph_with_lsp,
+};
 use crate::path::{
     canonicalize_normalized, has_windows_drive_prefix, path_to_slash_string, strip_root_prefix,
     strip_verbatim_prefix,
@@ -53,6 +57,8 @@ pub struct EnvDelta {
     pub detected_languages: Vec<String>,
     #[serde(default)]
     pub detected_toolchains: Vec<String>,
+    #[serde(default)]
+    pub active_lsp_servers: Vec<String>,
 }
 
 impl EnvDelta {
@@ -76,6 +82,9 @@ impl EnvDelta {
                 "- Toolchains: {}",
                 self.detected_toolchains.join(", ")
             ));
+        }
+        if !self.active_lsp_servers.is_empty() {
+            lines.push(format!("- LSP: {}", self.active_lsp_servers.join(", ")));
         }
         if let Some(status) = &self.build_status {
             lines.push(format!("- Last verification: {status}"));
@@ -166,6 +175,7 @@ pub struct EnvironmentMonitor {
     cargo: CargoRunner,
     registry: LanguageRegistry,
     verifier: ToolchainVerifier,
+    lsp: LspManager,
     /// In-memory last-known file contents for concise out-of-band diff generation.
     last_known_contents: Arc<Mutex<HashMap<String, String>>>,
     /// Pending filesystem events received from `LiveFsWatcher`.
@@ -184,6 +194,7 @@ impl EnvironmentMonitor {
         let cargo = CargoRunner::new(&root);
         let registry = LanguageRegistry::default_all();
         let verifier = ToolchainVerifier::new(&root);
+        let lsp = LspManager::discover_default(&root);
         Self {
             repo_root: root,
             repo_id: repo_id.into(),
@@ -193,9 +204,32 @@ impl EnvironmentMonitor {
             cargo,
             registry,
             verifier,
+            lsp,
             last_known_contents: Arc::new(Mutex::new(HashMap::new())),
             pending_events: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Replace the auto-discovered [`LspManager`] (e.g., to disable LSP or inject custom/mock servers).
+    pub fn with_lsp_manager(mut self, lsp: LspManager) -> Self {
+        self.lsp = lsp;
+        self
+    }
+
+    pub fn lsp(&self) -> &LspManager {
+        &self.lsp
+    }
+
+    pub async fn lsp_status(&self) -> Vec<LspServerStatus> {
+        self.lsp.status().await
+    }
+
+    pub async fn restart_lsp(&self, family: Option<&str>) -> Result<Vec<LspServerStatus>> {
+        self.lsp.restart(family).await
+    }
+
+    pub async fn shutdown_lsp(&self) {
+        self.lsp.shutdown_all().await;
     }
 
     pub fn repo_root(&self) -> &Path {
@@ -537,6 +571,8 @@ impl EnvironmentMonitor {
             None
         };
 
+        let active_lsp_servers = self.lsp.active_badges(&detected_languages).await;
+
         Ok(EnvDelta {
             generated_at: Some(Utc::now()),
             git,
@@ -546,16 +582,39 @@ impl EnvironmentMonitor {
             build_status,
             detected_languages,
             detected_toolchains,
+            active_lsp_servers,
         })
     }
 
-    /// Build a 1-hop or 2-hop RepoGraph ego-graph around a symbol/file from LanceDB snapshots.
+    /// Build a 1-hop or 2-hop RepoGraph ego-graph around a symbol/file from LanceDB snapshots,
+    /// automatically enriching edges with type-resolved LSP references/call-hierarchy when available.
     pub async fn ego_graph_for(&self, query_symbol: &str, max_hops: usize) -> Result<EgoGraph> {
         let snapshots = self
             .store
             .list_code_snapshots(&self.repo_id, &self.scope_id)
             .await?;
-        Ok(RepoGraph::build_ego_graph(&snapshots, query_symbol, max_hops))
+        let base = RepoGraph::build_ego_graph(&snapshots, query_symbol, max_hops);
+        Ok(enrich_ego_graph_with_lsp(base, &snapshots, &self.repo_root, &self.lsp).await)
+    }
+
+    /// Attempt sub-second post-edit diagnostics via an active LSP server before falling back to CLI.
+    pub async fn lsp_diagnostics_for_edit(
+        &self,
+        rel_path: &str,
+        abs_path: &Path,
+        content: &str,
+        content_hash: &str,
+    ) -> Option<VerificationReport> {
+        collect_lsp_diagnostics_report(
+            rel_path,
+            abs_path,
+            content,
+            content_hash,
+            &self.repo_root,
+            &self.lsp,
+            DEFAULT_LSP_DIAGNOSTIC_WAIT,
+        )
+        .await
     }
 
     /// Run language-agnostic verification using the pluggable [`ToolchainVerifier`] and

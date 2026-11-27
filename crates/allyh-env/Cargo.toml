@@ -38,3 +38,7 @@ allyh-memory.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[[test]]
+name = "lsp_integration"
+harness = false

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
-use allyh_env::{EnvDelta, EnvironmentMonitor, LiveFsWatcher};
+use allyh_env::{EnvDelta, EnvironmentMonitor, LiveFsWatcher, LspServerStatus};
 use allyh_memory::{
     CandidateDecision, ConsolidationOutcome, DbStatusReport, DeterministicHashEmbedder,
     EmbeddingProvider, HarnessVersionRecord, MemoryConsolidator, MemoryStore, RepoProfile,
@@ -42,6 +42,8 @@ pub struct InspectorSnapshot {
     pub detected_languages: Vec<String>,
     #[serde(default)]
     pub detected_toolchains: Vec<String>,
+    #[serde(default)]
+    pub active_lsp_servers: Vec<String>,
     pub build_status: String,
     pub gate_state: ControlGateState,
     pub active_tasks: Vec<TaskRecord>,
@@ -92,6 +94,8 @@ pub enum UserCommand {
     RequestRepoProfile,
     SaveRepoProfile(RepoProfile),
     ResetRepoProfile,
+    RequestLspStatus,
+    RestartLsp(Option<String>),
     RefreshEnv { run_build_check: bool },
     CompactNow,
     Shutdown,
@@ -139,6 +143,7 @@ pub enum UiEvent {
         detected_languages: Vec<String>,
         detected_toolchains: Vec<String>,
     },
+    LspStatus(Vec<LspServerStatus>),
     SystemNotice(String),
     Error(String),
 }
@@ -644,6 +649,12 @@ impl AllyHOrchestrator {
             .map(|e| format!("{}: {}", e.file_path, e.diff_summary))
             .collect();
 
+        let active_lsp_servers = self
+            .env
+            .lsp()
+            .active_badges(&self.last_env_delta.detected_languages)
+            .await;
+
         Ok(InspectorSnapshot {
             repo_id: self.repo_id.clone(),
             scope_id: self.scope_id.clone(),
@@ -659,6 +670,7 @@ impl AllyHOrchestrator {
             out_of_band_edits: oob,
             detected_languages: self.last_env_delta.detected_languages.clone(),
             detected_toolchains: self.last_env_delta.detected_toolchains.clone(),
+            active_lsp_servers,
             build_status: self
                 .last_env_delta
                 .build_status
@@ -1366,6 +1378,25 @@ impl AllyHOrchestrator {
                             let _ = ui_tx.send(UiEvent::Error(err.to_string()));
                         }
                     },
+                    UserCommand::RequestLspStatus => {
+                        let statuses = self.env.lsp_status().await;
+                        let _ = ui_tx.send(UiEvent::LspStatus(statuses));
+                    }
+                    UserCommand::RestartLsp(family) => match self.env.restart_lsp(family.as_deref()).await {
+                        Ok(statuses) => {
+                            let target = family.as_deref().unwrap_or("all");
+                            let _ = ui_tx.send(UiEvent::SystemNotice(format!(
+                                "Restarted LSP server(s) for `{target}`."
+                            )));
+                            let _ = ui_tx.send(UiEvent::LspStatus(statuses));
+                            if let Ok(snap) = self.inspector_snapshot().await {
+                                let _ = ui_tx.send(UiEvent::InspectorUpdated(snap));
+                            }
+                        }
+                        Err(err) => {
+                            let _ = ui_tx.send(UiEvent::Error(err.to_string()));
+                        }
+                    },
                     UserCommand::RefreshEnv { run_build_check } => {
                         match self.refresh_env(run_build_check).await {
                             Ok(_) => {
@@ -1398,6 +1429,7 @@ impl AllyHOrchestrator {
                         }
                     }
                     UserCommand::Shutdown => {
+                        self.env.shutdown_lsp().await;
                         self.sleep_worker.enqueue(SleepJob::Shutdown);
                         break;
                     }

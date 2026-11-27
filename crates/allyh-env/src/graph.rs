@@ -76,6 +76,9 @@ pub struct EgoGraph {
     pub center_definitions: Vec<EgoNode>,
     pub hop1_neighbors: Vec<EgoEdge>,
     pub hop2_neighbors: Vec<EgoEdge>,
+    /// Optional provenance tag when edges were semantically resolved via LSP (e.g. `"lsp:rust-analyzer"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,7 +103,12 @@ impl EgoGraph {
             return String::new();
         }
         let mut out = Vec::new();
-        out.push(format!("### RepoGraph Ego-Graph: `{}`", self.center));
+        let source_tag = self
+            .semantic_source
+            .as_deref()
+            .map(|src| format!(" [{src}]"))
+            .unwrap_or_default();
+        out.push(format!("### RepoGraph Ego-Graph: `{}`{source_tag}", self.center));
         for def in &self.center_definitions {
             out.push(format!(
                 "- DEF `{}` ({}) in `{}:{}-{}` :: `{}`",
@@ -200,6 +208,10 @@ impl RepoGraph {
             }
         }
         center_defs.truncate(8);
+        let center_def_keys: HashSet<(String, String)> = center_defs
+            .iter()
+            .map(|d| (d.file_path.clone(), d.symbol.name.clone()))
+            .collect();
 
         let mut hop1_edges: Vec<EgoEdge> = Vec::new();
         let mut hop1_names: HashSet<String> = HashSet::new();
@@ -252,6 +264,9 @@ impl RepoGraph {
                             && let Some(targets) = symbol_index.get(&ref_key)
                         {
                             for (target_file, target_sym) in targets {
+                                if !center_def_keys.contains(&(target_file.clone(), target_sym.name.clone())) {
+                                    continue;
+                                }
                                 if target_file == file && target_sym.name == sym.name {
                                     continue;
                                 }
@@ -321,6 +336,7 @@ impl RepoGraph {
             center_definitions: center_defs,
             hop1_neighbors: hop1_edges,
             hop2_neighbors: hop2_edges,
+            semantic_source: None,
         }
     }
 }

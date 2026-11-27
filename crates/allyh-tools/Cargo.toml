@@ -21,3 +21,7 @@ allyh-env.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[[test]]
+name = "lsp_edit_integration"
+harness = false

@@ -273,6 +273,13 @@ fn render_inspector(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     if !snapshot.detected_toolchains.is_empty() {
         workspace.insert(3, field("Tools", snapshot.detected_toolchains.join(", ")));
     }
+    if !snapshot.active_lsp_servers.is_empty() {
+        let insert_idx = if snapshot.detected_toolchains.is_empty() { 3 } else { 4 };
+        workspace.insert(
+            insert_idx,
+            field("LSP", snapshot.active_lsp_servers.join(", ")),
+        );
+    }
     if !snapshot.out_of_band_edits.is_empty() {
         workspace.insert(
             3,

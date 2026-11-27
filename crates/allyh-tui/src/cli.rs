@@ -52,6 +52,26 @@ pub enum CliCommand {
     Sim(SimArgs),
     /// Manage out-of-tree repository polyglot toolchain and ignore overrides in LanceDB.
     Config(ConfigArgs),
+    /// Inspect Language Server Protocol (LSP) semantic bridge availability.
+    Lsp(LspArgs),
+}
+
+/// Options for `allyh lsp`.
+#[derive(Debug, Clone, Args)]
+pub struct LspArgs {
+    #[command(subcommand)]
+    pub action: LspCommand,
+}
+
+/// Subcommands under `allyh lsp`.
+#[derive(Debug, Clone, Subcommand)]
+pub enum LspCommand {
+    /// Show auto-discovered LSP servers on PATH for this workspace.
+    Status {
+        /// Output machine-readable JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 /// Options for `allyh config`.
@@ -617,6 +637,15 @@ mod tests {
             reset.command,
             Some(CliCommand::Config(ConfigArgs {
                 action: ConfigCommand::Reset
+            }))
+        ));
+
+        let lsp_status = CliArgs::try_parse_from(["allyh", "lsp", "status", "--json"])
+            .expect("parse lsp status");
+        assert!(matches!(
+            lsp_status.command,
+            Some(CliCommand::Lsp(LspArgs {
+                action: LspCommand::Status { json: true }
             }))
         ));
     }

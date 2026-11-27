@@ -2,6 +2,7 @@ mod app;
 mod cli;
 mod config_cli;
 mod highlight;
+mod lsp_cli;
 mod sim_cli;
 mod skills_cli;
 mod theme;
@@ -117,6 +118,7 @@ async fn main() -> Result<()> {
                 )
                 .await
             }
+            CliCommand::Lsp(lsp_args) => lsp_cli::run_cli(lsp_args, &args.repo).await,
         };
     }
 
@@ -356,6 +358,7 @@ mod tests {
             out_of_band_edits: Vec::new(),
             detected_languages: vec!["Rust".into()],
             detected_toolchains: vec!["Rust (cargo)".into()],
+            active_lsp_servers: Vec::new(),
             build_status: "cargo check: PASS (0 warnings)".into(),
             gate_state,
             active_tasks: Vec::new(),
@@ -811,5 +814,48 @@ mod tests {
         assert!(rendered.contains("Stack"));
         assert!(rendered.contains("Rust, TypeScript"));
         assert!(rendered.contains("Tools"));
+    }
+
+    #[test]
+    fn test_lsp_slash_commands_and_inspector_display() {
+        use allyh_core::UiEvent;
+        use allyh_env::{LspServerState, LspServerStatus};
+
+        let mut snap = sample_snapshot(ControlGateState::Discovery);
+        snap.active_lsp_servers = vec!["rust-analyzer (running)".into()];
+        let mut app = AppState::new(snap, "allyh".into());
+
+        assert!(matches!(
+            app.parse_submission("/lsp"),
+            Some(UserCommand::RequestLspStatus)
+        ));
+        assert!(matches!(
+            app.parse_submission("/lsp status"),
+            Some(UserCommand::RequestLspStatus)
+        ));
+        assert!(matches!(
+            app.parse_submission("/lsp restart"),
+            Some(UserCommand::RestartLsp(None))
+        ));
+        assert!(matches!(
+            app.parse_submission("/lsp restart rust"),
+            Some(UserCommand::RestartLsp(Some(ref s))) if s == "rust"
+        ));
+
+        app.apply_ui_event(UiEvent::LspStatus(vec![LspServerStatus {
+            family: "rust".into(),
+            server_name: "rust-analyzer".into(),
+            command: "rust-analyzer".into(),
+            state: LspServerState::Running,
+            open_documents: 2,
+            cached_diagnostic_files: 1,
+            restart_count: 0,
+            last_error: None,
+        }]));
+
+        let highlighter = MarkdownHighlighter::new();
+        let rendered = screen(&mut app, &highlighter, 120, 36);
+        assert!(rendered.contains("LSP Semantic Bridge (1)"));
+        assert!(rendered.contains("rust-analyzer (running)"));
     }
 }

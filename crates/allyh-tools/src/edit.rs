@@ -162,8 +162,19 @@ impl EditByHashTool {
             .and_then(|p| p.check_command.as_deref())
             .is_some_and(|c| !c.trim().is_empty());
 
-        let verification =
-            if should_auto_verify && (has_custom_check || self.env.has_any_toolchain()) {
+        let verification = if should_auto_verify {
+            // Fast path: when no custom check command or explicit non-LSP toolchain override is set,
+            // try sub-second LSP diagnostics first, falling back seamlessly to CLI ToolchainVerifier.
+            let lsp_report = if !has_custom_check && args.toolchain.is_none() {
+                self.env
+                    .lsp_diagnostics_for_edit(&rel_path, &abs_path, &updated_content, &new_sha256)
+                    .await
+            } else {
+                None
+            };
+            if let Some(report) = lsp_report {
+                Some(report)
+            } else if has_custom_check || self.env.has_any_toolchain() {
                 let target = VerificationTarget {
                     kind: VerificationKind::Check,
                     target_scope: args.target_scope.clone(),
@@ -173,7 +184,10 @@ impl EditByHashTool {
                 Some(self.env.run_verification(&target).await?)
             } else {
                 None
-            };
+            }
+        } else {
+            None
+        };
 
         let prescriptive_diagnostics = verification
             .as_ref()

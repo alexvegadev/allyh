@@ -59,22 +59,22 @@ This roadmap defines the highest-leverage capabilities to evolve AllyH from a **
 
 ---
 
-## Milestone 2: LSP Semantic Bridge (`v0.4.0`)
+## Milestone 2: LSP Semantic Bridge (`v0.4.0`) — Completed
 
 **Goal:** Layer optional Language Server Protocol (LSP) integration over `tree-sitter` so AllyH gets compiler-accurate cross-file graphs and sub-second diagnostics for *any* language with an LSP server.
 
 ### 2.1 LSP Client Lifecycle Manager (`allyh-env`)
-- [ ] **Implement stdio JSON-RPC LSP client (`crates/allyh-env/src/lsp/client.rs`):** Handle `initialize`, `initialized`, `textDocument/didOpen`, `didChange`, `didSave`, `didClose`, and clean `shutdown`/`exit`.
-- [ ] **Auto-discover & manage per-language servers (`crates/allyh-env/src/lsp/registry.rs`):** Built-in presets for `rust-analyzer`, `typescript-language-server` / `vtsls`, `pyright-langserver` / `basedpyright`, `gopls`, and `clangd`, with lazy startup, crash recovery, and idle shutdown.
-- [ ] **Graceful fallback:** Never require an LSP binary to be installed; fall back transparently to `tree-sitter` + CLI `VerificationAdapter` when unavailable.
+- [x] **Implement stdio JSON-RPC LSP client (`crates/allyh-env/src/lsp/client.rs`):** Handle `initialize`, `initialized`, `textDocument/didOpen`, `didChange`, `didSave`, `didClose`, server-to-client requests, and clean `shutdown`/`exit`.
+- [x] **Auto-discover & manage per-language servers (`crates/allyh-env/src/lsp/registry.rs`):** Built-in presets for `rust-analyzer`, `typescript-language-server` / `vtsls`, `pyright-langserver` / `basedpyright` / `pylsp`, `gopls`, and `clangd`, with lazy startup, crash recovery, and idle shutdown.
+- [x] **Graceful fallback:** Never require an LSP binary to be installed; fall back transparently to `tree-sitter` + CLI `VerificationAdapter` when unavailable.
 
 ### 2.2 Semantic RepoGraph & Instant Diagnostics (`allyh-env`, `allyh-tools`)
-- [ ] **Hybrid `tree-sitter` + LSP RepoGraph (`crates/allyh-env/src/graph.rs`):** Enrich `EgoGraph` with semantic edges (`textDocument/references`, `textDocument/definition`, `textDocument/implementation`, `callHierarchy/incomingCalls`, `callHierarchy/outgoingCalls`) when an LSP is active, eliminating name-collision noise.
-- [ ] **Fast post-edit diagnostics (`crates/allyh-tools/src/edit.rs`):** Pull `textDocument/publishDiagnostics` / `textDocument/diagnostic` right after `edit_by_hash` for near-instant prescriptive feedback, reserving full build/test invocations for `run_verification`.
-- [ ] **Expose LSP status in TUI & CLI:** Show active LSP servers (`LSP: rust-analyzer, vtsls`) in the Coherence Inspector and add `/lsp status|restart` commands.
+- [x] **Hybrid `tree-sitter` + LSP RepoGraph (`crates/allyh-env/src/lsp/mod.rs`, `graph.rs`):** Enrich `EgoGraph` with semantic edges (`textDocument/references`, `textDocument/definition`, `textDocument/implementation`, `callHierarchy/incomingCalls`, `callHierarchy/outgoingCalls`) when an LSP is active, eliminating name-collision noise.
+- [x] **Fast post-edit diagnostics (`crates/allyh-tools/src/edit.rs`):** Pull `textDocument/diagnostic` or await `textDocument/publishDiagnostics` right after `edit_by_hash` for near-instant prescriptive feedback, reserving full build/test invocations for `run_verification`.
+- [x] **Expose LSP status in TUI & CLI:** Show active LSP servers (`LSP: rust-analyzer (running)`) in the Coherence Inspector and add `/lsp status|restart` and `allyh lsp status` commands.
 
 ### Milestone 2 Acceptance Criteria
-- [ ] Integration tests using a mock stdio LSP server (plus optional live `rust-analyzer` / `pyright` smoke tests) verify semantic ego-graph disambiguation across identically named symbols in separate modules and sub-second diagnostic attachment after `edit_by_hash`.
+- [x] Integration tests using mock stdio LSP servers (`crates/allyh-env/tests/lsp_integration.rs`, `crates/allyh-tools/tests/lsp_edit_integration.rs`) verify semantic ego-graph disambiguation across identically named symbols in separate modules and sub-second diagnostic attachment after `edit_by_hash`.
 
 ---
 

@@ -6,6 +6,7 @@ pub mod error;
 pub mod git;
 pub mod graph;
 pub mod lang;
+pub mod lsp;
 pub mod path;
 pub mod verify;
 pub mod watcher;
@@ -20,6 +21,12 @@ pub use graph::{
     EgoEdge, EgoGraph, EgoNode, FileGraph, RepoGraph, RustIndexer, SymbolInfo, SymbolKind,
 };
 pub use lang::{LanguageIndexer, LanguageRegistry, SourceLanguage};
+pub use lsp::{
+    DEFAULT_LSP_DIAGNOSTIC_WAIT, LspCallHierarchyItem, LspClient, LspDiagnostic, LspLocation,
+    LspManager, LspPosition, LspRange, LspServerSpec, LspServerState, LspServerStatus,
+    collect_lsp_diagnostics_report, encode_lsp_frame, enrich_ego_graph_with_lsp, file_uri_to_path,
+    file_uri_to_rel_path, lsp_language_id_for_path, path_to_file_uri,
+};
 pub use path::{canonicalize_normalized, path_to_slash_string, strip_verbatim_prefix};
 pub use verify::custom::{parse_generic_file_line_diagnostics, parse_sarif_diagnostics};
 pub use verify::go::{
