@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use allyh_env::{EgoGraph, EnvironmentMonitor};
+use allyh_env::{EgoGraph, EnvironmentMonitor, SourceLanguage};
 use allyh_memory::MemoryStore;
 use rig_core::completion::ToolAnnotations;
 use rig_core::tool::{Tool, ToolContext, ToolExecutionError, args_schema};
@@ -33,6 +33,8 @@ pub struct InspectSymbolOutput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InspectedFileSnippet {
     pub file_path: String,
+    #[serde(default)]
+    pub language: String,
     pub sha256_hash: String,
     pub start_line: usize,
     pub end_line: usize,
@@ -40,8 +42,8 @@ pub struct InspectedFileSnippet {
     pub snippet: String,
 }
 
-/// Compact ACI tool that inspects a Rust symbol or file slice together with its SHA-256 hash
-/// and 1-hop / 2-hop RepoGraph neighborhood.
+/// Compact ACI tool that inspects a source symbol or file slice across supported languages
+/// together with its SHA-256 hash and 1-hop / 2-hop RepoGraph neighborhood.
 #[derive(Clone)]
 pub struct InspectSymbolTool {
     env: Arc<EnvironmentMonitor>,
@@ -86,6 +88,7 @@ impl InspectSymbolTool {
             let snippet = slice_lines(&lines, start, end);
             seen_ranges.insert((rel.clone(), start, end));
             matched_files.push(InspectedFileSnippet {
+                language: SourceLanguage::from_path(&rel).as_str().to_string(),
                 file_path: rel,
                 sha256_hash: hash,
                 start_line: start,
@@ -117,6 +120,7 @@ impl InspectSymbolTool {
                 continue;
             }
             matched_files.push(InspectedFileSnippet {
+                language: SourceLanguage::from_path(&rel).as_str().to_string(),
                 file_path: rel,
                 sha256_hash: hash,
                 start_line: start,
@@ -146,6 +150,7 @@ impl InspectSymbolTool {
                     let total_lines = lines.len();
                     let end = total_lines.min(80).max(1);
                     matched_files.push(InspectedFileSnippet {
+                        language: SourceLanguage::from_path(&rel).as_str().to_string(),
                         file_path: rel,
                         sha256_hash: hash,
                         start_line: 1,
@@ -174,7 +179,7 @@ impl Tool for InspectSymbolTool {
     type Error = ToolError;
 
     fn description(&self) -> String {
-        "Inspect a Rust symbol or relative file slice, returning its SHA-256 hash (required for edit_by_hash) and compact 1-hop/2-hop RepoGraph neighborhood.".to_string()
+        "Inspect a source symbol or relative file slice across supported languages, returning its SHA-256 hash (required for edit_by_hash) and compact 1-hop/2-hop RepoGraph neighborhood.".to_string()
     }
 
     fn parameters(&self) -> serde_json::Value {

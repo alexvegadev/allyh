@@ -61,10 +61,12 @@ impl CompletionInterlock {
             }
             match rec.tool_name.as_str() {
                 "edit_by_hash" if rec.succeeded => {
-                    // Check if automatic post-edit `cargo check` already passed cleanly.
+                    // Check if automatic post-edit verification already passed cleanly
+                    // (supports both `verification` and legacy `cargo_check` payload keys).
                     let auto_passed = rec
                         .output_json
-                        .get("cargo_check")
+                        .get("verification")
+                        .or_else(|| rec.output_json.get("cargo_check"))
                         .and_then(|c| c.get("success"))
                         .and_then(|b| b.as_bool())
                         .unwrap_or(false);

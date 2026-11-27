@@ -395,7 +395,7 @@ impl AllyHRuntimeEvaluator {
             repo_root: repo_dir.clone(),
             storage: StorageConfig::from_local_path(&db_dir),
             scope_id: format!("sim-eval-{rollout_idx}"),
-            auto_cargo_check: harness.tools.auto_cargo_check,
+            auto_verify: harness.tools.auto_verify,
             idle_optimize_interval: Duration::from_secs(3600),
             enable_fs_watcher: false,
         };

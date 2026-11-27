@@ -7,9 +7,10 @@ use std::time::Duration;
 use allyh_env::{EnvDelta, EnvironmentMonitor, LiveFsWatcher};
 use allyh_memory::{
     CandidateDecision, ConsolidationOutcome, DbStatusReport, DeterministicHashEmbedder,
-    EmbeddingProvider, HarnessVersionRecord, MemoryConsolidator, MemoryStore, ScoredDecision,
-    SessionRecord, SimExportDocument, SimLedger, SimProblemEntry, SimRunRecord, SkillRecord,
-    SleepJob, SleepTimeWorkerHandle, StorageConfig, TaskRecord, WorkerStatus, compute_repo_id,
+    EmbeddingProvider, HarnessVersionRecord, MemoryConsolidator, MemoryStore, RepoProfile,
+    ScoredDecision, SessionRecord, SimExportDocument, SimLedger, SimProblemEntry, SimRunRecord,
+    SkillRecord, SleepJob, SleepTimeWorkerHandle, StorageConfig, TaskRecord, WorkerStatus,
+    compute_repo_id,
 };
 use allyh_tools::{AciToolset, ToolExecutionRecord};
 use chrono::Utc;
@@ -37,6 +38,10 @@ pub struct InspectorSnapshot {
     pub git_branch: String,
     pub dirty_files: Vec<String>,
     pub out_of_band_edits: Vec<String>,
+    #[serde(default)]
+    pub detected_languages: Vec<String>,
+    #[serde(default)]
+    pub detected_toolchains: Vec<String>,
     pub build_status: String,
     pub gate_state: ControlGateState,
     pub active_tasks: Vec<TaskRecord>,
@@ -84,6 +89,9 @@ pub enum UserCommand {
     ShowActiveHarness,
     UseHarness(String),
     RequestDbStatus,
+    RequestRepoProfile,
+    SaveRepoProfile(RepoProfile),
+    ResetRepoProfile,
     RefreshEnv { run_build_check: bool },
     CompactNow,
     Shutdown,
@@ -126,6 +134,11 @@ pub enum UiEvent {
         spec: HarnessSpec,
     },
     DbStatus(DbStatusReport),
+    RepoProfileDetail {
+        profile: Option<RepoProfile>,
+        detected_languages: Vec<String>,
+        detected_toolchains: Vec<String>,
+    },
     SystemNotice(String),
     Error(String),
 }
@@ -146,7 +159,7 @@ pub struct OrchestratorConfig {
     pub repo_root: PathBuf,
     pub storage: StorageConfig,
     pub scope_id: String,
-    pub auto_cargo_check: bool,
+    pub auto_verify: bool,
     pub idle_optimize_interval: Duration,
     pub enable_fs_watcher: bool,
 }
@@ -157,7 +170,7 @@ impl OrchestratorConfig {
             repo_root: repo_root.into(),
             storage: StorageConfig::default_local(),
             scope_id: allyh_memory::DEFAULT_SCOPE_ID.to_string(),
-            auto_cargo_check: true,
+            auto_verify: true,
             idle_optimize_interval: Duration::from_secs(45),
             enable_fs_watcher: true,
         }
@@ -224,7 +237,7 @@ impl AllyHOrchestrator {
             Arc::clone(&env),
             store.clone(),
             writes_enabled,
-            config.auto_cargo_check,
+            config.auto_verify,
         );
 
         let judge = Arc::new(LocalLlmConflictJudge::new(router.clone()));
@@ -504,6 +517,32 @@ impl AllyHOrchestrator {
         Ok(self.store.status_report(&self.repo_id, &self.scope_id).await?)
     }
 
+    /// Fetch the stored out-of-tree [`RepoProfile`] for this partition, if configured.
+    pub async fn get_repo_profile(&self) -> Result<Option<RepoProfile>> {
+        Ok(self
+            .store
+            .get_repo_profile(&self.repo_id, &self.scope_id)
+            .await?)
+    }
+
+    /// Persist an out-of-tree [`RepoProfile`] override in LanceDB and refresh environment metadata.
+    pub async fn save_repo_profile(&mut self, mut profile: RepoProfile) -> Result<RepoProfile> {
+        profile.repo_id = self.repo_id.clone();
+        profile.scope_id = self.scope_id.clone();
+        self.store.upsert_repo_profile(&profile).await?;
+        let _ = self.refresh_env(false).await;
+        Ok(profile)
+    }
+
+    /// Remove any stored [`RepoProfile`] override and restore automatic toolchain detection.
+    pub async fn reset_repo_profile(&mut self) -> Result<()> {
+        self.store
+            .delete_repo_profile(&self.repo_id, &self.scope_id)
+            .await?;
+        let _ = self.refresh_env(false).await;
+        Ok(())
+    }
+
     /// List all skills registered for this `(repo_id, scope_id)` partition.
     pub async fn list_skills(&self) -> Result<Vec<SkillRecord>> {
         Ok(self.store.list_skills(&self.repo_id, &self.scope_id).await?)
@@ -618,6 +657,8 @@ impl AllyHOrchestrator {
             git_branch: self.last_env_delta.git.branch.clone(),
             dirty_files: self.last_env_delta.git.dirty_files.clone(),
             out_of_band_edits: oob,
+            detected_languages: self.last_env_delta.detected_languages.clone(),
+            detected_toolchains: self.last_env_delta.detected_toolchains.clone(),
             build_status: self
                 .last_env_delta
                 .build_status
@@ -1282,6 +1323,49 @@ impl AllyHOrchestrator {
                             let _ = ui_tx.send(UiEvent::Error(err.to_string()));
                         }
                     },
+                    UserCommand::RequestRepoProfile => match self.get_repo_profile().await {
+                        Ok(profile) => {
+                            let _ = ui_tx.send(UiEvent::RepoProfileDetail {
+                                profile,
+                                detected_languages: self.last_env_delta.detected_languages.clone(),
+                                detected_toolchains: self.last_env_delta.detected_toolchains.clone(),
+                            });
+                        }
+                        Err(err) => {
+                            let _ = ui_tx.send(UiEvent::Error(err.to_string()));
+                        }
+                    },
+                    UserCommand::SaveRepoProfile(profile) => {
+                        match self.save_repo_profile(profile).await {
+                            Ok(saved) => {
+                                let _ = ui_tx.send(UiEvent::SystemNotice(format!(
+                                    "Saved out-of-tree repository profile in LanceDB (check: {}, lint: {}, test: {}).",
+                                    saved.check_command.as_deref().unwrap_or("auto"),
+                                    saved.lint_command.as_deref().unwrap_or("auto"),
+                                    saved.test_command.as_deref().unwrap_or("auto"),
+                                )));
+                                if let Ok(snap) = self.inspector_snapshot().await {
+                                    let _ = ui_tx.send(UiEvent::InspectorUpdated(snap));
+                                }
+                            }
+                            Err(err) => {
+                                let _ = ui_tx.send(UiEvent::Error(err.to_string()));
+                            }
+                        }
+                    }
+                    UserCommand::ResetRepoProfile => match self.reset_repo_profile().await {
+                        Ok(()) => {
+                            let _ = ui_tx.send(UiEvent::SystemNotice(
+                                "Reset repository profile; restored automatic language and toolchain detection.".to_string(),
+                            ));
+                            if let Ok(snap) = self.inspector_snapshot().await {
+                                let _ = ui_tx.send(UiEvent::InspectorUpdated(snap));
+                            }
+                        }
+                        Err(err) => {
+                            let _ = ui_tx.send(UiEvent::Error(err.to_string()));
+                        }
+                    },
                     UserCommand::RefreshEnv { run_build_check } => {
                         match self.refresh_env(run_build_check).await {
                             Ok(_) => {
@@ -1339,7 +1423,7 @@ impl AllyHOrchestrator {
                 title,
                 acceptance_criteria: vec![
                     "Changes respect all active LanceDB architectural invariants".to_string(),
-                    "cargo check and cargo test pass with 0 errors".to_string(),
+                    "Automated verification checks and tests pass with 0 errors".to_string(),
                 ],
             }],
         }

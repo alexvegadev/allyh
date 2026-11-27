@@ -36,7 +36,7 @@ pub struct CliArgs {
     #[arg(long, env = "ALLYH_EMBEDDING_MODEL")]
     pub embedding_model: Option<String>,
 
-    /// Disable automatic post-edit `cargo check --message-format=json`.
+    /// Disable automatic post-edit project check/type-check verification.
     #[arg(long, default_value_t = false)]
     pub no_auto_check: bool,
 }
@@ -50,6 +50,49 @@ pub enum CliCommand {
     Skills(SkillsArgs),
     /// Manage Self-Improvement Memory (SIM) and run Continual Recursive Self-Improvement (CRSI).
     Sim(SimArgs),
+    /// Manage out-of-tree repository polyglot toolchain and ignore overrides in LanceDB.
+    Config(ConfigArgs),
+}
+
+/// Options for `allyh config`.
+#[derive(Debug, Clone, Args)]
+pub struct ConfigArgs {
+    #[command(subcommand)]
+    pub action: ConfigCommand,
+}
+
+/// Subcommands under `allyh config`.
+#[derive(Debug, Clone, Subcommand)]
+pub enum ConfigCommand {
+    /// Show detected toolchains and any stored out-of-tree repository profile overrides.
+    Show {
+        /// Output machine-readable JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Persist custom check/lint/test commands, language overrides, or extra ignore globs in LanceDB.
+    Set {
+        /// Custom check/type-check command (pass `auto` to clear).
+        #[arg(long)]
+        check: Option<String>,
+        /// Custom lint command (pass `auto` to clear).
+        #[arg(long)]
+        lint: Option<String>,
+        /// Custom test command (pass `auto` to clear).
+        #[arg(long)]
+        test: Option<String>,
+        /// Override detected languages (repeatable, e.g. `--lang rust --lang typescript`).
+        #[arg(long = "lang")]
+        languages: Vec<String>,
+        /// Extra ignore globs applied during workspace scanning (repeatable).
+        #[arg(long = "ignore")]
+        ignore_globs: Vec<String>,
+        /// Override automatic post-edit verification (`true` or `false`).
+        #[arg(long)]
+        auto_verify: Option<bool>,
+    },
+    /// Remove the stored repository profile and restore automatic detection.
+    Reset,
 }
 
 /// Options for `allyh sim`.
@@ -522,6 +565,59 @@ mod tests {
             Some(CliCommand::Sim(SimArgs {
                 action: SimCommand::Show { ref problem_id, .. }
             })) if problem_id == "P5"
+        ));
+    }
+
+    #[test]
+    fn parses_config_subcommands_with_global_flags() {
+        let show = CliArgs::try_parse_from(["allyh", "config", "show", "--json"])
+            .expect("parse config show");
+        assert!(matches!(
+            show.command,
+            Some(CliCommand::Config(ConfigArgs {
+                action: ConfigCommand::Show { json: true }
+            }))
+        ));
+
+        let set = CliArgs::try_parse_from([
+            "allyh",
+            "config",
+            "set",
+            "--check",
+            "npx tsc --noEmit",
+            "--test",
+            "pytest -q",
+            "--lang",
+            "typescript",
+            "--ignore",
+            "generated/**",
+            "--auto-verify",
+            "false",
+        ])
+        .expect("parse config set");
+        assert!(matches!(
+            set.command,
+            Some(CliCommand::Config(ConfigArgs {
+                action: ConfigCommand::Set {
+                    ref check,
+                    ref test,
+                    ref languages,
+                    ref ignore_globs,
+                    auto_verify: Some(false),
+                    ..
+                }
+            })) if check.as_deref() == Some("npx tsc --noEmit")
+                && test.as_deref() == Some("pytest -q")
+                && languages == &vec!["typescript".to_string()]
+                && ignore_globs == &vec!["generated/**".to_string()]
+        ));
+
+        let reset = CliArgs::try_parse_from(["allyh", "config", "reset"]).expect("parse config reset");
+        assert!(matches!(
+            reset.command,
+            Some(CliCommand::Config(ConfigArgs {
+                action: ConfigCommand::Reset
+            }))
         ));
     }
 }

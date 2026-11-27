@@ -489,7 +489,7 @@ async fn five_step_sim_and_crsi_acceptance_suite() {
         repo_root: repo_a_dir.clone(),
         storage: StorageConfig::from_local_path(&db_dir),
         scope_id: DEFAULT_SCOPE_ID.into(),
-        auto_cargo_check: false,
+        auto_verify: false,
         idle_optimize_interval: Duration::from_secs(60),
         enable_fs_watcher: false,
     };

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use allyh_core::{AllyHOrchestrator, ControlGateState, InspectorSnapshot, UiEvent, UserCommand};
-use allyh_memory::{WorkerStatus, load_skill_markdown_file};
+use allyh_memory::{RepoProfile, WorkerStatus, load_skill_markdown_file};
 use allyh_tools::ToolExecutionRecord;
 use crossterm::event::KeyCode;
 use ratatui::style::Style;
@@ -24,8 +24,9 @@ pub const COMMANDS: &[SlashCommand] = &[
     SlashCommand::new("/pin", "[id]", "Pin or unpin a decision"),
     SlashCommand::new("/invalidate", "[id]", "Retire a decision"),
     SlashCommand::new("/db-status", "", "Inspect storage and table counts"),
+    SlashCommand::new("/config", "[cmd]", "Inspect or override polyglot verification config"),
     SlashCommand::new("/compact", "", "Compact conversation history"),
-    SlashCommand::new("/refresh", "", "Rescan files and run cargo check"),
+    SlashCommand::new("/refresh", "", "Rescan files and run project check"),
     SlashCommand::new("/help", "", "Show commands and shortcuts"),
     SlashCommand::new("/quit", "", "Close the session"),
 ];
@@ -308,6 +309,7 @@ impl AppState {
                     }
                 }
                 "db-status" => Some(UserCommand::RequestDbStatus),
+                "config" => self.parse_config_command(arg),
                 "compact" => Some(UserCommand::CompactNow),
                 "refresh" => Some(UserCommand::RefreshEnv {
                     run_build_check: true,
@@ -648,6 +650,49 @@ impl AppState {
                     report.sim_attempts_count,
                 )));
             }
+            UiEvent::RepoProfileDetail {
+                profile,
+                detected_languages,
+                detected_toolchains,
+            } => {
+                let langs = if detected_languages.is_empty() {
+                    "none".to_string()
+                } else {
+                    detected_languages.join(", ")
+                };
+                let tools = if detected_toolchains.is_empty() {
+                    "none".to_string()
+                } else {
+                    detected_toolchains.join(", ")
+                };
+                let mut msg = format!(
+                    "### Repository Polyglot Profile (Out-of-Tree LanceDB)\n\
+                     - **Detected Languages:** {langs}\n\
+                     - **Detected Toolchains:** {tools}"
+                );
+                if let Some(p) = profile {
+                    msg.push_str(&format!(
+                        "\n- **Check Override:** `{}`\n\
+                         - **Lint Override:** `{}`\n\
+                         - **Test Override:** `{}`\n\
+                         - **Extra Ignore Globs:** {}",
+                        p.check_command.as_deref().unwrap_or("auto"),
+                        p.lint_command.as_deref().unwrap_or("auto"),
+                        p.test_command.as_deref().unwrap_or("auto"),
+                        if p.extra_ignore_globs.is_empty() {
+                            "none".to_string()
+                        } else {
+                            p.extra_ignore_globs.join(", ")
+                        }
+                    ));
+                } else {
+                    msg.push_str("\n- **Custom Overrides:** none (automatic detection)");
+                }
+                msg.push_str(
+                    "\n\n_Use `/config set-check <cmd>`, `/config set-lint <cmd>`, `/config set-test <cmd>`, or `/config reset`._",
+                );
+                self.entries.push(ChatEntry::System(msg));
+            }
             UiEvent::SystemNotice(msg) => {
                 self.entries.push(ChatEntry::System(msg));
             }
@@ -842,5 +887,67 @@ impl AppState {
              _Run multi-round optimization via CLI: `allyh sim evolve --suite <path>` or `allyh sim continue --from-run <id> --suite <path>`._"
                 .to_string(),
         ));
+    }
+
+    fn parse_config_command(&mut self, arg: &str) -> Option<UserCommand> {
+        let trimmed = arg.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("show") {
+            return Some(UserCommand::RequestRepoProfile);
+        }
+        let mut parts = trimmed.splitn(2, char::is_whitespace);
+        let sub = parts.next().unwrap_or("").to_ascii_lowercase();
+        let rest = parts.next().unwrap_or("").trim();
+
+        match sub.as_str() {
+            "reset" | "clear" => Some(UserCommand::ResetRepoProfile),
+            "set-check" | "check" => {
+                if rest.is_empty() {
+                    self.entries.push(ChatEntry::System(
+                        "Usage: /config set-check <command>".to_string(),
+                    ));
+                    return None;
+                }
+                let mut profile =
+                    RepoProfile::empty(&self.inspector.repo_id, &self.inspector.scope_id);
+                profile.check_command = Some(rest.to_string());
+                Some(UserCommand::SaveRepoProfile(profile))
+            }
+            "set-lint" | "lint" => {
+                if rest.is_empty() {
+                    self.entries.push(ChatEntry::System(
+                        "Usage: /config set-lint <command>".to_string(),
+                    ));
+                    return None;
+                }
+                let mut profile =
+                    RepoProfile::empty(&self.inspector.repo_id, &self.inspector.scope_id);
+                profile.lint_command = Some(rest.to_string());
+                Some(UserCommand::SaveRepoProfile(profile))
+            }
+            "set-test" | "test" => {
+                if rest.is_empty() {
+                    self.entries.push(ChatEntry::System(
+                        "Usage: /config set-test <command>".to_string(),
+                    ));
+                    return None;
+                }
+                let mut profile =
+                    RepoProfile::empty(&self.inspector.repo_id, &self.inspector.scope_id);
+                profile.test_command = Some(rest.to_string());
+                Some(UserCommand::SaveRepoProfile(profile))
+            }
+            _ => {
+                self.entries.push(ChatEntry::System(
+                    "### Config Commands (Out-of-Tree LanceDB RepoProfile)\n\
+                     - `/config`  Show detected languages, toolchains, and overrides\n\
+                     - `/config set-check <cmd>`  Set a custom check/type-check command\n\
+                     - `/config set-lint <cmd>`  Set a custom lint command\n\
+                     - `/config set-test <cmd>`  Set a custom test command\n\
+                     - `/config reset`  Restore automatic polyglot detection"
+                        .to_string(),
+                ));
+                None
+            }
+        }
     }
 }

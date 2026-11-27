@@ -30,11 +30,11 @@ pub use embeddings::{
 pub use error::{MemoryError, Result};
 pub use schema::{
     ArchitecturalDecision, CodeGraphSnapshot, DbStatusReport, EMBEDDING_DIM, HarnessVersionRecord,
-    ScoredDecision, SessionRecord, SimAttemptRecord, SimMemoryMode, SimProblemRecord, SimRunRecord,
-    SkillRecord, TABLE_ARCHITECTURAL_DECISIONS, TABLE_CODE_GRAPH_SNAPSHOTS,
-    TABLE_HARNESS_VERSIONS, TABLE_SESSIONS, TABLE_SIM_ATTEMPTS, TABLE_SIM_PROBLEMS, TABLE_SIM_RUNS,
-    TABLE_SKILLS, TABLE_TASKS, TaskRecord, TaskStatus, VerificationProof, normalize_skill_slug,
-    skill_id,
+    RepoProfile, ScoredDecision, SessionRecord, SimAttemptRecord, SimMemoryMode, SimProblemRecord,
+    SimRunRecord, SkillRecord, TABLE_ARCHITECTURAL_DECISIONS, TABLE_CODE_GRAPH_SNAPSHOTS,
+    TABLE_HARNESS_VERSIONS, TABLE_REPO_PROFILES, TABLE_SESSIONS, TABLE_SIM_ATTEMPTS,
+    TABLE_SIM_PROBLEMS, TABLE_SIM_RUNS, TABLE_SKILLS, TABLE_TASKS, TaskRecord, TaskStatus,
+    VerificationProof, infer_language_from_path, normalize_skill_slug, repo_profile_id, skill_id,
 };
 pub use sim_ledger::{
     SIM_PROMPT_RULES, SimAttemptEntry, SimAttemptInput, SimCarriedFrom, SimExportDocument,

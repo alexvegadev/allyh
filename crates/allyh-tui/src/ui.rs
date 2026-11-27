@@ -234,9 +234,15 @@ fn render_inspector(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         1 => "1 changed file".to_owned(),
         n => format!("{n} changed files"),
     };
+    let stack_label = if snapshot.detected_languages.is_empty() {
+        "Auto".to_string()
+    } else {
+        snapshot.detected_languages.join(", ")
+    };
     let mut workspace = vec![
         Line::styled("Workspace", bold(BLUE)),
         field("Branch", snapshot.git_branch.as_str()),
+        field("Stack", stack_label),
         field("Changes", changes),
         field("Build", snapshot.build_status.as_str()),
         field("Storage", snapshot.storage_backend_label.as_str()),
@@ -264,6 +270,9 @@ fn render_inspector(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
             ),
         ),
     ];
+    if !snapshot.detected_toolchains.is_empty() {
+        workspace.insert(3, field("Tools", snapshot.detected_toolchains.join(", ")));
+    }
     if !snapshot.out_of_band_edits.is_empty() {
         workspace.insert(
             3,

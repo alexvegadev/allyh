@@ -20,7 +20,7 @@ fn make_config(repo_dir: &std::path::Path, db_dir: &std::path::Path, scope_id: &
         repo_root: repo_dir.to_path_buf(),
         storage: StorageConfig::from_local_path(db_dir),
         scope_id: scope_id.to_string(),
-        auto_cargo_check: false,
+        auto_verify: false,
         idle_optimize_interval: Duration::from_secs(60),
         enable_fs_watcher: false,
     }
@@ -416,5 +416,235 @@ async fn test_skills_progressive_disclosure_and_actor_commands() {
     assert!(matches!(updated_snap, UiEvent::InspectorUpdated(s) if s.skills_count == 0));
 
     cmd_tx.send(UserCommand::Shutdown).unwrap();
+}
+
+/// Milestone 1 Polyglot Acceptance Suite:
+/// Verifies end-to-end indexing, RepoGraph ego-graphs, monorepo toolchain detection,
+/// out-of-tree `RepoProfile` custom verification gating `TaskStatus::Verified`,
+/// and backward-compatible `HarnessSpec` / `CompletionInterlock` deserialization.
+#[tokio::test]
+async fn polyglot_monorepo_acceptance_suite() {
+    use allyh_core::{CompletionInterlock, CompletionInterlockPolicy, HarnessSpec, InterlockDecision};
+    use allyh_memory::{RepoProfile, TaskStatus};
+    use allyh_tools::{EditByHashArgs, InspectSymbolArgs, RunVerificationArgs};
+
+    let tmp = TempDir::new().expect("tempdir");
+    let db_dir = tmp.path().join("db");
+    let repo_dir = tmp.path().join("poly_monorepo");
+
+    std::fs::create_dir_all(repo_dir.join("backend/src")).unwrap();
+    std::fs::create_dir_all(repo_dir.join("web/src")).unwrap();
+    std::fs::create_dir_all(repo_dir.join("ml")).unwrap();
+    std::fs::create_dir_all(repo_dir.join("svc")).unwrap();
+
+    std::fs::write(
+        repo_dir.join("backend/Cargo.toml"),
+        "[package]\nname = \"backend\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo_dir.join("backend/src/lib.rs"),
+        "pub fn health_check() -> bool { true }\n",
+    )
+    .unwrap();
+    std::fs::write(repo_dir.join("web/tsconfig.json"), "{}").unwrap();
+    std::fs::write(
+        repo_dir.join("web/src/client.ts"),
+        "export function fetchStatus(): string { return 'ok'; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo_dir.join("web/src/App.tsx"),
+        "import { fetchStatus } from './client';\nexport function StatusBanner() { return <span>{fetchStatus()}</span>; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo_dir.join("ml/pyproject.toml"),
+        "[project]\nname = \"ml\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo_dir.join("ml/score.py"),
+        "def compute_score(x: int) -> int:\n    return normalize(x)\n\ndef normalize(v: int) -> int:\n    return v * 2\n",
+    )
+    .unwrap();
+    std::fs::write(repo_dir.join("svc/go.mod"), "module example.com/svc\n").unwrap();
+    std::fs::write(
+        repo_dir.join("svc/main.go"),
+        "package main\n\ntype Engine struct{}\nfunc (e *Engine) Start() int { return boot() }\nfunc boot() int { return 1 }\n",
+    )
+    .unwrap();
+
+    let mut cfg = make_config(&repo_dir, &db_dir, "default");
+    cfg.auto_verify = true;
+    let mut orch = AllyHOrchestrator::initialize(cfg, offline_router(), None)
+        .await
+        .expect("init polyglot orchestrator");
+
+    // 1. Inspector detects all four languages & toolchains automatically
+    let snap = orch.inspector_snapshot().await.expect("snap");
+    for lang in ["Rust", "TypeScript", "Python", "Go"] {
+        assert!(
+            snap.detected_languages.iter().any(|l| l == lang),
+            "expected language {lang} in {:?}",
+            snap.detected_languages
+        );
+    }
+    assert_eq!(snap.detected_toolchains.len(), 4);
+
+    // 2. Inspect polyglot symbols with accurate 1-hop ego-graphs and language tags
+    let tsx_inspect = orch
+        .toolset()
+        .inspect_tool()
+        .execute(InspectSymbolArgs {
+            query: "StatusBanner".into(),
+            hops: Some(1),
+            start_line: None,
+            end_line: None,
+        })
+        .await
+        .expect("inspect tsx");
+    assert_eq!(tsx_inspect.matched_files[0].language, "tsx");
+    assert!(
+        tsx_inspect
+            .ego_graph
+            .hop1_neighbors
+            .iter()
+            .any(|e| e.to_symbol == "fetchStatus")
+    );
+
+    let py_inspect = orch
+        .toolset()
+        .inspect_tool()
+        .execute(InspectSymbolArgs {
+            query: "compute_score".into(),
+            hops: Some(1),
+            start_line: None,
+            end_line: None,
+        })
+        .await
+        .expect("inspect py");
+    assert_eq!(py_inspect.matched_files[0].language, "python");
+    assert!(
+        py_inspect
+            .ego_graph
+            .hop1_neighbors
+            .iter()
+            .any(|e| e.to_symbol == "normalize")
+    );
+
+    let go_inspect = orch
+        .toolset()
+        .inspect_tool()
+        .execute(InspectSymbolArgs {
+            query: "Engine.Start".into(),
+            hops: Some(1),
+            start_line: None,
+            end_line: None,
+        })
+        .await
+        .expect("inspect go");
+    assert_eq!(go_inspect.matched_files[0].language, "go");
+    assert!(
+        go_inspect
+            .ego_graph
+            .hop1_neighbors
+            .iter()
+            .any(|e| e.to_symbol == "boot")
+    );
+
+    // 3. Configure out-of-tree RepoProfile custom verifier (no dotfiles written into repo!)
+    let pass_cmd = "echo verified-ok";
+    let mut profile = RepoProfile::empty(orch.repo_id(), orch.scope_id());
+    profile.check_command = Some(pass_cmd.into());
+    profile.test_command = Some(pass_cmd.into());
+    orch.save_repo_profile(profile).await.expect("save profile");
+    assert!(!repo_dir.join(".allyh.toml").exists());
+
+    // 4. Approve a plan, edit a TypeScript file with auto-verify, and verify the LanceDB task
+    orch.propose_plan(AllyHOrchestrator::build_quick_plan("Update web client"));
+    let tasks = orch.approve_plan().await.expect("approve plan");
+    let task_id = tasks[0].id.clone();
+
+    let client_inspect = orch
+        .toolset()
+        .inspect_tool()
+        .execute(InspectSymbolArgs {
+            query: "web/src/client.ts".into(),
+            hops: Some(1),
+            start_line: None,
+            end_line: None,
+        })
+        .await
+        .expect("inspect client.ts");
+    let hash = client_inspect.matched_files[0].sha256_hash.clone();
+
+    let edit_out = orch
+        .toolset()
+        .edit_tool()
+        .execute(EditByHashArgs {
+            file_path: "web/src/client.ts".into(),
+            expected_sha256: Some(hash),
+            target_snippet: Some("'ok'".into()),
+            replacement_snippet: Some("'healthy'".into()),
+            full_content: None,
+            create_if_missing: None,
+            target_scope: None,
+            toolchain: None,
+        })
+        .await
+        .expect("edit web/src/client.ts");
+    assert!(
+        edit_out
+            .verification
+            .as_ref()
+            .is_some_and(|v| v.success && v.toolchain == "custom")
+    );
+
+    let verify_out = orch
+        .toolset()
+        .verify_tool()
+        .execute(RunVerificationArgs {
+            kind: Some("test".into()),
+            target: None,
+            toolchain: None,
+            affected_file: Some("web/src/client.ts".into()),
+            task_id: Some(task_id.clone()),
+        })
+        .await
+        .expect("run_verification");
+    assert_eq!(verify_out.verified_task_id.as_deref(), Some(task_id.as_str()));
+
+    let updated_tasks = orch
+        .store()
+        .list_tasks(orch.repo_id(), orch.scope_id())
+        .await
+        .expect("list tasks");
+    assert_eq!(updated_tasks[0].status, TaskStatus::Verified);
+
+    // 5. Legacy HarnessSpec JSON (`auto_cargo_check`) + CompletionInterlock (`verification` payload)
+    let mut legacy_json = serde_json::to_value(HarnessSpec::default_seed()).unwrap();
+    legacy_json["tools"].as_object_mut().unwrap().remove("auto_verify");
+    legacy_json["tools"]["auto_cargo_check"] = serde_json::json!(false);
+    let parsed_legacy: HarnessSpec =
+        serde_json::from_value(legacy_json).expect("legacy auto_cargo_check alias must deserialize");
+    assert!(!parsed_legacy.tools.auto_verify);
+
+    let mut interlock = CompletionInterlock::new(CompletionInterlockPolicy {
+        enabled: true,
+        max_consecutive_rejections: 2,
+        require_verification_after_edits: true,
+        reject_on_recent_tool_error: true,
+        quality_audit_notice: None,
+        budget_reminder_ratio: None,
+    });
+    interlock.observe_tool_round(&[allyh_tools::ToolExecutionRecord {
+        tool_name: "edit_by_hash".into(),
+        compact_header: "edit_by_hash(web/src/client.ts) -> custom check: PASS".into(),
+        succeeded: true,
+        output_text: String::new(),
+        output_json: serde_json::json!({ "verification": { "success": true } }),
+    }]);
+    assert_eq!(interlock.check_completion("Done"), InterlockDecision::Allow);
 }
 

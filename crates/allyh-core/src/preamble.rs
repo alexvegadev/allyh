@@ -192,19 +192,34 @@ impl DynamicPreambleAssembler {
     /// Extract candidate symbol or path queries from a prompt and recent environment delta.
     pub fn extract_symbol_queries(prompt: &str, env_delta: &EnvDelta) -> Vec<String> {
         let mut queries = Vec::new();
-        for token in prompt.split(|c: char| !c.is_alphanumeric() && c != '_' && c != ':' && c != '.' && c != '/') {
-            let t = token.trim_matches(|c: char| c == ':' || c == '.');
-            if t.contains("::") || t.ends_with(".rs") || (t.len() >= 5 && t.chars().any(|c| c.is_uppercase() || c == '_')) {
+        for token in prompt.split(|c: char| {
+            !c.is_alphanumeric() && c != '_' && c != ':' && c != '.' && c != '/' && c != '-'
+        }) {
+            let t = token.trim_matches(|c: char| c == ':' || c == '.' || c == '-');
+            if t.is_empty() {
+                continue;
+            }
+            let has_code_ext = [
+                ".rs", ".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".py", ".pyi",
+                ".go", ".toml", ".json", ".mod",
+            ]
+            .iter()
+            .any(|ext| t.ends_with(ext));
+            let is_member_expr = (t.contains("::") || (t.contains('.') && !t.starts_with("http")))
+                && t.len() >= 4;
+            let is_ident = t.len() >= 5 && t.chars().any(|c| c.is_uppercase() || c == '_');
+
+            if has_code_ext || is_member_expr || is_ident {
                 if !queries.iter().any(|q| q == t) {
                     queries.push(t.to_string());
                 }
             }
-            if queries.len() >= 3 {
+            if queries.len() >= 4 {
                 break;
             }
         }
         for edit in &env_delta.out_of_band_edits {
-            if queries.len() >= 4 {
+            if queries.len() >= 5 {
                 break;
             }
             if !queries.iter().any(|q| q == &edit.file_path) {

@@ -2,7 +2,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use allyh_env::{
-    CargoVerificationReport, EnvironmentMonitor, VerificationKind, summarize_text_diff,
+    EnvironmentMonitor, VerificationKind, VerificationReport, VerificationTarget,
+    summarize_text_diff,
 };
 use rig_core::completion::ToolAnnotations;
 use rig_core::tool::{Tool, ToolContext, ToolExecutionError, args_schema};
@@ -26,41 +27,47 @@ pub struct EditByHashArgs {
     pub full_content: Option<String>,
     /// Allow creating a new file when it does not exist yet.
     pub create_if_missing: Option<bool>,
-    /// Optional Cargo package name (`-p <pkg>`) for faster post-edit `cargo check`.
-    pub cargo_package: Option<String>,
+    /// Optional package, subdirectory, or test scope for faster post-edit verification (alias: `cargo_package`).
+    #[serde(default, alias = "cargo_package")]
+    pub target_scope: Option<String>,
+    /// Optional explicit toolchain override (`rust`, `typescript`, `python`, `go`, `custom`).
+    #[serde(default)]
+    pub toolchain: Option<String>,
 }
 
-/// Prescriptive output returned by [`EditByHashTool`], always including post-edit compiler diagnostics.
+/// Prescriptive output returned by [`EditByHashTool`], including post-edit diagnostics from
+/// the affected sub-project's toolchain verifier.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EditByHashOutput {
     pub file_path: String,
     pub previous_sha256: Option<String>,
     pub new_sha256: String,
     pub diff_summary: String,
-    pub cargo_check: Option<CargoVerificationReport>,
+    #[serde(alias = "cargo_check")]
+    pub verification: Option<VerificationReport>,
     pub prescriptive_diagnostics: String,
 }
 
-/// Hash-verified file editor with automatic post-edit `cargo check --message-format=json` hook.
+/// Hash-verified file editor with automatic post-edit verification hook across supported toolchains.
 #[derive(Clone)]
 pub struct EditByHashTool {
     env: Arc<EnvironmentMonitor>,
     /// Enforces the Control Gate: edits are rejected while AllyH is in Discovery / PlanApproval mode.
     writes_enabled: Arc<AtomicBool>,
-    /// Automatically run `cargo check --message-format=json` after every edit.
-    auto_cargo_check: bool,
+    /// Automatically run post-edit check verification on the affected sub-project.
+    auto_verify: bool,
 }
 
 impl EditByHashTool {
     pub fn new(
         env: Arc<EnvironmentMonitor>,
         writes_enabled: Arc<AtomicBool>,
-        auto_cargo_check: bool,
+        auto_verify: bool,
     ) -> Self {
         Self {
             env,
             writes_enabled,
-            auto_cargo_check,
+            auto_verify,
         }
     }
 
@@ -145,27 +152,42 @@ impl EditByHashTool {
         self.env.cache_file_content(&rel_path, &updated_content);
         let _ = self.env.index_file(&rel_path, 0).await;
 
-        let cargo_check = if self.auto_cargo_check && self.env.cargo().has_cargo_manifest() {
-            Some(
-                self.env
-                    .run_cargo(VerificationKind::Check, args.cargo_package.as_deref())
-                    .await?,
-            )
-        } else {
-            None
-        };
-
-        let prescriptive_diagnostics = cargo_check
+        let profile = self.env.load_repo_profile().await;
+        let should_auto_verify = profile
             .as_ref()
-            .map(CargoVerificationReport::render_prescriptive)
-            .unwrap_or_else(|| "cargo check skipped (no Cargo.toml or disabled)".to_string());
+            .and_then(|p| p.auto_verify_override)
+            .unwrap_or(self.auto_verify);
+        let has_custom_check = profile
+            .as_ref()
+            .and_then(|p| p.check_command.as_deref())
+            .is_some_and(|c| !c.trim().is_empty());
+
+        let verification =
+            if should_auto_verify && (has_custom_check || self.env.has_any_toolchain()) {
+                let target = VerificationTarget {
+                    kind: VerificationKind::Check,
+                    target_scope: args.target_scope.clone(),
+                    affected_file: Some(rel_path.clone()),
+                    toolchain_override: args.toolchain.clone(),
+                };
+                Some(self.env.run_verification(&target).await?)
+            } else {
+                None
+            };
+
+        let prescriptive_diagnostics = verification
+            .as_ref()
+            .map(VerificationReport::render_prescriptive)
+            .unwrap_or_else(|| {
+                "verification skipped (no detected toolchain or auto-check disabled)".to_string()
+            });
 
         Ok(EditByHashOutput {
             file_path: rel_path,
             previous_sha256,
             new_sha256,
             diff_summary,
-            cargo_check,
+            verification,
             prescriptive_diagnostics,
         })
     }
@@ -178,7 +200,7 @@ impl Tool for EditByHashTool {
     type Error = ToolError;
 
     fn description(&self) -> String {
-        "Edit or create a workspace file only if its SHA-256 hash matches expected_sha256, then automatically run `cargo check --message-format=json` and return prescriptive compiler diagnostics.".to_string()
+        "Edit or create a workspace file only if its SHA-256 hash matches expected_sha256, then automatically run the affected sub-project's type-check/compiler verification and return prescriptive diagnostics.".to_string()
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -187,7 +209,7 @@ impl Tool for EditByHashTool {
 
     fn annotations(&self) -> ToolAnnotations {
         ToolAnnotations::default()
-            .with_title("Hash-Verified File Edit + Cargo Check")
+            .with_title("Hash-Verified File Edit + Auto Check")
             .with_read_only(false)
             .with_destructive(true)
             .with_open_world(false)

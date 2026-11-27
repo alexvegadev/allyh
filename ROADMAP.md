@@ -19,43 +19,43 @@ This roadmap defines the highest-leverage capabilities to evolve AllyH from a **
 
 ---
 
-## Milestone 1: Pluggable Polyglot Language & Toolchain Engine (`v0.3.0`)
+## Milestone 1: Pluggable Polyglot Language & Toolchain Engine (`v0.3.0`) — Completed
 
 **Goal:** Eliminate every hardcoded Rust/`.rs`/`cargo` assumption across `allyh-env`, `allyh-tools`, `allyh-core`, `allyh-memory`, and `allyh-tui`, introducing first-class support for **Rust, TypeScript/JavaScript, Python, and Go** (plus extensible custom verifiers for any language).
 
 ### 1.1 Generalized RepoGraph & Multi-Language `tree-sitter` Indexing (`allyh-env`, `allyh-memory`)
-- [ ] **Abstract `LanguageIndexer` trait (`crates/allyh-env/src/graph.rs`):** Replace direct `RustIndexer` calls with a `LanguageRegistry` dispatching by file extension / filename.
-- [ ] **Broaden `SymbolKind` (`crates/allyh-env/src/graph.rs`):** Add polyglot variants (`Class`, `Interface`, `Method`, `Namespace`, `Variable`, `Component`, `Macro`) while keeping backward-compatible serde deserialization for existing snapshots.
-- [ ] **Add `language` metadata to `CodeGraphSnapshot` (`crates/allyh-memory/src/schema.rs`):** Persist detected language per file snapshot (with schema migration / default fallback for existing LanceDB tables).
-- [ ] **Implement Tier-1 `tree-sitter` adapters (`crates/allyh-env/src/lang/`):**
-  - [ ] Rust (`tree-sitter-rust` — migrate existing `RustIndexer`)
-  - [ ] TypeScript / TSX / JavaScript (`tree-sitter-typescript`, `tree-sitter-javascript`)
-  - [ ] Python (`tree-sitter-python`)
-  - [ ] Go (`tree-sitter-go`)
-- [ ] **Add feature flags in `Cargo.toml`:** Allow compiling with `--features lang-all` (default) or minimal language subsets to keep build times and binary size predictable.
-- [ ] **Upgrade file discovery (`crates/allyh-env/src/watcher.rs`):** Replace hardcoded `matches!(ext, "rs" | "toml")` and static `is_ignored_entry` lists with `.gitignore` / `.ignore`-aware walking (e.g., `ignore::WalkBuilder`) plus language-aware default ignores (`.venv`, `__pycache__`, `node_modules`, `dist`, `build`, `vendor`, `target`).
+- [x] **Abstract `LanguageIndexer` trait (`crates/allyh-env/src/lang/mod.rs`):** Replace direct `RustIndexer` calls with a `LanguageRegistry` dispatching by file extension / filename.
+- [x] **Broaden `SymbolKind` (`crates/allyh-env/src/graph.rs`):** Add polyglot variants (`Class`, `Interface`, `Method`, `Namespace`, `Variable`, `Component`, `Macro`) while keeping backward-compatible serde deserialization for existing snapshots.
+- [x] **Add `language` metadata to `CodeGraphSnapshot` (`crates/allyh-memory/src/schema.rs`):** Persist detected language per file snapshot (with schema migration / default fallback for existing LanceDB tables).
+- [x] **Implement Tier-1 `tree-sitter` adapters (`crates/allyh-env/src/lang/`):**
+  - [x] Rust (`tree-sitter-rust` — migrate existing `RustIndexer`)
+  - [x] TypeScript / TSX / JavaScript (`tree-sitter-typescript`, `tree-sitter-javascript`)
+  - [x] Python (`tree-sitter-python`)
+  - [x] Go (`tree-sitter-go`)
+- [x] **Add feature flags in `Cargo.toml`:** Allow compiling with `--features lang-all` (default) or minimal language subsets to keep build times and binary size predictable.
+- [x] **Upgrade file discovery (`crates/allyh-env/src/watcher.rs`):** Replace hardcoded `matches!(ext, "rs" | "toml")` and static `is_ignored_entry` lists with `.gitignore` / `.ignore`-aware walking (`ignore::WalkBuilder`) plus language-aware default ignores (`.venv`, `__pycache__`, `node_modules`, `dist`, `build`, `vendor`, `target`).
 
 ### 1.2 Pluggable `ToolchainVerifier` & Unified Diagnostics (`allyh-env`, `allyh-tools`, `allyh-core`)
-- [ ] **Define `VerificationAdapter` trait (`crates/allyh-env/src/verify/`):** Generalize `CargoRunner` and `CargoVerificationReport` into language-agnostic `VerificationReport`, `DiagnosticItem` (preserving `level`, `code`, `message`, `file`, `line`, `column`, `suggestion`), and `VerificationKind` (`TypeCheck`, `Lint`, `Test`, `Custom(String)`).
-- [ ] **Implement built-in toolchain auto-detectors & structured diagnostic parsers:**
-  - [ ] **Rust:** `cargo check` / `cargo clippy` / `cargo test` (`--message-format=json`)
-  - [ ] **TypeScript / JS:** `tsc --noEmit` (compiler error parser), `eslint --format json` / `biome check --reporter=json`, `vitest` / `jest` / `npm test`
-  - [ ] **Python:** `pyright --outputjson` / `mypy --output=json`, `ruff check --output-format=json`, `pytest` (JUnit/JSON failure parser)
-  - [ ] **Go:** `go vet` / `go build` diagnostics, `golangci-lint run --out-format json`, `go test -json`
-  - [ ] **Generic SARIF & Custom Command fallback:** Parse SARIF 2.1.0 or stderr regex profiles for C/C++, Java, C#, Zig, etc.
-- [ ] **Support polyglot monorepos:** Detect multiple toolchains by nearest manifest directory (e.g., `backend/Cargo.toml` + `web/package.json` + `ml/pyproject.toml`) and route post-edit checks only to the affected sub-project.
-- [ ] **Out-of-tree `repo_profiles` table (`crates/allyh-memory`):** Persist per-repository language overrides, custom check/lint/test commands, and ignore rules in LanceDB (no `.allyh.toml` pollution required in the repo), editable via `allyh config` and `/config`.
+- [x] **Define `VerificationAdapter` trait (`crates/allyh-env/src/verify/`):** Generalize `CargoRunner` and `CargoVerificationReport` into language-agnostic `VerificationReport`, `DiagnosticItem` (preserving `level`, `code`, `message`, `file`, `line`, `column`, `suggestion`), and `VerificationKind` (`Check`, `Lint`, `Clippy`, `Test`).
+- [x] **Implement built-in toolchain auto-detectors & structured diagnostic parsers:**
+  - [x] **Rust:** `cargo check` / `cargo clippy` / `cargo test` (`--message-format=json`)
+  - [x] **TypeScript / JS:** `tsc --noEmit` (compiler error parser), `eslint --format json` / `biome check --reporter=json`, `vitest` / `jest` / `npm test`
+  - [x] **Python:** `pyright --outputjson` / `mypy --output=json`, `ruff check --output-format json`, `pytest` failure parser
+  - [x] **Go:** `go vet` diagnostics, `golangci-lint run --out-format json`, `go test -json`
+  - [x] **Generic SARIF & Custom Command fallback:** Parse SARIF 2.1.0 or `file:line:col` fallback for C/C++, Java, C#, Zig, etc.
+- [x] **Support polyglot monorepos:** Detect multiple toolchains by nearest manifest directory (e.g., `backend/Cargo.toml` + `web/tsconfig.json` + `ml/pyproject.toml` + `svc/go.mod`) and route post-edit checks only to the affected sub-project.
+- [x] **Out-of-tree `repo_profiles` table (`crates/allyh-memory`):** Persist per-repository language overrides, custom check/lint/test commands, and ignore rules in LanceDB (no `.allyh.toml` pollution required in the repo), editable via `allyh config` and `/config`.
 
 ### 1.3 Polyglot ACI Tools, Preamble, Interlock & CLI (`allyh-tools`, `allyh-core`, `allyh-tui`)
-- [ ] **Generalize `EditByHashTool` (`crates/allyh-tools/src/edit.rs`):** Rename/alias `cargo_package` → `target_scope` and `cargo_check` → `verification` (with `#[serde(alias = "...")]` for backward compatibility).
-- [ ] **Generalize `RunVerificationTool` (`crates/allyh-tools/src/verify.rs`):** Accept `kind` (`check` | `lint` | `test` | `clippy` alias), optional `target` (package/subdir/test filter), and `toolchain` override; issue `VerificationProof` from any passing adapter.
-- [ ] **Update `CompletionInterlock` & `HarnessSpec` (`crates/allyh-core/src/interlock.rs`, `harness.rs`):** Read `verification.success` (with `cargo_check.success` fallback) and alias `auto_cargo_check` → `auto_verify` so existing SIM ledgers and `HarnessSpec` records remain 100% valid.
-- [ ] **Upgrade `DynamicPreambleAssembler::extract_symbol_queries` (`crates/allyh-core/src/preamble.rs`):** Recognize polyglot paths (`.ts`, `.tsx`, `.js`, `.py`, `.go`, etc.) and member expressions (`Foo.bar`, `pkg/mod.Fn`, `Foo::bar`).
-- [ ] **Update TUI & CLI labels (`crates/allyh-tui`):** Surface detected language(s) and active toolchain(s) in the Coherence Inspector sidebar; generalize `--no-auto-check` and `/refresh` descriptions.
+- [x] **Generalize `EditByHashTool` (`crates/allyh-tools/src/edit.rs`):** Rename/alias `cargo_package` → `target_scope` and `cargo_check` → `verification` (with `#[serde(alias = "...")]` for backward compatibility).
+- [x] **Generalize `RunVerificationTool` (`crates/allyh-tools/src/verify.rs`):** Accept `kind` (`check` | `lint` | `test` | `clippy` alias), optional `target` (package/subdir/test filter), and `toolchain` override; issue `VerificationProof` from any passing adapter.
+- [x] **Update `CompletionInterlock` & `HarnessSpec` (`crates/allyh-core/src/interlock.rs`, `harness.rs`):** Read `verification.success` (with `cargo_check.success` fallback) and alias `auto_cargo_check` → `auto_verify` so existing SIM ledgers and `HarnessSpec` records remain 100% valid.
+- [x] **Upgrade `DynamicPreambleAssembler::extract_symbol_queries` (`crates/allyh-core/src/preamble.rs`):** Recognize polyglot paths (`.ts`, `.tsx`, `.js`, `.py`, `.go`, etc.) and member expressions (`Foo.bar`, `pkg/mod.Fn`, `Foo::bar`).
+- [x] **Update TUI & CLI labels (`crates/allyh-tui`):** Surface detected language(s) and active toolchain(s) in the Coherence Inspector sidebar; generalize `--no-auto-check` and `/refresh` descriptions.
 
 ### Milestone 1 Acceptance Criteria
-- [ ] Polyglot acceptance test suite covering Rust, TypeScript, Python, and Go fixture repos (including a Rust + TypeScript monorepo): `inspect_symbol` returns accurate 1-hop/2-hop ego-graphs, `edit_by_hash` triggers the matching sub-project verifier, and `run_verification` gates `TaskStatus::Verified` with structured diagnostics.
-- [ ] Existing Rust acceptance suites (`acceptance_suite.rs`, `sim_acceptance_suite.rs`) pass with zero regressions.
+- [x] Polyglot acceptance test suite covering Rust, TypeScript, Python, and Go fixture repos (including a Rust + TypeScript + Python + Go monorepo): `inspect_symbol` returns accurate 1-hop/2-hop ego-graphs, `edit_by_hash` triggers the matching sub-project verifier, and `run_verification` gates `TaskStatus::Verified` with structured diagnostics.
+- [x] Existing Rust acceptance suites (`acceptance_suite.rs`, `sim_acceptance_suite.rs`) pass with zero regressions.
 
 ---
 

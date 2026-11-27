@@ -43,11 +43,11 @@ impl AciToolset {
         env: Arc<EnvironmentMonitor>,
         store: MemoryStore,
         writes_enabled: Arc<AtomicBool>,
-        auto_cargo_check: bool,
+        auto_verify: bool,
     ) -> Self {
         Self {
             inspect: InspectSymbolTool::new(Arc::clone(&env), store.clone()),
-            edit: EditByHashTool::new(Arc::clone(&env), Arc::clone(&writes_enabled), auto_cargo_check),
+            edit: EditByHashTool::new(Arc::clone(&env), Arc::clone(&writes_enabled), auto_verify),
             verify: RunVerificationTool::new(Arc::clone(&env), store.clone()),
             skill: AddSkillTool::new(Arc::clone(&env), store.clone()),
             get_skill: GetSkillTool::new(Arc::clone(&env), store.clone()),
@@ -206,7 +206,7 @@ impl AciToolset {
                     match self.edit.call(&mut ctx, parsed).await {
                         Ok(out) => {
                             let check_label = out
-                                .cargo_check
+                                .verification
                                 .as_ref()
                                 .map(|c| c.compact_status_line())
                                 .unwrap_or_else(|| "check skipped".to_string());

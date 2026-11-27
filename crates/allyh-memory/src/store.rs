@@ -8,7 +8,7 @@ use lancedb::index::Index;
 use lancedb::index::scalar::{BTreeIndexBuilder, FtsIndexBuilder, FullTextSearchQuery};
 use lancedb::index::vector::IvfPqIndexBuilder;
 use lancedb::query::{ExecutableQuery, QueryBase};
-use lancedb::table::OptimizeAction;
+use lancedb::table::{NewColumnTransform, OptimizeAction};
 use lancedb::{Connection, DistanceType, Table};
 use rig_core::DynModel;
 use rig_core::operation::Embedding;
@@ -18,18 +18,19 @@ use crate::config::{StorageConfig, escape_sql_literal};
 use crate::embeddings::{EmbeddingProvider, cosine_similarity};
 use crate::error::{MemoryError, Result};
 use crate::schema::{
-    ArchitecturalDecision, CodeGraphSnapshot, DbStatusReport, HarnessVersionRecord, ScoredDecision,
-    SessionRecord, SimRunRecord, SkillRecord, TABLE_ARCHITECTURAL_DECISIONS,
-    TABLE_CODE_GRAPH_SNAPSHOTS, TABLE_HARNESS_VERSIONS, TABLE_SESSIONS, TABLE_SIM_ATTEMPTS,
-    TABLE_SIM_PROBLEMS, TABLE_SIM_RUNS, TABLE_SKILLS, TABLE_TASKS, TaskRecord, TaskStatus,
-    VerificationProof, architectural_decisions_schema, batch_to_decisions,
-    batch_to_harness_versions, batch_to_sessions, batch_to_sim_attempts, batch_to_sim_problems,
-    batch_to_sim_runs, batch_to_skills, batch_to_snapshots, batch_to_tasks,
+    ArchitecturalDecision, CodeGraphSnapshot, DbStatusReport, HarnessVersionRecord, RepoProfile,
+    ScoredDecision, SessionRecord, SimRunRecord, SkillRecord, TABLE_ARCHITECTURAL_DECISIONS,
+    TABLE_CODE_GRAPH_SNAPSHOTS, TABLE_HARNESS_VERSIONS, TABLE_REPO_PROFILES, TABLE_SESSIONS,
+    TABLE_SIM_ATTEMPTS, TABLE_SIM_PROBLEMS, TABLE_SIM_RUNS, TABLE_SKILLS, TABLE_TASKS, TaskRecord,
+    TaskStatus, VerificationProof, architectural_decisions_schema, batch_to_decisions,
+    batch_to_harness_versions, batch_to_repo_profiles, batch_to_sessions, batch_to_sim_attempts,
+    batch_to_sim_problems, batch_to_sim_runs, batch_to_skills, batch_to_snapshots, batch_to_tasks,
     code_graph_snapshots_schema, decisions_to_batch, harness_versions_schema,
-    harness_versions_to_batch, normalize_skill_slug, sessions_schema, sessions_to_batch,
-    sim_attempts_schema, sim_attempts_to_batch, sim_problems_schema, sim_problems_to_batch,
-    sim_runs_schema, sim_runs_to_batch, skill_id, skills_schema, skills_to_batch,
-    snapshots_to_batch, tasks_schema, tasks_to_batch,
+    harness_versions_to_batch, normalize_skill_slug, repo_profile_id, repo_profiles_schema,
+    repo_profiles_to_batch, sessions_schema, sessions_to_batch, sim_attempts_schema,
+    sim_attempts_to_batch, sim_problems_schema, sim_problems_to_batch, sim_runs_schema,
+    sim_runs_to_batch, skill_id, skills_schema, skills_to_batch, snapshots_to_batch, tasks_schema,
+    tasks_to_batch,
 };
 use crate::sim_ledger::{SimExportDocument, SimLedger};
 
@@ -107,10 +108,32 @@ impl MemoryStore {
                 .create_empty_table(TABLE_CODE_GRAPH_SNAPSHOTS, code_graph_snapshots_schema())
                 .execute()
                 .await?;
+        } else {
+            // Seamlessly migrate pre-v0.3.0 `code_graph_snapshots` tables lacking `language`.
+            if let Ok(table) = self.open_table(TABLE_CODE_GRAPH_SNAPSHOTS).await
+                && let Ok(schema) = table.schema().await
+                && schema.field_with_name("language").is_err()
+            {
+                let _ = table
+                    .add_columns(
+                        NewColumnTransform::SqlExpressions(vec![(
+                            "language".to_string(),
+                            "'unknown'".to_string(),
+                        )]),
+                        None,
+                    )
+                    .await;
+            }
         }
         if !existing.iter().any(|n| n == TABLE_SKILLS) {
             self.connection
                 .create_empty_table(TABLE_SKILLS, skills_schema())
+                .execute()
+                .await?;
+        }
+        if !existing.iter().any(|n| n == TABLE_REPO_PROFILES) {
+            self.connection
+                .create_empty_table(TABLE_REPO_PROFILES, repo_profiles_schema())
                 .execute()
                 .await?;
         }
@@ -159,6 +182,7 @@ impl MemoryStore {
             TABLE_TASKS,
             TABLE_CODE_GRAPH_SNAPSHOTS,
             TABLE_SKILLS,
+            TABLE_REPO_PROFILES,
             TABLE_HARNESS_VERSIONS,
             TABLE_SIM_RUNS,
             TABLE_SIM_PROBLEMS,
@@ -562,7 +586,7 @@ impl MemoryStore {
     ) -> Result<TaskRecord> {
         if new_status == TaskStatus::Verified && proof.is_none() {
             return Err(MemoryError::InvalidTransition(
-                "task cannot transition to 'verified' without passing automated verification (cargo check/test)".to_string(),
+                "task cannot transition to 'verified' without passing automated verification (check/lint/test)".to_string(),
             ));
         }
 
@@ -845,6 +869,70 @@ impl MemoryStore {
             escape_sql_literal(repo_id),
             escape_sql_literal(scope_id),
             escape_sql_literal(file_path)
+        );
+        table.delete(&filter).await?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Repository Profiles (Out-of-Tree Polyglot Toolchain & Ignore Overrides)
+    // -----------------------------------------------------------------------
+
+    /// Insert or update an out-of-tree [`RepoProfile`] for `(repo_id, scope_id)`.
+    pub async fn upsert_repo_profile(&self, profile: &RepoProfile) -> Result<()> {
+        let mut normalized = profile.clone();
+        normalized.id = repo_profile_id(&normalized.repo_id, &normalized.scope_id);
+        normalized.updated_at = Utc::now();
+
+        let table = self.open_table(TABLE_REPO_PROFILES).await?;
+        let batch = repo_profiles_to_batch(std::slice::from_ref(&normalized))?;
+        let schema = batch.schema();
+        let reader = Box::new(RecordBatchIterator::new(vec![Ok(batch)], schema));
+        let mut merge = table.merge_insert(&["id"]);
+        merge
+            .when_matched_update_all(None)
+            .when_not_matched_insert_all();
+        merge.execute(reader).await?;
+        Ok(())
+    }
+
+    /// Retrieve the stored [`RepoProfile`] for `(repo_id, scope_id)`, if configured.
+    pub async fn get_repo_profile(
+        &self,
+        repo_id: &str,
+        scope_id: &str,
+    ) -> Result<Option<RepoProfile>> {
+        let table = self.open_table(TABLE_REPO_PROFILES).await?;
+        let filter = format!(
+            "repo_id = '{}' AND scope_id = '{}'",
+            escape_sql_literal(repo_id),
+            escape_sql_literal(scope_id)
+        );
+        let batches = table
+            .query()
+            .only_if(filter)
+            .limit(1)
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        for batch in &batches {
+            let mut rows = batch_to_repo_profiles(batch)?;
+            if let Some(first) = rows.pop() {
+                return Ok(Some(first));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Delete the stored [`RepoProfile`] for `(repo_id, scope_id)`, restoring auto-detection.
+    pub async fn delete_repo_profile(&self, repo_id: &str, scope_id: &str) -> Result<()> {
+        let table = self.open_table(TABLE_REPO_PROFILES).await?;
+        let filter = format!(
+            "repo_id = '{}' AND scope_id = '{}'",
+            escape_sql_literal(repo_id),
+            escape_sql_literal(scope_id)
         );
         table.delete(&filter).await?;
         Ok(())
@@ -1192,6 +1280,7 @@ impl MemoryStore {
             TABLE_TASKS,
             TABLE_CODE_GRAPH_SNAPSHOTS,
             TABLE_SKILLS,
+            TABLE_REPO_PROFILES,
             TABLE_HARNESS_VERSIONS,
             TABLE_SIM_RUNS,
             TABLE_SIM_PROBLEMS,

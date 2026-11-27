@@ -63,7 +63,8 @@ async fn test_aci_write_gate_and_stale_hash_rejection() {
             replacement_snippet: Some("\"world\"".into()),
             full_content: None,
             create_if_missing: None,
-            cargo_package: None,
+            target_scope: None,
+            toolchain: None,
         })
         .await;
     assert!(matches!(blocked, Err(ToolError::WriteGateLocked(_))));
@@ -79,7 +80,8 @@ async fn test_aci_write_gate_and_stale_hash_rejection() {
             replacement_snippet: Some("\"world\"".into()),
             full_content: None,
             create_if_missing: None,
-            cargo_package: None,
+            target_scope: None,
+            toolchain: None,
         })
         .await;
     assert!(matches!(stale, Err(ToolError::StaleHash { .. })));
@@ -94,7 +96,8 @@ async fn test_aci_write_gate_and_stale_hash_rejection() {
             replacement_snippet: Some("\"world\"".into()),
             full_content: None,
             create_if_missing: None,
-            cargo_package: None,
+            target_scope: None,
+            toolchain: None,
         })
         .await
         .expect("edit succeeded");
@@ -151,7 +154,8 @@ async fn test_edit_by_hash_preserves_windows_crlf_with_lf_snippets() {
             replacement_snippet: Some("pub fn a() -> i32 {\n    2\n}".into()),
             full_content: None,
             create_if_missing: None,
-            cargo_package: None,
+            target_scope: None,
+            toolchain: None,
         })
         .await
         .expect("crlf edit should succeed");

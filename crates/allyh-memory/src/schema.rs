@@ -19,6 +19,7 @@ pub const TABLE_ARCHITECTURAL_DECISIONS: &str = "architectural_decisions";
 pub const TABLE_TASKS: &str = "tasks";
 pub const TABLE_CODE_GRAPH_SNAPSHOTS: &str = "code_graph_snapshots";
 pub const TABLE_SKILLS: &str = "skills";
+pub const TABLE_REPO_PROFILES: &str = "repo_profiles";
 pub const TABLE_HARNESS_VERSIONS: &str = "harness_versions";
 pub const TABLE_SIM_RUNS: &str = "sim_runs";
 pub const TABLE_SIM_PROBLEMS: &str = "sim_problems";
@@ -175,11 +176,99 @@ pub struct CodeGraphSnapshot {
     pub repo_id: String,
     pub scope_id: String,
     pub file_path: String,
+    #[serde(default = "default_unknown_language")]
+    pub language: String,
     pub sha256_hash: String,
     pub last_read_turn: u64,
     pub symbols_json: String,
     pub dependencies: Vec<String>,
     pub vector: Vec<f32>,
+}
+
+fn default_unknown_language() -> String {
+    "unknown".to_string()
+}
+
+/// Out-of-tree per-repository polyglot configuration stored in `repo_profiles`.
+///
+/// Allows overriding detected languages, check/lint/test commands, ignore globs, and auto-verify
+/// behavior without writing dotfiles into the target repository.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RepoProfile {
+    pub id: String,
+    pub repo_id: String,
+    pub scope_id: String,
+    #[serde(default)]
+    pub languages_override: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lint_command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_command: Option<String>,
+    #[serde(default)]
+    pub extra_ignore_globs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_verify_override: Option<bool>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl RepoProfile {
+    pub fn empty(repo_id: impl Into<String>, scope_id: impl Into<String>) -> Self {
+        let repo_id = repo_id.into();
+        let scope_id = scope_id.into();
+        let id = repo_profile_id(&repo_id, &scope_id);
+        Self {
+            id,
+            repo_id,
+            scope_id,
+            languages_override: Vec::new(),
+            check_command: None,
+            lint_command: None,
+            test_command: None,
+            extra_ignore_globs: Vec::new(),
+            auto_verify_override: None,
+            updated_at: Utc::now(),
+        }
+    }
+
+    pub fn is_default_empty(&self) -> bool {
+        self.languages_override.is_empty()
+            && self.check_command.is_none()
+            && self.lint_command.is_none()
+            && self.test_command.is_none()
+            && self.extra_ignore_globs.is_empty()
+            && self.auto_verify_override.is_none()
+    }
+}
+
+/// Stable partition key for a [`RepoProfile`] row.
+pub fn repo_profile_id(repo_id: &str, scope_id: &str) -> String {
+    format!("{repo_id}:{scope_id}")
+}
+
+/// Best-effort language inference from a relative file path (used for legacy schema migration).
+pub fn infer_language_from_path(file_path: &str) -> &'static str {
+    let lower = file_path.to_ascii_lowercase();
+    if lower.ends_with(".rs") {
+        "rust"
+    } else if lower.ends_with(".tsx") {
+        "tsx"
+    } else if lower.ends_with(".ts") || lower.ends_with(".mts") || lower.ends_with(".cts") {
+        "typescript"
+    } else if lower.ends_with(".jsx") {
+        "jsx"
+    } else if lower.ends_with(".js") || lower.ends_with(".mjs") || lower.ends_with(".cjs") {
+        "javascript"
+    } else if lower.ends_with(".py") || lower.ends_with(".pyi") {
+        "python"
+    } else if lower.ends_with(".go") {
+        "go"
+    } else if lower.ends_with(".toml") || lower.ends_with(".json") || lower.ends_with(".mod") {
+        "config"
+    } else {
+        "unknown"
+    }
 }
 
 /// Diagnostics snapshot reported by `/db-status`.
@@ -400,11 +489,27 @@ pub fn code_graph_snapshots_schema() -> SchemaRef {
         Field::new("repo_id", DataType::Utf8, false),
         Field::new("scope_id", DataType::Utf8, false),
         Field::new("file_path", DataType::Utf8, false),
+        Field::new("language", DataType::Utf8, false),
         Field::new("sha256_hash", DataType::Utf8, false),
         Field::new("last_read_turn", DataType::UInt64, false),
         Field::new("symbols", DataType::Utf8, false),
         Field::new("dependencies", string_list_type(), false),
         Field::new("vector", vector_type(), false),
+    ]))
+}
+
+pub fn repo_profiles_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("repo_id", DataType::Utf8, false),
+        Field::new("scope_id", DataType::Utf8, false),
+        Field::new("languages_override", string_list_type(), false),
+        Field::new("check_command", DataType::Utf8, true),
+        Field::new("lint_command", DataType::Utf8, true),
+        Field::new("test_command", DataType::Utf8, true),
+        Field::new("extra_ignore_globs", string_list_type(), false),
+        Field::new("auto_verify_override", DataType::Boolean, true),
+        Field::new("updated_at", timestamp_utc(), false),
     ]))
 }
 
@@ -858,6 +963,13 @@ pub fn snapshots_to_batch(records: &[CodeGraphSnapshot]) -> Result<RecordBatch> 
     let repo_ids = StringArray::from_iter_values(records.iter().map(|r| r.repo_id.as_str()));
     let scope_ids = StringArray::from_iter_values(records.iter().map(|r| r.scope_id.as_str()));
     let file_paths = StringArray::from_iter_values(records.iter().map(|r| r.file_path.as_str()));
+    let languages = StringArray::from_iter_values(records.iter().map(|r| {
+        if r.language.is_empty() {
+            infer_language_from_path(&r.file_path)
+        } else {
+            r.language.as_str()
+        }
+    }));
     let hashes = StringArray::from_iter_values(records.iter().map(|r| r.sha256_hash.as_str()));
     let turns = UInt64Array::from_iter_values(records.iter().map(|r| r.last_read_turn));
     let symbols = StringArray::from_iter_values(records.iter().map(|r| r.symbols_json.as_str()));
@@ -872,6 +984,7 @@ pub fn snapshots_to_batch(records: &[CodeGraphSnapshot]) -> Result<RecordBatch> 
             Arc::new(repo_ids),
             Arc::new(scope_ids),
             Arc::new(file_paths),
+            Arc::new(languages),
             Arc::new(hashes),
             Arc::new(turns),
             Arc::new(symbols),
@@ -885,6 +998,9 @@ pub fn batch_to_snapshots(batch: &RecordBatch) -> Result<Vec<CodeGraphSnapshot>>
     let repo_ids = col_str(batch, "repo_id")?;
     let scope_ids = col_str(batch, "scope_id")?;
     let file_paths = col_str(batch, "file_path")?;
+    let languages = batch
+        .column_by_name("language")
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>());
     let hashes = col_str(batch, "sha256_hash")?;
     let turns = col_u64(batch, "last_read_turn")?;
     let symbols = col_str(batch, "symbols")?;
@@ -893,15 +1009,95 @@ pub fn batch_to_snapshots(batch: &RecordBatch) -> Result<Vec<CodeGraphSnapshot>>
 
     let mut out = Vec::with_capacity(batch.num_rows());
     for i in 0..batch.num_rows() {
+        let file_path = file_paths.value(i).to_string();
+        let language = match languages {
+            Some(arr) if !arr.is_null(i) && !arr.value(i).is_empty() && arr.value(i) != "unknown" => {
+                arr.value(i).to_string()
+            }
+            _ => infer_language_from_path(&file_path).to_string(),
+        };
         out.push(CodeGraphSnapshot {
             repo_id: repo_ids.value(i).to_string(),
             scope_id: scope_ids.value(i).to_string(),
-            file_path: file_paths.value(i).to_string(),
+            file_path,
+            language,
             sha256_hash: hashes.value(i).to_string(),
             last_read_turn: turns.value(i),
             symbols_json: symbols.value(i).to_string(),
             dependencies: read_string_list(dependencies, i),
             vector: read_vector(vectors, i),
+        });
+    }
+    Ok(out)
+}
+
+pub fn repo_profiles_to_batch(records: &[RepoProfile]) -> Result<RecordBatch> {
+    let schema = repo_profiles_schema();
+    let ids = StringArray::from_iter_values(records.iter().map(|r| r.id.as_str()));
+    let repo_ids = StringArray::from_iter_values(records.iter().map(|r| r.repo_id.as_str()));
+    let scope_ids = StringArray::from_iter_values(records.iter().map(|r| r.scope_id.as_str()));
+    let langs_vec: Vec<Vec<String>> = records
+        .iter()
+        .map(|r| r.languages_override.clone())
+        .collect();
+    let languages_override = build_string_list_array(&langs_vec);
+    let check_cmds =
+        StringArray::from_iter(records.iter().map(|r| r.check_command.as_deref()));
+    let lint_cmds = StringArray::from_iter(records.iter().map(|r| r.lint_command.as_deref()));
+    let test_cmds = StringArray::from_iter(records.iter().map(|r| r.test_command.as_deref()));
+    let ignores_vec: Vec<Vec<String>> = records
+        .iter()
+        .map(|r| r.extra_ignore_globs.clone())
+        .collect();
+    let extra_ignore_globs = build_string_list_array(&ignores_vec);
+    let auto_verify = BooleanArray::from_iter(records.iter().map(|r| r.auto_verify_override));
+    let updated_at = TimestampMicrosecondArray::from_iter_values(
+        records.iter().map(|r| r.updated_at.timestamp_micros()),
+    )
+    .with_timezone("UTC");
+
+    Ok(RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(ids),
+            Arc::new(repo_ids),
+            Arc::new(scope_ids),
+            Arc::new(languages_override),
+            Arc::new(check_cmds),
+            Arc::new(lint_cmds),
+            Arc::new(test_cmds),
+            Arc::new(extra_ignore_globs),
+            Arc::new(auto_verify),
+            Arc::new(updated_at),
+        ],
+    )?)
+}
+
+pub fn batch_to_repo_profiles(batch: &RecordBatch) -> Result<Vec<RepoProfile>> {
+    let ids = col_str(batch, "id")?;
+    let repo_ids = col_str(batch, "repo_id")?;
+    let scope_ids = col_str(batch, "scope_id")?;
+    let languages_override = col_list(batch, "languages_override")?;
+    let check_cmds = col_str(batch, "check_command")?;
+    let lint_cmds = col_str(batch, "lint_command")?;
+    let test_cmds = col_str(batch, "test_command")?;
+    let extra_ignore_globs = col_list(batch, "extra_ignore_globs")?;
+    let auto_verify = col_bool(batch, "auto_verify_override")?;
+    let updated_at = col_ts(batch, "updated_at")?;
+
+    let mut out = Vec::with_capacity(batch.num_rows());
+    for i in 0..batch.num_rows() {
+        out.push(RepoProfile {
+            id: ids.value(i).to_string(),
+            repo_id: repo_ids.value(i).to_string(),
+            scope_id: scope_ids.value(i).to_string(),
+            languages_override: read_string_list(languages_override, i),
+            check_command: (!check_cmds.is_null(i)).then(|| check_cmds.value(i).to_string()),
+            lint_command: (!lint_cmds.is_null(i)).then(|| lint_cmds.value(i).to_string()),
+            test_command: (!test_cmds.is_null(i)).then(|| test_cmds.value(i).to_string()),
+            extra_ignore_globs: read_string_list(extra_ignore_globs, i),
+            auto_verify_override: (!auto_verify.is_null(i)).then(|| auto_verify.value(i)),
+            updated_at: micros_to_utc(updated_at.value(i)),
         });
     }
     Ok(out)

@@ -1,5 +1,6 @@
 mod app;
 mod cli;
+mod config_cli;
 mod highlight;
 mod sim_cli;
 mod skills_cli;
@@ -107,12 +108,21 @@ async fn main() -> Result<()> {
                 )
                 .await
             }
+            CliCommand::Config(config_args) => {
+                config_cli::run_cli(
+                    config_args,
+                    &args.repo,
+                    args.db_uri.as_deref(),
+                    &args.scope,
+                )
+                .await
+            }
         };
     }
 
     let mut cfg = OrchestratorConfig::new(&args.repo);
     cfg.scope_id = args.scope.clone();
-    cfg.auto_cargo_check = !args.no_auto_check;
+    cfg.auto_verify = !args.no_auto_check;
     if let Some(uri) = &args.db_uri {
         cfg.storage = StorageConfig::from_uri(uri.clone());
     }
@@ -344,6 +354,8 @@ mod tests {
             git_branch: "master".into(),
             dirty_files: vec!["src/lib.rs".into()],
             out_of_band_edits: Vec::new(),
+            detected_languages: vec!["Rust".into()],
+            detected_toolchains: vec!["Rust (cargo)".into()],
             build_status: "cargo check: PASS (0 warnings)".into(),
             gate_state,
             active_tasks: Vec::new(),
@@ -771,5 +783,33 @@ mod tests {
         assert!(rendered.contains("premature stop"));
         assert!(rendered.contains("tb4-r2 (r2)"));
         assert!(rendered.contains("2 problem(s)"));
+    }
+
+    #[test]
+    fn test_config_slash_commands_and_polyglot_inspector_display() {
+        let mut snap = sample_snapshot(ControlGateState::Discovery);
+        snap.detected_languages = vec!["Rust".into(), "TypeScript".into()];
+        snap.detected_toolchains = vec!["Rust (cargo)".into(), "TypeScript/JS (web)".into()];
+        let mut app = AppState::new(snap, "monorepo".into());
+
+        assert!(matches!(
+            app.parse_submission("/config"),
+            Some(UserCommand::RequestRepoProfile)
+        ));
+        assert!(matches!(
+            app.parse_submission("/config set-check npx tsc --noEmit"),
+            Some(UserCommand::SaveRepoProfile(ref p))
+                if p.check_command.as_deref() == Some("npx tsc --noEmit")
+        ));
+        assert!(matches!(
+            app.parse_submission("/config reset"),
+            Some(UserCommand::ResetRepoProfile)
+        ));
+
+        let highlighter = MarkdownHighlighter::new();
+        let rendered = screen(&mut app, &highlighter, 120, 36);
+        assert!(rendered.contains("Stack"));
+        assert!(rendered.contains("Rust, TypeScript"));
+        assert!(rendered.contains("Tools"));
     }
 }

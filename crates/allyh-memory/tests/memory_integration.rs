@@ -178,6 +178,7 @@ async fn test_lancedb_bitemporal_isolation_and_task_gate() {
         repo_id: repo_a.clone(),
         scope_id: DEFAULT_SCOPE_ID.into(),
         file_path: "src/lib.rs".into(),
+        language: "rust".into(),
         sha256_hash: "deadbeef".into(),
         last_read_turn: 1,
         symbols_json: "[]".into(),
@@ -621,4 +622,80 @@ async fn test_sim_ledger_storage_lineage_aliases_and_json_roundtrip() {
     assert_eq!(status.sim_runs_count, 1);
     assert_eq!(status.sim_problems_count, 1);
     assert_eq!(status.sim_attempts_count, 3);
+}
+
+#[tokio::test]
+async fn test_repo_profile_crud_and_partition_isolation() {
+    use allyh_memory::RepoProfile;
+
+    let dir = TempDir::new().expect("tempdir");
+    let store = MemoryStore::connect(
+        StorageConfig::from_local_path(dir.path().join("db")),
+        Arc::new(DeterministicHashEmbedder),
+    )
+    .await
+    .expect("connect");
+
+    let repo_a = compute_repo_id("/repos/poly-alpha");
+    let repo_b = compute_repo_id("/repos/poly-beta");
+
+    assert!(
+        store
+            .get_repo_profile(&repo_a, DEFAULT_SCOPE_ID)
+            .await
+            .expect("empty get")
+            .is_none()
+    );
+
+    let mut profile = RepoProfile::empty(&repo_a, DEFAULT_SCOPE_ID);
+    profile.languages_override = vec!["TypeScript".into(), "Python".into()];
+    profile.check_command = Some("npx tsc --noEmit".into());
+    profile.lint_command = Some("ruff check .".into());
+    profile.test_command = Some("pytest -q".into());
+    profile.extra_ignore_globs = vec!["generated/**".into()];
+    profile.auto_verify_override = Some(true);
+
+    store
+        .upsert_repo_profile(&profile)
+        .await
+        .expect("upsert profile");
+
+    let loaded = store
+        .get_repo_profile(&repo_a, DEFAULT_SCOPE_ID)
+        .await
+        .expect("get profile")
+        .expect("profile exists");
+    assert_eq!(loaded.check_command.as_deref(), Some("npx tsc --noEmit"));
+    assert_eq!(loaded.lint_command.as_deref(), Some("ruff check ."));
+    assert_eq!(loaded.test_command.as_deref(), Some("pytest -q"));
+    assert_eq!(loaded.extra_ignore_globs, vec!["generated/**"]);
+    assert_eq!(loaded.auto_verify_override, Some(true));
+
+    // Partition isolation across repos and scopes
+    assert!(
+        store
+            .get_repo_profile(&repo_b, DEFAULT_SCOPE_ID)
+            .await
+            .expect("repo b")
+            .is_none()
+    );
+    assert!(
+        store
+            .get_repo_profile(&repo_a, "other-scope")
+            .await
+            .expect("other scope")
+            .is_none()
+    );
+
+    store
+        .delete_repo_profile(&repo_a, DEFAULT_SCOPE_ID)
+        .await
+        .expect("delete profile");
+    assert!(
+        store
+            .get_repo_profile(&repo_a, DEFAULT_SCOPE_ID)
+            .await
+            .expect("after delete")
+            .is_none()
+    );
 }

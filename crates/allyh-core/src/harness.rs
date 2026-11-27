@@ -44,7 +44,8 @@ pub struct ToolPolicy {
     pub output_head_chars: usize,
     /// Maximum characters retained from the tail of oversized tool outputs (0 disables truncation).
     pub output_tail_chars: usize,
-    pub auto_cargo_check: bool,
+    #[serde(alias = "auto_cargo_check")]
+    pub auto_verify: bool,
     #[serde(default)]
     pub stale_hash_hint: String,
 }
@@ -142,7 +143,7 @@ impl HarnessSpec {
                 max_tool_rounds: 6,
                 output_head_chars: 0,
                 output_tail_chars: 0,
-                auto_cargo_check: true,
+                auto_verify: true,
                 stale_hash_hint: String::new(),
             },
             completion_interlock: CompletionInterlockPolicy {

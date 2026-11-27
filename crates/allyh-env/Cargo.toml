@@ -3,7 +3,17 @@ name = "allyh-env"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["lang-all"]
+lang-all = ["lang-rust", "lang-typescript", "lang-javascript", "lang-python", "lang-go"]
+lang-rust = ["dep:tree-sitter-rust"]
+lang-typescript = ["dep:tree-sitter-typescript"]
+lang-javascript = ["dep:tree-sitter-javascript"]
+lang-python = ["dep:tree-sitter-python"]
+lang-go = ["dep:tree-sitter-go"]
+
 [dependencies]
+async-trait.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -15,7 +25,12 @@ thiserror.workspace = true
 notify.workspace = true
 git2.workspace = true
 tree-sitter.workspace = true
-tree-sitter-rust.workspace = true
+tree-sitter-rust = { workspace = true, optional = true }
+tree-sitter-typescript = { workspace = true, optional = true }
+tree-sitter-javascript = { workspace = true, optional = true }
+tree-sitter-python = { workspace = true, optional = true }
+tree-sitter-go = { workspace = true, optional = true }
+ignore.workspace = true
 walkdir.workspace = true
 similar.workspace = true
 
