@@ -10,6 +10,7 @@ pub mod consolidator;
 pub mod embeddings;
 pub mod error;
 pub mod schema;
+pub mod sim_ledger;
 pub mod skill_doc;
 pub mod store;
 
@@ -28,10 +29,16 @@ pub use embeddings::{
 };
 pub use error::{MemoryError, Result};
 pub use schema::{
-    ArchitecturalDecision, CodeGraphSnapshot, DbStatusReport, EMBEDDING_DIM, ScoredDecision,
-    SessionRecord, SkillRecord, TABLE_ARCHITECTURAL_DECISIONS, TABLE_CODE_GRAPH_SNAPSHOTS,
-    TABLE_SESSIONS, TABLE_SKILLS, TABLE_TASKS, TaskRecord, TaskStatus, VerificationProof,
-    normalize_skill_slug, skill_id,
+    ArchitecturalDecision, CodeGraphSnapshot, DbStatusReport, EMBEDDING_DIM, HarnessVersionRecord,
+    ScoredDecision, SessionRecord, SimAttemptRecord, SimMemoryMode, SimProblemRecord, SimRunRecord,
+    SkillRecord, TABLE_ARCHITECTURAL_DECISIONS, TABLE_CODE_GRAPH_SNAPSHOTS,
+    TABLE_HARNESS_VERSIONS, TABLE_SESSIONS, TABLE_SIM_ATTEMPTS, TABLE_SIM_PROBLEMS, TABLE_SIM_RUNS,
+    TABLE_SKILLS, TABLE_TASKS, TaskRecord, TaskStatus, VerificationProof, normalize_skill_slug,
+    skill_id,
+};
+pub use sim_ledger::{
+    SIM_PROMPT_RULES, SimAttemptEntry, SimAttemptInput, SimCarriedFrom, SimExportDocument,
+    SimLedger, SimProblemEntry, SimProblemRef, SimUpdateResult, normalize_root_cause,
 };
 pub use skill_doc::{
     SkillDocument, load_skill_markdown_file, parse_skill_markdown, render_skill_markdown,

@@ -20,6 +20,7 @@ pub const COMMANDS: &[SlashCommand] = &[
     SlashCommand::new("/model", "[spec]", "Show or switch the reasoning model"),
     SlashCommand::new("/memories", "", "List active project decisions"),
     SlashCommand::new("/skills", "[cmd]", "List, show, pin, import, or remove skills"),
+    SlashCommand::new("/sim", "[cmd]", "Inspect SIM ledger, problems, or active harness"),
     SlashCommand::new("/pin", "[id]", "Pin or unpin a decision"),
     SlashCommand::new("/invalidate", "[id]", "Retire a decision"),
     SlashCommand::new("/db-status", "", "Inspect storage and table counts"),
@@ -256,6 +257,7 @@ impl AppState {
                 }
                 "memories" => Some(UserCommand::RequestMemories),
                 "skills" | "skill" => self.parse_skills_command(cmd.as_str(), arg),
+                "sim" => self.parse_sim_command(arg),
                 "invalidate" => {
                     if arg.is_empty() {
                         if let Some(id) = self.selected_memory_id() {
@@ -503,13 +505,133 @@ impl AppState {
                     skill.instructions
                 )));
             }
+            UiEvent::SimSummary {
+                ledger,
+                active_harness_label,
+                active_harness_hash,
+            } => {
+                let mut msg = format!(
+                    "### Self-Improvement Memory (SIM)\n\
+                     - **Active Harness:** `{active_harness_label}` (sha256: `{}`)\n",
+                    &active_harness_hash[..active_harness_hash.len().min(12)]
+                );
+                match ledger {
+                    Some(l) => {
+                        msg.push_str(&format!(
+                            "- **Latest Run:** `{}` (`{}`) | mode: `{}` | rounds: {}\n\
+                             - **Context:** domain=`{}` | benchmark=`{}` | policy=`{}`\n\
+                             - **Entries:** {} problem(s) | {} attempt(s) | {} alias(es)",
+                            &l.run.run_id[..l.run.run_id.len().min(8)],
+                            l.run.arm_name,
+                            l.run.memory_mode,
+                            l.run.rounds_completed,
+                            l.run.domain,
+                            l.run.benchmark,
+                            l.run.policy_model,
+                            l.problems.len(),
+                            l.total_attempts(),
+                            l.aliases.len()
+                        ));
+                        if let Some(ref carried) = l.run.carried_from_run_id {
+                            msg.push_str(&format!(
+                                "\n- **Carried From:** `{carried}` (domain: `{}`)",
+                                l.run.carried_from_domain.as_deref().unwrap_or("—")
+                            ));
+                        }
+                        msg.push_str(
+                            "\n\n_Use `/sim list`, `/sim show <P-id>`, `/sim harness`, or `allyh sim evolve --suite <path>`._",
+                        );
+                    }
+                    None => {
+                        msg.push_str(
+                            "- **Latest Run:** none yet\n\n_Run `allyh sim evolve --suite <path>` to start source RSI or `allyh sim import <sim.json>` to load a ledger._",
+                        );
+                    }
+                }
+                self.entries.push(ChatEntry::System(msg));
+            }
+            UiEvent::SimProblems(ledger) => match ledger {
+                Some(l) if !l.problems.is_empty() => {
+                    let rendered = l
+                        .problems
+                        .iter()
+                        .map(|p| {
+                            let pred: usize = p.attempts.iter().map(|a| a.predicted.len()).sum();
+                            let fixed: usize = p.attempts.iter().map(|a| a.fixed.len()).sum();
+                            format!(
+                                "- `{}` (r{}, `{}`): {} — {} attempt(s), {fixed}/{pred} predicted fixed",
+                                p.id,
+                                p.opened_round,
+                                p.origin_domain,
+                                p.name,
+                                p.attempts.len()
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    self.entries.push(ChatEntry::System(format!(
+                        "### SIM Problem Ledger ({})\n{rendered}\n\n_Use `/sim show <P-id>` for full attempt rationales and outcomes._",
+                        l.problems.len()
+                    )));
+                }
+                _ => {
+                    self.entries.push(ChatEntry::System(
+                        "No SIM problems recorded for this repository partition yet.".to_string(),
+                    ));
+                }
+            },
+            UiEvent::SimProblemDetail {
+                problem,
+                resolved_from,
+            } => {
+                let alias_note = resolved_from
+                    .map(|src| format!(" _(resolved alias `{src}` → `{}`)_", problem.id))
+                    .unwrap_or_default();
+                let mut lines = vec![format!(
+                    "### SIM Problem `{}`{alias_note}\n- **Root Cause:** {}\n- **Opened:** round {} (origin: `{}`)",
+                    problem.id, problem.name, problem.opened_round, problem.origin_domain
+                )];
+                for a in &problem.attempts {
+                    lines.push(format!(
+                        "\n#### Round {} [{}] — score {:.2} ({}/{}) | `{}` / `{}`",
+                        a.round, a.sample, a.score, a.passed, a.total, a.domain, a.policy_model
+                    ));
+                    lines.push(format!("- **What:** {}", a.what));
+                    if !a.files.is_empty() {
+                        lines.push(format!("- **Files:** {}", a.files.join(", ")));
+                    }
+                    lines.push(format!(
+                        "- **Predicted:** [{}] | **Fixed:** [{}] | **Missed:** [{}]",
+                        a.predicted.join(", "),
+                        a.fixed.join(", "),
+                        a.missed.join(", ")
+                    ));
+                }
+                self.entries.push(ChatEntry::System(lines.join("\n")));
+            }
+            UiEvent::ActiveHarnessDetail {
+                label,
+                version_id,
+                spec,
+            } => {
+                let id_str = version_id.as_deref().unwrap_or("default-seed");
+                let json = spec.canonical_json().unwrap_or_default();
+                self.entries.push(ChatEntry::System(format!(
+                    "### Active Harness: `{label}`\n- **Version ID:** `{id_str}`\n- **Interlock Enabled:** {} (max rejections: {})\n- **Max Tool Rounds:** {} | **Decision Top-K:** {}\n\n```json\n{json}\n```",
+                    spec.completion_interlock.enabled,
+                    spec.completion_interlock.max_consecutive_rejections,
+                    spec.tools.max_tool_rounds,
+                    spec.retrieval.decision_top_k
+                )));
+            }
             UiEvent::DbStatus(report) => {
                 self.entries.push(ChatEntry::System(format!(
                     "### LanceDB Status ({})\n\
                      - URI: `{}`\n\
                      - Repo Partition: `{}` | Scope: `{}`\n\
                      - Sessions: {} | Active Rules: {} | Superseded/Invalidated: {}\n\
-                     - Tasks: {} | Skills: {} | Code Graph Snapshots: {}",
+                     - Tasks: {} | Skills: {} | Code Graph Snapshots: {}\n\
+                     - Harness Versions: {} | SIM Runs: {} | SIM Problems: {} | SIM Attempts: {}",
                     report.backend_label,
                     report.uri,
                     &report.repo_id[..report.repo_id.len().min(12)],
@@ -520,6 +642,10 @@ impl AppState {
                     report.tasks_count,
                     report.skills_count,
                     report.code_snapshots_count,
+                    report.harness_versions_count,
+                    report.sim_runs_count,
+                    report.sim_problems_count,
+                    report.sim_attempts_count,
                 )));
             }
             UiEvent::SystemNotice(msg) => {
@@ -638,6 +764,82 @@ impl AppState {
              - `/skills pin <name>`  Pin or unpin a skill in the dynamic preamble\n\
              - `/skills import <path>`  Import a `SKILL.md` file into LanceDB\n\
              - `/skills remove <name>`  Delete a skill from LanceDB"
+                .to_string(),
+        ));
+    }
+
+    fn parse_sim_command(&mut self, arg: &str) -> Option<UserCommand> {
+        let trimmed = arg.trim();
+        if trimmed.is_empty() {
+            return Some(UserCommand::RequestSimSummary);
+        }
+
+        let mut parts = trimmed.splitn(2, char::is_whitespace);
+        let sub = parts.next().unwrap_or("").to_ascii_lowercase();
+        let rest = parts.next().unwrap_or("").trim();
+
+        match sub.as_str() {
+            "status" | "summary" => Some(UserCommand::RequestSimSummary),
+            "list" | "ls" | "problems" => Some(UserCommand::RequestSimProblems),
+            "show" | "view" | "problem" => {
+                if rest.is_empty() {
+                    self.entries.push(ChatEntry::System(
+                        "Usage: /sim show <problem-id> (e.g. `/sim show P1`)".to_string(),
+                    ));
+                    None
+                } else {
+                    Some(UserCommand::ShowSimProblem(rest.to_string()))
+                }
+            }
+            "export" => {
+                let raw_path = rest.trim_matches(|c| c == '"' || c == '\'').trim();
+                let target = if raw_path.is_empty() {
+                    self.repo_root.join("sim-ledger.json")
+                } else {
+                    let candidate = PathBuf::from(raw_path);
+                    if candidate.is_absolute() {
+                        candidate
+                    } else {
+                        self.repo_root.join(candidate)
+                    }
+                };
+                Some(UserCommand::ExportSim(target))
+            }
+            "harness" | "spec" => Some(UserCommand::ShowActiveHarness),
+            "use" => {
+                if rest.is_empty() {
+                    self.entries.push(ChatEntry::System(
+                        "Usage: /sim use <harness-version-id-or-label>".to_string(),
+                    ));
+                    None
+                } else {
+                    Some(UserCommand::UseHarness(rest.to_string()))
+                }
+            }
+            "help" => {
+                self.push_sim_usage();
+                None
+            }
+            other if other.starts_with('p') && other[1..].chars().all(|c| c.is_ascii_digit()) => {
+                Some(UserCommand::ShowSimProblem(trimmed.to_string()))
+            }
+            _ => {
+                self.push_sim_usage();
+                None
+            }
+        }
+    }
+
+    fn push_sim_usage(&mut self) {
+        self.entries.push(ChatEntry::System(
+            "### SIM Commands\n\
+             - `/sim`  Show active harness version and latest SIM run summary\n\
+             - `/sim list`  List recurring harness problems (`P1..Pn`)\n\
+             - `/sim show <P-id>`  View full attempt history, rationales, and outcomes\n\
+             - `/sim harness`  Inspect active `HarnessSpec` configuration\n\
+             - `/sim use <id>`  Activate a stored evolved harness version\n\
+             - `/sim export [path]`  Export canonical Appendix D.3 SIM JSON\n\n\
+             _Run multi-round optimization via CLI: `allyh sim evolve --suite <path>` or `allyh sim continue --from-run <id> --suite <path>`._"
                 .to_string(),
         ));
     }

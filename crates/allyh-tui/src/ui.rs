@@ -242,6 +242,15 @@ fn render_inspector(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         field("Storage", snapshot.storage_backend_label.as_str()),
         field("Scope", snapshot.scope_id.as_str()),
         field("Skills", snapshot.skills_count.to_string()),
+        field("Harness", snapshot.active_harness_label.as_str()),
+        field(
+            "SIM",
+            if snapshot.sim_problems_count == 0 {
+                "0 problems".to_string()
+            } else {
+                format!("{} problem(s)", snapshot.sim_problems_count)
+            },
+        ),
         field(
             "Partition",
             snapshot.repo_id.chars().take(12).collect::<String>(),

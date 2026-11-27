@@ -7,7 +7,8 @@ use std::time::Duration;
 use allyh_env::{EnvDelta, EnvironmentMonitor, LiveFsWatcher};
 use allyh_memory::{
     CandidateDecision, ConsolidationOutcome, DbStatusReport, DeterministicHashEmbedder,
-    EmbeddingProvider, MemoryConsolidator, MemoryStore, ScoredDecision, SessionRecord, SkillRecord,
+    EmbeddingProvider, HarnessVersionRecord, MemoryConsolidator, MemoryStore, ScoredDecision,
+    SessionRecord, SimExportDocument, SimLedger, SimProblemEntry, SimRunRecord, SkillRecord,
     SleepJob, SleepTimeWorkerHandle, StorageConfig, TaskRecord, WorkerStatus, compute_repo_id,
 };
 use allyh_tools::{AciToolset, ToolExecutionRecord};
@@ -21,6 +22,8 @@ use crate::compaction::CompactingHistory;
 use crate::consolidation::{LocalLlmConflictJudge, extract_candidate_decisions};
 use crate::error::Result;
 use crate::gate::{ControlGate, ControlGateState, ProposedPlan, ProposedTaskSpec};
+use crate::harness::HarnessSpec;
+use crate::interlock::{CompletionInterlock, InterlockDecision};
 use crate::preamble::{AssembledPreamble, DynamicPreambleAssembler, PreambleInputs};
 use crate::router::{HybridRouter, ModelProfile};
 
@@ -39,6 +42,9 @@ pub struct InspectorSnapshot {
     pub active_tasks: Vec<TaskRecord>,
     pub activated_memories: Vec<ScoredDecision>,
     pub skills_count: usize,
+    pub active_harness_label: String,
+    pub sim_problems_count: usize,
+    pub sim_run_id: Option<String>,
     pub active_model_label: String,
     pub worker_model_label: String,
     pub worker_status: WorkerStatus,
@@ -71,6 +77,12 @@ pub enum UserCommand {
         instructions: String,
         triggers: Vec<String>,
     },
+    RequestSimSummary,
+    RequestSimProblems,
+    ShowSimProblem(String),
+    ExportSim(PathBuf),
+    ShowActiveHarness,
+    UseHarness(String),
     RequestDbStatus,
     RefreshEnv { run_build_check: bool },
     CompactNow,
@@ -97,6 +109,21 @@ pub enum UiEvent {
     SkillDetail {
         skill: SkillRecord,
         pinned: bool,
+    },
+    SimSummary {
+        ledger: Option<SimLedger>,
+        active_harness_label: String,
+        active_harness_hash: String,
+    },
+    SimProblems(Option<SimLedger>),
+    SimProblemDetail {
+        problem: SimProblemEntry,
+        resolved_from: Option<String>,
+    },
+    ActiveHarnessDetail {
+        label: String,
+        version_id: Option<String>,
+        spec: HarnessSpec,
     },
     DbStatus(DbStatusReport),
     SystemNotice(String),
@@ -152,6 +179,8 @@ pub struct AllyHOrchestrator {
     gate: ControlGate,
     router: HybridRouter,
     history: CompactingHistory,
+    active_harness: HarnessSpec,
+    active_harness_record: Option<HarnessVersionRecord>,
     pinned_decision_ids: HashSet<String>,
     pinned_skill_ids: HashSet<String>,
     last_env_delta: EnvDelta,
@@ -237,6 +266,24 @@ impl AllyHOrchestrator {
             })
             .collect();
 
+        let active_harness_record = store
+            .get_active_harness_version(&repo_id, &scope_id)
+            .await?;
+        let active_harness = match &active_harness_record {
+            Some(rec) => HarnessSpec::from_version_record(rec).unwrap_or_else(|err| {
+                tracing::warn!(error = %err, version_id = %rec.id, "falling back to default seed harness");
+                HarnessSpec::default_seed()
+            }),
+            None => HarnessSpec::default_seed(),
+        };
+
+        let mut history = CompactingHistory::new(prior_summary);
+        history.apply_policy(
+            active_harness.compaction.keep_recent_units,
+            active_harness.compaction.compaction_ratio,
+            active_harness.compaction.max_rollup_chars,
+        );
+
         Ok(Self {
             session_id,
             repo_id,
@@ -249,7 +296,9 @@ impl AllyHOrchestrator {
             toolset,
             gate,
             router,
-            history: CompactingHistory::new(prior_summary),
+            history,
+            active_harness,
+            active_harness_record,
             pinned_decision_ids: HashSet::new(),
             pinned_skill_ids: HashSet::new(),
             last_env_delta: initial_delta,
@@ -285,6 +334,114 @@ impl AllyHOrchestrator {
 
     pub fn router(&self) -> &HybridRouter {
         &self.router
+    }
+
+    pub fn active_harness(&self) -> &HarnessSpec {
+        &self.active_harness
+    }
+
+    pub fn active_harness_record(&self) -> Option<&HarnessVersionRecord> {
+        self.active_harness_record.as_ref()
+    }
+
+    pub fn active_harness_label(&self) -> String {
+        match &self.active_harness_record {
+            Some(rec) => format!("{} (r{})", rec.label, rec.round),
+            None => "seed (default)".to_string(),
+        }
+    }
+
+    /// Apply an in-memory [`HarnessSpec`] immediately (used by CRSI evaluators and tests).
+    pub fn set_active_harness_spec(
+        &mut self,
+        spec: HarnessSpec,
+        record: Option<HarnessVersionRecord>,
+    ) -> Result<()> {
+        spec.validate()?;
+        self.history.apply_policy(
+            spec.compaction.keep_recent_units,
+            spec.compaction.compaction_ratio,
+            spec.compaction.max_rollup_chars,
+        );
+        self.active_harness = spec;
+        self.active_harness_record = record;
+        Ok(())
+    }
+
+    /// Activate a persisted [`HarnessVersionRecord`] from LanceDB by ID, prefix, or label.
+    pub async fn activate_harness_version(
+        &mut self,
+        version_id_or_prefix: &str,
+    ) -> Result<HarnessVersionRecord> {
+        let rec = self
+            .store
+            .set_active_harness_version(&self.repo_id, &self.scope_id, version_id_or_prefix)
+            .await?;
+        let spec = HarnessSpec::from_version_record(&rec)?;
+        self.set_active_harness_spec(spec, Some(rec.clone()))?;
+        Ok(rec)
+    }
+
+    /// Detect whether the active reasoning model differs from the policy model recorded on
+    /// the active evolved harness or latest SIM run (cross-model CRSI shift signal).
+    pub async fn model_shift_notice(&self) -> Option<String> {
+        let current_model = &self.router.primary().model_id;
+        let source_policy = self
+            .active_harness_record
+            .as_ref()
+            .map(|r| r.policy_model.as_str())
+            .filter(|p| !p.trim().is_empty());
+
+        let latest_run = self
+            .store
+            .latest_sim_run(&self.repo_id, &self.scope_id)
+            .await
+            .ok()
+            .flatten();
+
+        let prev_policy = source_policy.or_else(|| {
+            latest_run
+                .as_ref()
+                .map(|r| r.policy_model.as_str())
+                .filter(|p| !p.trim().is_empty())
+        })?;
+
+        if !prev_policy.eq_ignore_ascii_case(current_model)
+            && !prev_policy.ends_with(current_model)
+        {
+            let run_hint = latest_run
+                .as_ref()
+                .map(|r| format!(" (`allyh sim continue --from-run {}`)", &r.run_id[..r.run_id.len().min(8)]))
+                .unwrap_or_default();
+            return Some(format!(
+                "Cross-model shift detected: active harness/SIM was tuned for `{prev_policy}`, now running `{current_model}`. Inspect with `/sim` or continue CRSI{run_hint}."
+            ));
+        }
+        None
+    }
+
+    pub async fn load_sim_ledger(&self, run_id_or_arm: &str) -> Result<Option<SimLedger>> {
+        Ok(self
+            .store
+            .load_sim_ledger(&self.repo_id, &self.scope_id, run_id_or_arm)
+            .await?)
+    }
+
+    pub async fn list_sim_runs(&self) -> Result<Vec<SimRunRecord>> {
+        Ok(self
+            .store
+            .list_sim_runs(&self.repo_id, &self.scope_id)
+            .await?)
+    }
+
+    pub async fn export_sim_document(
+        &self,
+        run_id_or_arm: Option<&str>,
+    ) -> Result<Option<SimExportDocument>> {
+        Ok(self
+            .store
+            .export_sim_document(&self.repo_id, &self.scope_id, run_id_or_arm)
+            .await?)
     }
 
     pub fn switch_model(&mut self, spec: &str) -> Result<ModelProfile> {
@@ -430,6 +587,12 @@ impl AllyHOrchestrator {
             .list_skills(&self.repo_id, &self.scope_id)
             .await?
             .len();
+        let latest_sim = self
+            .store
+            .load_sim_ledger(&self.repo_id, &self.scope_id, "")
+            .await?;
+        let sim_problems_count = latest_sim.as_ref().map(|l| l.problems.len()).unwrap_or(0);
+        let sim_run_id = latest_sim.map(|l| l.run.run_id);
         let mut memories = self.last_activated_memories.clone();
         for m in &mut memories {
             m.pinned = self.pinned_decision_ids.contains(&m.decision.id);
@@ -464,6 +627,9 @@ impl AllyHOrchestrator {
             active_tasks: tasks,
             activated_memories: memories,
             skills_count,
+            active_harness_label: self.active_harness_label(),
+            sim_problems_count,
+            sim_run_id,
             active_model_label: self.router.primary().label.clone(),
             worker_model_label: self.router.local_worker().label.clone(),
             worker_status: self.sleep_worker.status(),
@@ -507,7 +673,12 @@ impl AllyHOrchestrator {
             .collect();
         let matched_skills = self
             .store
-            .match_skills(&self.repo_id, &self.scope_id, prompt, 3)
+            .match_skills(
+                &self.repo_id,
+                &self.scope_id,
+                prompt,
+                self.active_harness.retrieval.skill_match_top_k,
+            )
             .await?;
         for skill in matched_skills {
             if !active_skills.iter().any(|s| s.id == skill.id) {
@@ -515,10 +686,14 @@ impl AllyHOrchestrator {
             }
         }
 
-        let sym_queries = DynamicPreambleAssembler::extract_symbol_queries(prompt, &env_delta);
+        let mut sym_queries = DynamicPreambleAssembler::extract_symbol_queries(prompt, &env_delta);
+        sym_queries.truncate(self.active_harness.retrieval.max_symbol_queries.max(1));
         let mut ego_graphs = Vec::new();
         for q in &sym_queries {
-            if let Ok(ego) = self.env.ego_graph_for(q, 1).await
+            if let Ok(ego) = self
+                .env
+                .ego_graph_for(q, self.active_harness.retrieval.ego_graph_hops)
+                .await
                 && (!ego.center_definitions.is_empty() || !ego.hop1_neighbors.is_empty())
             {
                 ego_graphs.push(ego);
@@ -529,6 +704,7 @@ impl AllyHOrchestrator {
             repo_id: &self.repo_id,
             scope_id: &self.scope_id,
             gate_state: self.gate.state(),
+            harness: &self.active_harness,
             env_delta: &env_delta,
             tasks: &tasks,
             memories: &memories,
@@ -551,12 +727,14 @@ impl AllyHOrchestrator {
 
         self.history.push_message(Message::user(prompt));
 
-        // 5. Run completion + compact ACI tool-use loop.
+        // 5. Run completion + compact ACI tool-use loop with CompletionInterlock.
         let tool_defs = self.toolset.definitions();
         let mut tool_records = Vec::new();
         let mut final_text = String::new();
+        let max_rounds = self.active_harness.tools.max_tool_rounds.max(1);
+        let mut interlock = CompletionInterlock::new(self.active_harness.completion_interlock.clone());
 
-        for _round in 0..6 {
+        for round in 0..max_rounds {
             let (tok_tx, mut tok_rx) = mpsc::unbounded_channel::<String>();
             let ui_clone = ui_tx.cloned();
             let forward_handle = tokio::spawn(async move {
@@ -584,6 +762,16 @@ impl AllyHOrchestrator {
                 if let Some(msg) = response.message() {
                     self.history.push_message(msg);
                 }
+                if round + 1 < max_rounds
+                    && let InterlockDecision::Reject { reminder, .. } =
+                        interlock.check_completion(&final_text)
+                {
+                    if let Some(tx) = ui_tx {
+                        let _ = tx.send(UiEvent::SystemNotice(reminder.clone()));
+                    }
+                    self.history.push_message(Message::user(reminder));
+                    continue;
+                }
                 break;
             }
 
@@ -593,6 +781,7 @@ impl AllyHOrchestrator {
                 atomic_pair.push(ast_msg);
             }
             let mut result_contents = Vec::new();
+            let mut round_records = Vec::new();
             for call in calls {
                 let (record, output) = self
                     .toolset
@@ -604,19 +793,28 @@ impl AllyHOrchestrator {
                 if let Some(tx) = ui_tx {
                     let _ = tx.send(UiEvent::ToolCard(record.clone()));
                 }
+                round_records.push(record.clone());
                 tool_records.push(record);
+                let formatted = self.active_harness.format_tool_output(&output.render());
                 result_contents.push(UserContent::tool_result(
                     call.id,
                     call.function.name,
-                    vec![ToolResultContent::text(output.render())],
+                    vec![ToolResultContent::text(formatted)],
                 ));
             }
+            interlock.observe_tool_round(&round_records);
             if !result_contents.is_empty() {
                 atomic_pair.push(Message::User {
                     content: result_contents,
                 });
             }
             self.history.push_atomic_group(atomic_pair);
+
+            if round + 1 < max_rounds
+                && let Some(budget_notice) = interlock.budget_reminder_if_due(round, max_rounds)
+            {
+                self.history.push_message(Message::user(budget_notice));
+            }
         }
 
         // 6. Post-turn bi-temporal decision consolidation & sleep-time optimization.
@@ -668,12 +866,14 @@ impl AllyHOrchestrator {
     }
 
     async fn refresh_activated_memories(&mut self, query: &str) -> Result<Vec<ScoredDecision>> {
+        let top_k = self.active_harness.retrieval.decision_top_k.max(1);
+        let fallback_k = self.active_harness.retrieval.fallback_decision_count;
         let mut results = if query.trim().is_empty() {
             self.store
                 .list_active_decisions(&self.repo_id, &self.scope_id)
                 .await?
                 .into_iter()
-                .take(8)
+                .take(top_k)
                 .map(|decision| ScoredDecision {
                     decision,
                     score: 1.0,
@@ -682,7 +882,7 @@ impl AllyHOrchestrator {
                 .collect()
         } else {
             self.store
-                .hybrid_search_decisions(&self.repo_id, &self.scope_id, query, 8)
+                .hybrid_search_decisions(&self.repo_id, &self.scope_id, query, top_k)
                 .await?
         };
 
@@ -707,14 +907,14 @@ impl AllyHOrchestrator {
                 }
             }
         }
-        // If query returned nothing (e.g. brand-new wording), still surface up to 5 active invariants.
-        if results.is_empty() {
+        // If query returned nothing (e.g. brand-new wording), still surface up to fallback_k active invariants.
+        if results.is_empty() && fallback_k > 0 {
             results = self
                 .store
                 .list_active_decisions(&self.repo_id, &self.scope_id)
                 .await?
                 .into_iter()
-                .take(5)
+                .take(fallback_k)
                 .map(|decision| ScoredDecision {
                     decision,
                     score: 0.5,
@@ -800,6 +1000,9 @@ impl AllyHOrchestrator {
                                 "Switched active reasoning model to {}",
                                 profile.label
                             )));
+                            if let Some(shift_msg) = self.model_shift_notice().await {
+                                let _ = ui_tx.send(UiEvent::SystemNotice(shift_msg));
+                            }
                             if let Ok(snap) = self.inspector_snapshot().await {
                                 let _ = ui_tx.send(UiEvent::InspectorUpdated(snap));
                             }
@@ -951,6 +1154,116 @@ impl AllyHOrchestrator {
                                     "{verb} skill `{}` ({} trigger(s)).",
                                     skill.name,
                                     skill.triggers.len()
+                                )));
+                                if let Ok(snap) = self.inspector_snapshot().await {
+                                    let _ = ui_tx.send(UiEvent::InspectorUpdated(snap));
+                                }
+                            }
+                            Err(err) => {
+                                let _ = ui_tx.send(UiEvent::Error(err.to_string()));
+                            }
+                        }
+                    }
+                    UserCommand::RequestSimSummary => match self.load_sim_ledger("").await {
+                        Ok(ledger) => {
+                            let _ = ui_tx.send(UiEvent::SimSummary {
+                                ledger,
+                                active_harness_label: self.active_harness_label(),
+                                active_harness_hash: self.active_harness.sha256_hash(),
+                            });
+                        }
+                        Err(err) => {
+                            let _ = ui_tx.send(UiEvent::Error(err.to_string()));
+                        }
+                    },
+                    UserCommand::RequestSimProblems => match self.load_sim_ledger("").await {
+                        Ok(ledger) => {
+                            let _ = ui_tx.send(UiEvent::SimProblems(ledger));
+                        }
+                        Err(err) => {
+                            let _ = ui_tx.send(UiEvent::Error(err.to_string()));
+                        }
+                    },
+                    UserCommand::ShowSimProblem(raw_id) => match self.load_sim_ledger("").await {
+                        Ok(Some(ledger)) => {
+                            let canonical = ledger.resolve_alias(&raw_id);
+                            let resolved_from = (!canonical.eq_ignore_ascii_case(raw_id.trim()))
+                                .then(|| raw_id.trim().to_string());
+                            if let Some(problem) = ledger.get_problem(&canonical).cloned() {
+                                let _ = ui_tx.send(UiEvent::SimProblemDetail {
+                                    problem,
+                                    resolved_from,
+                                });
+                            } else {
+                                let _ = ui_tx.send(UiEvent::Error(format!(
+                                    "SIM problem '{raw_id}' not found. Run `/sim list` to see recorded problems."
+                                )));
+                            }
+                        }
+                        Ok(None) => {
+                            let _ = ui_tx.send(UiEvent::SystemNotice(
+                                "No Self-Improvement Memory (SIM) runs recorded for this partition yet.".to_string(),
+                            ));
+                        }
+                        Err(err) => {
+                            let _ = ui_tx.send(UiEvent::Error(err.to_string()));
+                        }
+                    },
+                    UserCommand::ExportSim(path) => match self.export_sim_document(None).await {
+                        Ok(Some(doc)) => match serde_json::to_string_pretty(&doc) {
+                            Ok(json) => {
+                                if let Some(parent) = path.parent()
+                                    && !parent.as_os_str().is_empty()
+                                {
+                                    let _ = std::fs::create_dir_all(parent);
+                                }
+                                match std::fs::write(&path, json) {
+                                    Ok(()) => {
+                                        let _ = ui_tx.send(UiEvent::SystemNotice(format!(
+                                            "Exported SIM ledger ({} problem(s)) to `{}`.",
+                                            doc.problems.len(),
+                                            path.display()
+                                        )));
+                                    }
+                                    Err(err) => {
+                                        let _ = ui_tx.send(UiEvent::Error(format!(
+                                            "Failed to write SIM export '{}': {err}",
+                                            path.display()
+                                        )));
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                let _ = ui_tx.send(UiEvent::Error(err.to_string()));
+                            }
+                        },
+                        Ok(None) => {
+                            let _ = ui_tx.send(UiEvent::SystemNotice(
+                                "No SIM run available to export.".to_string(),
+                            ));
+                        }
+                        Err(err) => {
+                            let _ = ui_tx.send(UiEvent::Error(err.to_string()));
+                        }
+                    },
+                    UserCommand::ShowActiveHarness => {
+                        let _ = ui_tx.send(UiEvent::ActiveHarnessDetail {
+                            label: self.active_harness_label(),
+                            version_id: self
+                                .active_harness_record
+                                .as_ref()
+                                .map(|r| r.id.clone()),
+                            spec: self.active_harness.clone(),
+                        });
+                    }
+                    UserCommand::UseHarness(id_or_prefix) => {
+                        match self.activate_harness_version(&id_or_prefix).await {
+                            Ok(rec) => {
+                                let _ = ui_tx.send(UiEvent::SystemNotice(format!(
+                                    "Activated harness `{}` (id: `{}`, round {}).",
+                                    rec.label,
+                                    &rec.id[..rec.id.len().min(8)],
+                                    rec.round
                                 )));
                                 if let Ok(snap) = self.inspector_snapshot().await {
                                     let _ = ui_tx.send(UiEvent::InspectorUpdated(snap));

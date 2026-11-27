@@ -64,11 +64,13 @@ dependencies = [
  "chrono",
  "futures",
  "git2",
+ "hex",
  "reqwest 0.12.28",
  "rig-core",
  "rig-lancedb",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror",
  "tokio",
@@ -124,6 +126,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "allyh-sim"
+version = "0.2.2"
+dependencies = [
+ "allyh-core",
+ "allyh-env",
+ "allyh-memory",
+ "allyh-tools",
+ "async-trait",
+ "chrono",
+ "futures",
+ "rig-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "allyh-tools"
 version = "0.2.2"
 dependencies = [
@@ -150,6 +173,7 @@ dependencies = [
  "allyh-core",
  "allyh-env",
  "allyh-memory",
+ "allyh-sim",
  "allyh-tools",
  "anyhow",
  "chrono",

@@ -32,6 +32,9 @@ pub enum MemoryError {
 
     #[error("Invalid skill definition: {0}")]
     InvalidSkill(String),
+
+    #[error("Invalid SIM ledger operation: {0}")]
+    InvalidSim(String),
 }
 
 pub type Result<T> = std::result::Result<T, MemoryError>;

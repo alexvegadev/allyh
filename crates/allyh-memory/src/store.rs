@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::RecordBatchIterator;
+use arrow_array::{RecordBatchIterator, RecordBatchReader};
 use chrono::{DateTime, Utc};
 use futures::TryStreamExt;
 use lancedb::index::Index;
@@ -18,14 +18,20 @@ use crate::config::{StorageConfig, escape_sql_literal};
 use crate::embeddings::{EmbeddingProvider, cosine_similarity};
 use crate::error::{MemoryError, Result};
 use crate::schema::{
-    ArchitecturalDecision, CodeGraphSnapshot, DbStatusReport, ScoredDecision, SessionRecord,
-    SkillRecord, TABLE_ARCHITECTURAL_DECISIONS, TABLE_CODE_GRAPH_SNAPSHOTS, TABLE_SESSIONS,
-    TABLE_SKILLS, TABLE_TASKS, TaskRecord, TaskStatus, VerificationProof,
-    architectural_decisions_schema, batch_to_decisions, batch_to_sessions, batch_to_skills,
-    batch_to_snapshots, batch_to_tasks, code_graph_snapshots_schema, decisions_to_batch,
-    normalize_skill_slug, sessions_schema, sessions_to_batch, skill_id, skills_schema,
-    skills_to_batch, snapshots_to_batch, tasks_schema, tasks_to_batch,
+    ArchitecturalDecision, CodeGraphSnapshot, DbStatusReport, HarnessVersionRecord, ScoredDecision,
+    SessionRecord, SimRunRecord, SkillRecord, TABLE_ARCHITECTURAL_DECISIONS,
+    TABLE_CODE_GRAPH_SNAPSHOTS, TABLE_HARNESS_VERSIONS, TABLE_SESSIONS, TABLE_SIM_ATTEMPTS,
+    TABLE_SIM_PROBLEMS, TABLE_SIM_RUNS, TABLE_SKILLS, TABLE_TASKS, TaskRecord, TaskStatus,
+    VerificationProof, architectural_decisions_schema, batch_to_decisions,
+    batch_to_harness_versions, batch_to_sessions, batch_to_sim_attempts, batch_to_sim_problems,
+    batch_to_sim_runs, batch_to_skills, batch_to_snapshots, batch_to_tasks,
+    code_graph_snapshots_schema, decisions_to_batch, harness_versions_schema,
+    harness_versions_to_batch, normalize_skill_slug, sessions_schema, sessions_to_batch,
+    sim_attempts_schema, sim_attempts_to_batch, sim_problems_schema, sim_problems_to_batch,
+    sim_runs_schema, sim_runs_to_batch, skill_id, skills_schema, skills_to_batch,
+    snapshots_to_batch, tasks_schema, tasks_to_batch,
 };
+use crate::sim_ledger::{SimExportDocument, SimLedger};
 
 /// Minimum row count required by LanceDB before training an IVF-PQ vector index.
 const MIN_ROWS_FOR_IVF_INDEX: usize = 256;
@@ -108,6 +114,30 @@ impl MemoryStore {
                 .execute()
                 .await?;
         }
+        if !existing.iter().any(|n| n == TABLE_HARNESS_VERSIONS) {
+            self.connection
+                .create_empty_table(TABLE_HARNESS_VERSIONS, harness_versions_schema())
+                .execute()
+                .await?;
+        }
+        if !existing.iter().any(|n| n == TABLE_SIM_RUNS) {
+            self.connection
+                .create_empty_table(TABLE_SIM_RUNS, sim_runs_schema())
+                .execute()
+                .await?;
+        }
+        if !existing.iter().any(|n| n == TABLE_SIM_PROBLEMS) {
+            self.connection
+                .create_empty_table(TABLE_SIM_PROBLEMS, sim_problems_schema())
+                .execute()
+                .await?;
+        }
+        if !existing.iter().any(|n| n == TABLE_SIM_ATTEMPTS) {
+            self.connection
+                .create_empty_table(TABLE_SIM_ATTEMPTS, sim_attempts_schema())
+                .execute()
+                .await?;
+        }
 
         // Best-effort scalar / FTS index initialization.
         if let Err(err) = self.ensure_indexes().await {
@@ -129,6 +159,10 @@ impl MemoryStore {
             TABLE_TASKS,
             TABLE_CODE_GRAPH_SNAPSHOTS,
             TABLE_SKILLS,
+            TABLE_HARNESS_VERSIONS,
+            TABLE_SIM_RUNS,
+            TABLE_SIM_PROBLEMS,
+            TABLE_SIM_ATTEMPTS,
         ] {
             let table = self.open_table(table_name).await?;
             let count = table.count_rows(None).await?;
@@ -140,6 +174,17 @@ impl MemoryStore {
                 .replace(true)
                 .execute()
                 .await;
+
+            if matches!(
+                table_name,
+                TABLE_SIM_RUNS | TABLE_SIM_PROBLEMS | TABLE_SIM_ATTEMPTS
+            ) {
+                let _ = table
+                    .create_index(&["run_id"], Index::BTree(BTreeIndexBuilder::default()))
+                    .replace(true)
+                    .execute()
+                    .await;
+            }
 
             if table_name == TABLE_ARCHITECTURAL_DECISIONS {
                 let _ = table
@@ -806,6 +851,336 @@ impl MemoryStore {
     }
 
     // -----------------------------------------------------------------------
+    // Harness Versions & Self-Improvement Memory (SIM)
+    // -----------------------------------------------------------------------
+
+    /// Insert or update a versioned executable harness specification.
+    pub async fn upsert_harness_version(&self, record: &HarnessVersionRecord) -> Result<()> {
+        let table = self.open_table(TABLE_HARNESS_VERSIONS).await?;
+        let batch = harness_versions_to_batch(std::slice::from_ref(record))?;
+        let schema = batch.schema();
+        let reader = Box::new(RecordBatchIterator::new(vec![Ok(batch)], schema));
+        let mut merge = table.merge_insert(&["id"]);
+        merge
+            .when_matched_update_all(None)
+            .when_not_matched_insert_all();
+        merge.execute(reader).await?;
+        Ok(())
+    }
+
+    /// List all harness versions stored for `(repo_id, scope_id)`, newest first.
+    pub async fn list_harness_versions(
+        &self,
+        repo_id: &str,
+        scope_id: &str,
+    ) -> Result<Vec<HarnessVersionRecord>> {
+        let table = self.open_table(TABLE_HARNESS_VERSIONS).await?;
+        let filter = format!(
+            "repo_id = '{}' AND scope_id = '{}'",
+            escape_sql_literal(repo_id),
+            escape_sql_literal(scope_id)
+        );
+        let batches = table
+            .query()
+            .only_if(filter)
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let mut versions = Vec::new();
+        for batch in &batches {
+            versions.extend(batch_to_harness_versions(batch)?);
+        }
+        versions.sort_by_key(|a| std::cmp::Reverse(a.created_at));
+        Ok(versions)
+    }
+
+    /// Look up a single harness version by exact ID or unique prefix within `(repo_id, scope_id)`.
+    pub async fn get_harness_version(
+        &self,
+        repo_id: &str,
+        scope_id: &str,
+        version_id_or_prefix: &str,
+    ) -> Result<Option<HarnessVersionRecord>> {
+        let needle = version_id_or_prefix.trim();
+        if needle.is_empty() {
+            return Ok(None);
+        }
+        let versions = self.list_harness_versions(repo_id, scope_id).await?;
+        Ok(versions
+            .into_iter()
+            .find(|v| v.id == needle || v.id.starts_with(needle) || v.label.eq_ignore_ascii_case(needle)))
+    }
+
+    /// Return the currently active harness version for `(repo_id, scope_id)`, if any.
+    pub async fn get_active_harness_version(
+        &self,
+        repo_id: &str,
+        scope_id: &str,
+    ) -> Result<Option<HarnessVersionRecord>> {
+        let versions = self.list_harness_versions(repo_id, scope_id).await?;
+        Ok(versions.into_iter().find(|v| v.is_active))
+    }
+
+    /// Mark one harness version active for `(repo_id, scope_id)` and deactivate all others.
+    pub async fn set_active_harness_version(
+        &self,
+        repo_id: &str,
+        scope_id: &str,
+        version_id_or_prefix: &str,
+    ) -> Result<HarnessVersionRecord> {
+        let Some(mut target) = self
+            .get_harness_version(repo_id, scope_id, version_id_or_prefix)
+            .await?
+        else {
+            return Err(MemoryError::NotFound(format!(
+                "harness version '{version_id_or_prefix}'"
+            )));
+        };
+
+        let table = self.open_table(TABLE_HARNESS_VERSIONS).await?;
+        let deactivate_filter = format!(
+            "repo_id = '{}' AND scope_id = '{}' AND is_active = true",
+            escape_sql_literal(repo_id),
+            escape_sql_literal(scope_id)
+        );
+        let _ = table
+            .update()
+            .only_if(deactivate_filter)
+            .column("is_active", "false")
+            .execute()
+            .await?;
+
+        target.is_active = true;
+        self.upsert_harness_version(&target).await?;
+        Ok(target)
+    }
+
+    /// Persist a full [`SimLedger`] (run metadata, problem entries, and ordered attempts)
+    /// into LanceDB, keeping problem/attempt rows synchronized after alias merges.
+    pub async fn save_sim_ledger(&self, ledger: &SimLedger) -> Result<()> {
+        let (run, problems, attempts) = ledger.to_records();
+
+        // 1. Upsert run metadata.
+        let runs_table = self.open_table(TABLE_SIM_RUNS).await?;
+        let run_batch = sim_runs_to_batch(std::slice::from_ref(&run))?;
+        let run_schema = run_batch.schema();
+        let run_reader = Box::new(RecordBatchIterator::new(vec![Ok(run_batch)], run_schema));
+        let mut run_merge = runs_table.merge_insert(&["run_id"]);
+        run_merge
+            .when_matched_update_all(None)
+            .when_not_matched_insert_all();
+        run_merge.execute(run_reader).await?;
+
+        let run_filter = format!(
+            "repo_id = '{}' AND scope_id = '{}' AND run_id = '{}'",
+            escape_sql_literal(&run.repo_id),
+            escape_sql_literal(&run.scope_id),
+            escape_sql_literal(&run.run_id)
+        );
+
+        // 2. Replace problem rows for this run_id so merged alias duplicates do not linger.
+        let prob_table = self.open_table(TABLE_SIM_PROBLEMS).await?;
+        prob_table.delete(&run_filter).await?;
+        if !problems.is_empty() {
+            let batch = sim_problems_to_batch(&problems)?;
+            let schema = batch.schema();
+            let reader: Box<dyn RecordBatchReader + Send> =
+                Box::new(RecordBatchIterator::new(vec![Ok(batch)], schema));
+            prob_table.add(reader).execute().await?;
+        }
+
+        // 3. Replace attempt rows for this run_id in deterministic sequence order.
+        let att_table = self.open_table(TABLE_SIM_ATTEMPTS).await?;
+        att_table.delete(&run_filter).await?;
+        if !attempts.is_empty() {
+            let batch = sim_attempts_to_batch(&attempts)?;
+            let schema = batch.schema();
+            let reader: Box<dyn RecordBatchReader + Send> =
+                Box::new(RecordBatchIterator::new(vec![Ok(batch)], schema));
+            att_table.add(reader).execute().await?;
+        }
+
+        Ok(())
+    }
+
+    /// List all SIM runs for `(repo_id, scope_id)`, most recently updated first.
+    pub async fn list_sim_runs(&self, repo_id: &str, scope_id: &str) -> Result<Vec<SimRunRecord>> {
+        let table = self.open_table(TABLE_SIM_RUNS).await?;
+        let filter = format!(
+            "repo_id = '{}' AND scope_id = '{}'",
+            escape_sql_literal(repo_id),
+            escape_sql_literal(scope_id)
+        );
+        let batches = table
+            .query()
+            .only_if(filter)
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let mut runs = Vec::new();
+        for batch in &batches {
+            runs.extend(batch_to_sim_runs(batch)?);
+        }
+        runs.sort_by_key(|a| std::cmp::Reverse(a.updated_at));
+        Ok(runs)
+    }
+
+    /// Return the most recently updated SIM run for `(repo_id, scope_id)`.
+    pub async fn latest_sim_run(
+        &self,
+        repo_id: &str,
+        scope_id: &str,
+    ) -> Result<Option<SimRunRecord>> {
+        Ok(self.list_sim_runs(repo_id, scope_id).await?.into_iter().next())
+    }
+
+    /// Load a complete [`SimLedger`] by exact `run_id`, ID prefix, or `arm_name`.
+    pub async fn load_sim_ledger(
+        &self,
+        repo_id: &str,
+        scope_id: &str,
+        run_id_or_arm: &str,
+    ) -> Result<Option<SimLedger>> {
+        let needle = run_id_or_arm.trim();
+        let runs = self.list_sim_runs(repo_id, scope_id).await?;
+        let run = if needle.is_empty() {
+            runs.into_iter().next()
+        } else {
+            runs.into_iter().find(|r| {
+                r.run_id == needle
+                    || r.run_id.starts_with(needle)
+                    || r.arm_name.eq_ignore_ascii_case(needle)
+            })
+        };
+        let Some(run) = run else {
+            return Ok(None);
+        };
+
+        let filter = format!(
+            "repo_id = '{}' AND scope_id = '{}' AND run_id = '{}'",
+            escape_sql_literal(repo_id),
+            escape_sql_literal(scope_id),
+            escape_sql_literal(&run.run_id)
+        );
+
+        let prob_table = self.open_table(TABLE_SIM_PROBLEMS).await?;
+        let prob_batches = prob_table
+            .query()
+            .only_if(&filter)
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        let mut problems = Vec::new();
+        for batch in &prob_batches {
+            problems.extend(batch_to_sim_problems(batch)?);
+        }
+
+        let att_table = self.open_table(TABLE_SIM_ATTEMPTS).await?;
+        let att_batches = att_table
+            .query()
+            .only_if(&filter)
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        let mut attempts = Vec::new();
+        for batch in &att_batches {
+            attempts.extend(batch_to_sim_attempts(batch)?);
+        }
+
+        Ok(Some(SimLedger::from_records(run, problems, attempts)?))
+    }
+
+    /// Export a stored SIM run to its canonical Appendix D.3 [`SimExportDocument`].
+    pub async fn export_sim_document(
+        &self,
+        repo_id: &str,
+        scope_id: &str,
+        run_id_or_arm: Option<&str>,
+    ) -> Result<Option<SimExportDocument>> {
+        let ledger = self
+            .load_sim_ledger(repo_id, scope_id, run_id_or_arm.unwrap_or(""))
+            .await?;
+        Ok(ledger.map(|l| l.to_export_document()))
+    }
+
+    /// Import an external Appendix D.3 [`SimExportDocument`] into `(repo_id, scope_id)` and persist it.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn import_sim_document(
+        &self,
+        repo_id: &str,
+        scope_id: &str,
+        doc: SimExportDocument,
+        arm_name: &str,
+        domain: &str,
+        benchmark: &str,
+        policy_model: &str,
+        optimizer_model: &str,
+        harness_version_id: &str,
+    ) -> Result<SimLedger> {
+        let ledger = SimLedger::from_export_document(
+            doc,
+            repo_id,
+            scope_id,
+            arm_name,
+            domain,
+            benchmark,
+            policy_model,
+            optimizer_model,
+            harness_version_id,
+        )?;
+        self.save_sim_ledger(&ledger).await?;
+        Ok(ledger)
+    }
+
+    async fn count_sim_problems(&self, repo_id: &str, scope_id: &str) -> Result<usize> {
+        let table = self.open_table(TABLE_SIM_PROBLEMS).await?;
+        let filter = format!(
+            "repo_id = '{}' AND scope_id = '{}'",
+            escape_sql_literal(repo_id),
+            escape_sql_literal(scope_id)
+        );
+        let batches = table
+            .query()
+            .only_if(filter)
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        let mut rows = 0usize;
+        for batch in &batches {
+            rows += batch.num_rows();
+        }
+        Ok(rows)
+    }
+
+    async fn count_sim_attempts(&self, repo_id: &str, scope_id: &str) -> Result<usize> {
+        let table = self.open_table(TABLE_SIM_ATTEMPTS).await?;
+        let filter = format!(
+            "repo_id = '{}' AND scope_id = '{}'",
+            escape_sql_literal(repo_id),
+            escape_sql_literal(scope_id)
+        );
+        let batches = table
+            .query()
+            .only_if(filter)
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        let mut rows = 0usize;
+        for batch in &batches {
+            rows += batch.num_rows();
+        }
+        Ok(rows)
+    }
+
+    // -----------------------------------------------------------------------
     // Maintenance & Status
     // -----------------------------------------------------------------------
 
@@ -817,6 +1192,10 @@ impl MemoryStore {
             TABLE_TASKS,
             TABLE_CODE_GRAPH_SNAPSHOTS,
             TABLE_SKILLS,
+            TABLE_HARNESS_VERSIONS,
+            TABLE_SIM_RUNS,
+            TABLE_SIM_PROBLEMS,
+            TABLE_SIM_ATTEMPTS,
         ] {
             let table = self.open_table(table_name).await?;
             if table.count_rows(None).await? > 0 {
@@ -839,6 +1218,10 @@ impl MemoryStore {
         let tasks = self.list_tasks(repo_id, scope_id).await?;
         let snapshots = self.list_code_snapshots(repo_id, scope_id).await?;
         let skills = self.list_skills(repo_id, scope_id).await?;
+        let harness_versions = self.list_harness_versions(repo_id, scope_id).await?;
+        let sim_runs = self.list_sim_runs(repo_id, scope_id).await?;
+        let sim_problems_count = self.count_sim_problems(repo_id, scope_id).await?;
+        let sim_attempts_count = self.count_sim_attempts(repo_id, scope_id).await?;
 
         Ok(DbStatusReport {
             uri: self.config.uri.clone(),
@@ -851,6 +1234,10 @@ impl MemoryStore {
             tasks_count: tasks.len(),
             code_snapshots_count: snapshots.len(),
             skills_count: skills.len(),
+            harness_versions_count: harness_versions.len(),
+            sim_runs_count: sim_runs.len(),
+            sim_problems_count,
+            sim_attempts_count,
         })
     }
 }

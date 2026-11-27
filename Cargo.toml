@@ -5,6 +5,7 @@ members = [
     "crates/allyh-env",
     "crates/allyh-tools",
     "crates/allyh-core",
+    "crates/allyh-sim",
     "crates/allyh-tui",
 ]
 
@@ -63,3 +64,4 @@ allyh-memory = { path = "crates/allyh-memory" }
 allyh-env = { path = "crates/allyh-env" }
 allyh-tools = { path = "crates/allyh-tools" }
 allyh-core = { path = "crates/allyh-core" }
+allyh-sim = { path = "crates/allyh-sim" }

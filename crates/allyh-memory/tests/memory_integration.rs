@@ -365,3 +365,260 @@ async fn test_skills_crud_matching_and_partition_isolation() {
         0
     );
 }
+
+#[tokio::test]
+async fn test_sim_ledger_storage_lineage_aliases_and_json_roundtrip() {
+    use allyh_memory::{
+        HarnessVersionRecord, MemoryError, SimAttemptInput, SimExportDocument, SimLedger,
+        SimMemoryMode, SimProblemEntry, SimProblemRef,
+    };
+
+    let dir = TempDir::new().expect("tempdir");
+    let store = MemoryStore::connect(
+        StorageConfig::from_local_path(dir.path().join("db")),
+        Arc::new(DeterministicHashEmbedder),
+    )
+    .await
+    .expect("connect");
+
+    let repo_a = compute_repo_id("/repos/sim-alpha");
+    let repo_b = compute_repo_id("/repos/sim-beta");
+
+    // 1. Harness version persistence & single-active switching
+    let h0 = HarnessVersionRecord {
+        id: "hv-seed-0".into(),
+        repo_id: repo_a.clone(),
+        scope_id: DEFAULT_SCOPE_ID.into(),
+        parent_version_id: None,
+        run_id: None,
+        round: 0,
+        label: "seed".into(),
+        spec_json: r#"{"version":1}"#.into(),
+        sha256_hash: "hash0".into(),
+        policy_model: "anthropic:claude-sonnet-4-6".into(),
+        domain: "coding".into(),
+        is_active: true,
+        created_at: Utc::now(),
+    };
+    let h1 = HarnessVersionRecord {
+        id: "hv-evolved-1".into(),
+        parent_version_id: Some("hv-seed-0".into()),
+        round: 1,
+        label: "round-1".into(),
+        spec_json: r#"{"version":2}"#.into(),
+        sha256_hash: "hash1".into(),
+        is_active: false,
+        ..h0.clone()
+    };
+    store.upsert_harness_version(&h0).await.expect("upsert h0");
+    store.upsert_harness_version(&h1).await.expect("upsert h1");
+    let activated = store
+        .set_active_harness_version(&repo_a, DEFAULT_SCOPE_ID, "hv-evolved")
+        .await
+        .expect("activate h1");
+    assert_eq!(activated.id, "hv-evolved-1");
+    let active_now = store
+        .get_active_harness_version(&repo_a, DEFAULT_SCOPE_ID)
+        .await
+        .expect("get active")
+        .expect("active exists");
+    assert_eq!(active_now.id, "hv-evolved-1");
+
+    // 2. Source SIM ledger recording & rejected-attempt guard
+    let mut source = SimLedger::new_source(
+        &repo_a,
+        DEFAULT_SCOPE_ID,
+        "source-tb21",
+        "coding_enriched",
+        "tb2.1",
+        "anthropic:claude-sonnet-4-6",
+        "anthropic:claude-sonnet-4-6",
+        "hv-seed-0",
+        SimMemoryMode::FullSim,
+    );
+
+    let rejected = source.record_accepted_attempt(SimAttemptInput {
+        problem_ref: SimProblemRef::New("premature completion".into()),
+        round: 1,
+        sample: "s1".into(),
+        accepted: false,
+        backfilled: false,
+        what: "rejected experiment".into(),
+        files: vec!["interlock.rs".into()],
+        predicted: vec!["task-a".into()],
+        fixed: vec![],
+        missed: vec!["task-a".into()],
+        passed: 1,
+        total: 5,
+        score: 20.0,
+        domain: "coding_enriched".into(),
+        benchmark: "tb2.1".into(),
+        policy_model: "anthropic:claude-sonnet-4-6".into(),
+        harness_version_id: "hv-seed-0".into(),
+    });
+    assert!(matches!(rejected, Err(MemoryError::InvalidSim(_))));
+    assert!(source.problems.is_empty());
+
+    let u1 = source
+        .record_accepted_attempt(SimAttemptInput {
+            problem_ref: SimProblemRef::New("premature completion without verification".into()),
+            round: 1,
+            sample: "s2".into(),
+            accepted: true,
+            backfilled: false,
+            what: "Add execution gating interlock".into(),
+            files: vec!["crates/allyh-core/src/interlock.rs".into()],
+            predicted: vec!["task-a".into(), "task-b".into()],
+            fixed: vec!["task-a".into()],
+            missed: vec!["task-b".into()],
+            passed: 4,
+            total: 5,
+            score: 80.0,
+            domain: "coding_enriched".into(),
+            benchmark: "tb2.1".into(),
+            policy_model: "anthropic:claude-sonnet-4-6".into(),
+            harness_version_id: "hv-evolved-1".into(),
+        })
+        .expect("record P1");
+    assert_eq!(u1.canonical_problem_id, "P1");
+    assert!(u1.opened_new_problem);
+
+    // Deterministic exact-text matching merges duplicate New() into P1 automatically
+    let u2 = source
+        .record_accepted_attempt(SimAttemptInput {
+            problem_ref: SimProblemRef::New("  Premature   Completion Without Verification ".into()),
+            round: 2,
+            sample: "s1".into(),
+            accepted: true,
+            backfilled: false,
+            what: "Tighten interlock check after failed tool calls".into(),
+            files: vec!["crates/allyh-core/src/interlock.rs".into()],
+            predicted: vec!["task-b".into()],
+            fixed: vec!["task-b".into()],
+            missed: vec![],
+            passed: 5,
+            total: 5,
+            score: 100.0,
+            domain: "coding_enriched".into(),
+            benchmark: "tb2.1".into(),
+            policy_model: "anthropic:claude-sonnet-4-6".into(),
+            harness_version_id: "hv-evolved-1".into(),
+        })
+        .expect("merge into P1");
+    assert_eq!(u2.canonical_problem_id, "P1");
+    assert!(!u2.opened_new_problem);
+    assert_eq!(source.problems.len(), 1);
+    assert_eq!(source.problems[0].attempts.len(), 2);
+
+    // Explicit alias merge when duplicate entries are loaded/imported
+    source.problems.push(SimProblemEntry {
+        id: "P6".into(),
+        name: "premature completion without verification".into(),
+        opened_round: 3,
+        origin_domain: "coding_enriched".into(),
+        origin_run_id: source.run.run_id.clone(),
+        attempts: vec![source.problems[0].attempts[1].clone()],
+    });
+    let merged = source.merge_identical_problems();
+    assert_eq!(merged, vec![("P6".to_string(), "P1".to_string())]);
+    assert_eq!(source.resolve_alias("P6"), "P1");
+    assert_eq!(source.problems[0].attempts.len(), 3);
+
+    // Persist to LanceDB & reload
+    store.save_sim_ledger(&source).await.expect("save source");
+    let loaded = store
+        .load_sim_ledger(&repo_a, DEFAULT_SCOPE_ID, &source.run.run_id)
+        .await
+        .expect("load source")
+        .expect("source exists");
+    assert_eq!(loaded.problems.len(), 1);
+    assert_eq!(loaded.problems[0].attempts.len(), 3);
+    assert_eq!(loaded.resolve_alias("P6"), "P1");
+
+    // Partition isolation
+    assert!(
+        store
+            .list_sim_runs(&repo_b, DEFAULT_SCOPE_ID)
+            .await
+            .expect("repo b runs")
+            .is_empty()
+    );
+
+    // 3. Carryover into FullSim vs ProblemOnly vs HarnessTransfer
+    let target_full = loaded.carry_into(
+        &repo_a,
+        DEFAULT_SCOPE_ID,
+        "target-tb4-full",
+        "tb4",
+        "tb4",
+        "openai:gpt-4o",
+        "openai:gpt-4o",
+        "hv-evolved-1",
+        SimMemoryMode::FullSim,
+    );
+    assert_eq!(
+        target_full.run.carried_from_run_id.as_deref(),
+        Some(loaded.run.run_id.as_str())
+    );
+    assert_eq!(target_full.problems.len(), 1);
+    assert_eq!(target_full.problems[0].attempts.len(), 3);
+    assert!(
+        target_full
+            .render_for_prompt(SimMemoryMode::FullSim)
+            .contains("Add execution gating interlock")
+    );
+
+    let target_prob_only = loaded.carry_into(
+        &repo_a,
+        DEFAULT_SCOPE_ID,
+        "target-tb4-prob-only",
+        "tb4",
+        "tb4",
+        "openai:gpt-4o",
+        "openai:gpt-4o",
+        "hv-evolved-1",
+        SimMemoryMode::ProblemOnly,
+    );
+    assert_eq!(target_prob_only.problems.len(), 1);
+    assert!(target_prob_only.problems[0].attempts.is_empty());
+    let prob_prompt = target_prob_only.render_for_prompt(SimMemoryMode::ProblemOnly);
+    assert!(prob_prompt.contains("premature completion without verification"));
+    assert!(!prob_prompt.contains("Add execution gating interlock"));
+
+    // 4. Appendix D.3 JSON Export / Import round-trip
+    let doc = target_full.to_export_document();
+    let json = serde_json::to_string_pretty(&doc).expect("serialize doc");
+    let parsed: SimExportDocument = serde_json::from_str(&json).expect("deserialize doc");
+    assert_eq!(parsed.aliases.get("P6").map(String::as_str), Some("P1"));
+    assert_eq!(
+        parsed.carried_from.as_ref().map(|c| c.into.as_str()),
+        Some("target-tb4-full")
+    );
+
+    let imported = store
+        .import_sim_document(
+            &repo_b,
+            DEFAULT_SCOPE_ID,
+            parsed,
+            "imported-arm",
+            "tb4",
+            "tb4",
+            "local:qwen-35b",
+            "local:qwen-35b",
+            "hv-evolved-1",
+        )
+        .await
+        .expect("import into repo_b");
+    assert_eq!(imported.problems.len(), 1);
+    assert_eq!(imported.problems[0].attempts.len(), 3);
+
+    // 5. DbStatusReport includes SIM counts
+    let status = store
+        .status_report(&repo_a, DEFAULT_SCOPE_ID)
+        .await
+        .expect("status");
+    assert_eq!(status.harness_versions_count, 2);
+    assert_eq!(status.sim_runs_count, 1);
+    assert_eq!(status.sim_problems_count, 1);
+    assert_eq!(status.sim_attempts_count, 3);
+}

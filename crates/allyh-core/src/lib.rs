@@ -5,6 +5,8 @@ pub mod compaction;
 pub mod consolidation;
 pub mod error;
 pub mod gate;
+pub mod harness;
+pub mod interlock;
 pub mod orchestrator;
 pub mod preamble;
 pub mod router;
@@ -15,6 +17,11 @@ pub use consolidation::{
 };
 pub use error::{CoreError, Result};
 pub use gate::{ControlGate, ControlGateState, ProposedPlan, ProposedTaskSpec};
+pub use harness::{
+    CompactionPolicy, CompletionInterlockPolicy, HarnessSpec, ModelAdaptationPolicy,
+    PreamblePolicy, RetrievalPolicy, ToolPolicy,
+};
+pub use interlock::{CompletionInterlock, InterlockDecision};
 pub use orchestrator::{
     AllyHOrchestrator, InspectorSnapshot, OrchestratorConfig, TurnOutcome, UiEvent, UserCommand,
 };

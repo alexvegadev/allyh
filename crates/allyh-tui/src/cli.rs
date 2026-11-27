@@ -48,6 +48,174 @@ pub enum CliCommand {
     Update(UpdateArgs),
     /// Manage reusable procedural skills stored in LanceDB for this repository.
     Skills(SkillsArgs),
+    /// Manage Self-Improvement Memory (SIM) and run Continual Recursive Self-Improvement (CRSI).
+    Sim(SimArgs),
+}
+
+/// Options for `allyh sim`.
+#[derive(Debug, Clone, Args)]
+pub struct SimArgs {
+    #[command(subcommand)]
+    pub action: SimCommand,
+}
+
+/// Subcommands under `allyh sim`.
+#[derive(Debug, Clone, Subcommand)]
+pub enum SimCommand {
+    /// Show active harness version, SIM lineage (`carried_from`), and problem/attempt counts.
+    Status {
+        /// Optional SIM run ID prefix or arm name (defaults to latest run).
+        #[arg(long)]
+        run: Option<String>,
+        /// Output machine-readable JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// List recurring harness problem entries (`P1..Pn`) in a SIM run.
+    #[command(visible_alias = "ls")]
+    List {
+        /// Optional SIM run ID prefix or arm name (defaults to latest run).
+        #[arg(long)]
+        run: Option<String>,
+        /// Output machine-readable JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Show the complete attempt history and outcomes of a SIM problem ID (or merged alias).
+    Show {
+        /// Problem identifier or alias (e.g. `P3` or `P6`).
+        problem_id: String,
+        /// Optional SIM run ID prefix or arm name (defaults to latest run).
+        #[arg(long)]
+        run: Option<String>,
+        /// Output machine-readable JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Export a SIM ledger to the canonical arXiv:2611.18856 Appendix D.3 JSON format.
+    Export {
+        /// Optional SIM run ID prefix or arm name (defaults to latest run).
+        #[arg(long)]
+        run: Option<String>,
+        /// Destination JSON path (prints to stdout when omitted).
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+    },
+    /// Import an external Appendix D.3 SIM JSON file into this repository partition.
+    Import {
+        /// Path to the SIM JSON document.
+        path: PathBuf,
+        /// Optional arm label for the imported run.
+        #[arg(long)]
+        arm: Option<String>,
+        /// Optional domain label.
+        #[arg(long, default_value = "coding")]
+        domain: String,
+        /// Optional benchmark label.
+        #[arg(long, default_value = "imported")]
+        benchmark: String,
+    },
+    /// Run source Recursive Self-Improvement (RSI) on an evaluation suite's disjoint evolve split.
+    Evolve {
+        /// Path to a JSON evaluation suite (`EvalSuiteSpec`).
+        #[arg(long)]
+        suite: PathBuf,
+        /// Run arm label.
+        #[arg(long, default_value = "source-rsi")]
+        arm: String,
+        /// Number of optimization rounds N (paper default: 10).
+        #[arg(long, default_value_t = 3)]
+        rounds: u32,
+        /// Candidate proposals k per round (paper default: 5).
+        #[arg(long, default_value_t = 5)]
+        candidates: usize,
+        /// Evaluation rollouts per evolve task.
+        #[arg(long, default_value_t = 1)]
+        rollouts: usize,
+        /// SIM memory mode (`full-sim`, `problem-only`, `harness-transfer`, `cold-start`).
+        #[arg(long, default_value = "full-sim")]
+        mode: String,
+        /// Optional dedicated optimizer model spec for proposer & selector (defaults to `--model`).
+        #[arg(long)]
+        optimizer_model: Option<String>,
+        /// Optional external evaluator program (`CommandHarnessEvaluator`).
+        #[arg(long)]
+        eval_cmd: Option<String>,
+        /// Activate the final evolved harness in LanceDB for interactive sessions.
+        #[arg(long, default_value_t = true)]
+        activate: bool,
+        /// Output machine-readable JSON report.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Run cross-dataset or cross-model CRSI continuation carrying `(H_S, M_S)` from a source run.
+    Continue {
+        /// Source SIM run ID prefix or arm name.
+        #[arg(long)]
+        from_run: String,
+        /// Optional source repository path if carrying across repositories.
+        #[arg(long)]
+        from_repo: Option<PathBuf>,
+        /// Optional source scope ID if carrying across scopes.
+        #[arg(long)]
+        from_scope: Option<String>,
+        /// Path to the target JSON evaluation suite (`EvalSuiteSpec`).
+        #[arg(long)]
+        suite: PathBuf,
+        /// Target arm label.
+        #[arg(long, default_value = "target-crsi")]
+        arm: String,
+        /// Number of target optimization rounds N.
+        #[arg(long, default_value_t = 3)]
+        rounds: u32,
+        /// Candidate proposals k per round.
+        #[arg(long, default_value_t = 5)]
+        candidates: usize,
+        /// Evaluation rollouts per evolve task.
+        #[arg(long, default_value_t = 1)]
+        rollouts: usize,
+        /// Transfer condition (`full-sim`, `problem-only`, `harness-transfer`, `cold-start`).
+        #[arg(long, default_value = "full-sim")]
+        mode: String,
+        /// Optional dedicated optimizer model spec for proposer & selector.
+        #[arg(long)]
+        optimizer_model: Option<String>,
+        /// Optional external evaluator program (`CommandHarnessEvaluator`).
+        #[arg(long)]
+        eval_cmd: Option<String>,
+        /// Activate the final retained target harness in LanceDB.
+        #[arg(long, default_value_t = true)]
+        activate: bool,
+        /// Output machine-readable JSON report.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Evaluate a harness version on the held-out (or evolve) split outside the optimization loop.
+    Eval {
+        /// Harness version ID prefix, label, or `active`.
+        #[arg(long, default_value = "active")]
+        harness: String,
+        /// Path to the JSON evaluation suite (`EvalSuiteSpec`).
+        #[arg(long)]
+        suite: PathBuf,
+        /// Split to evaluate (`held-out` or `evolve`).
+        #[arg(long, default_value = "held-out")]
+        split: String,
+        /// Evaluation rollouts per task.
+        #[arg(long, default_value_t = 1)]
+        rollouts: usize,
+        /// Optional external evaluator program (`CommandHarnessEvaluator`).
+        #[arg(long)]
+        eval_cmd: Option<String>,
+        /// Output machine-readable JSON feedback.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Activate a stored harness version for interactive TUI sessions.
+    Use {
+        /// Harness version ID prefix or label.
+        version: String,
+    },
 }
 
 /// Options for `allyh skills`.
@@ -274,6 +442,86 @@ mod tests {
             Some(CliCommand::Skills(SkillsArgs {
                 action: SkillsCommand::Remove { ref name }
             })) if name == "release-flow"
+        ));
+    }
+
+    #[test]
+    fn parses_sim_subcommands_with_global_flags() {
+        let status_args = CliArgs::try_parse_from([
+            "allyh",
+            "sim",
+            "status",
+            "--json",
+            "--repo",
+            "workspace",
+            "--scope",
+            "sim-team",
+        ])
+        .expect("parse sim status");
+        assert_eq!(status_args.repo, PathBuf::from("workspace"));
+        assert_eq!(status_args.scope, "sim-team");
+        assert!(matches!(
+            status_args.command,
+            Some(CliCommand::Sim(SimArgs {
+                action: SimCommand::Status { run: None, json: true }
+            }))
+        ));
+
+        let evolve_args = CliArgs::try_parse_from([
+            "allyh",
+            "sim",
+            "evolve",
+            "--suite",
+            "bench.json",
+            "--rounds",
+            "10",
+            "--candidates",
+            "5",
+            "--mode",
+            "full-sim",
+        ])
+        .expect("parse sim evolve");
+        assert!(matches!(
+            evolve_args.command,
+            Some(CliCommand::Sim(SimArgs {
+                action: SimCommand::Evolve {
+                    rounds: 10,
+                    candidates: 5,
+                    ref mode,
+                    ..
+                }
+            })) if mode == "full-sim"
+        ));
+
+        let cont_args = CliArgs::try_parse_from([
+            "allyh",
+            "sim",
+            "continue",
+            "--from-run",
+            "source-tb21",
+            "--suite",
+            "tb4.json",
+            "--mode",
+            "problem-only",
+        ])
+        .expect("parse sim continue");
+        assert!(matches!(
+            cont_args.command,
+            Some(CliCommand::Sim(SimArgs {
+                action: SimCommand::Continue {
+                    ref from_run,
+                    ref mode,
+                    ..
+                }
+            })) if from_run == "source-tb21" && mode == "problem-only"
+        ));
+
+        let show_args = CliArgs::try_parse_from(["allyh", "sim", "show", "P5"]).expect("sim show");
+        assert!(matches!(
+            show_args.command,
+            Some(CliCommand::Sim(SimArgs {
+                action: SimCommand::Show { ref problem_id, .. }
+            })) if problem_id == "P5"
         ));
     }
 }

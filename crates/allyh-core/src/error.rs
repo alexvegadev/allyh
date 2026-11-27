@@ -24,6 +24,9 @@ pub enum CoreError {
     #[error("Control gate error: {0}")]
     ControlGate(String),
 
+    #[error("Invalid harness specification: {0}")]
+    HarnessSpec(String),
+
     #[error("Orchestrator channel closed")]
     ChannelClosed,
 }

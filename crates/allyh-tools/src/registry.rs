@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::edit::{EditByHashArgs, EditByHashTool};
 use crate::error::ToolError;
 use crate::inspect::{InspectSymbolArgs, InspectSymbolTool};
+use crate::sim::{InspectSimArgs, InspectSimTool};
 use crate::skill::{AddSkillArgs, AddSkillTool, GetSkillArgs, GetSkillTool};
 use crate::verify::{RunVerificationArgs, RunVerificationTool};
 
@@ -25,7 +26,7 @@ pub struct ToolExecutionRecord {
 }
 
 /// Bundled compact ACI toolset (`inspect_symbol`, `edit_by_hash`, `run_verification`,
-/// `get_skill`, `add_skill`) sharing the same repository monitor, LanceDB store, and write gate.
+/// `get_skill`, `add_skill`, `inspect_sim`) sharing the same repository monitor, LanceDB store, and write gate.
 #[derive(Clone)]
 pub struct AciToolset {
     inspect: InspectSymbolTool,
@@ -33,6 +34,7 @@ pub struct AciToolset {
     verify: RunVerificationTool,
     skill: AddSkillTool,
     get_skill: GetSkillTool,
+    inspect_sim: InspectSimTool,
     writes_enabled: Arc<AtomicBool>,
 }
 
@@ -48,7 +50,8 @@ impl AciToolset {
             edit: EditByHashTool::new(Arc::clone(&env), Arc::clone(&writes_enabled), auto_cargo_check),
             verify: RunVerificationTool::new(Arc::clone(&env), store.clone()),
             skill: AddSkillTool::new(Arc::clone(&env), store.clone()),
-            get_skill: GetSkillTool::new(env, store),
+            get_skill: GetSkillTool::new(Arc::clone(&env), store.clone()),
+            inspect_sim: InspectSimTool::new(env, store),
             writes_enabled,
         }
     }
@@ -79,6 +82,10 @@ impl AciToolset {
 
     pub fn get_skill_tool(&self) -> &GetSkillTool {
         &self.get_skill
+    }
+
+    pub fn inspect_sim_tool(&self) -> &InspectSimTool {
+        &self.inspect_sim
     }
 
     /// Return `rig-core` [`ToolDefinition`]s exposed to the active completion model.
@@ -126,6 +133,14 @@ impl AciToolset {
                 self.skill.parameters(),
             )
             .with_annotations(self.skill.annotations()),
+        );
+        defs.push(
+            ToolDefinition::new(
+                ToolName::new(InspectSimTool::NAME).expect("valid tool name"),
+                self.inspect_sim.description(),
+                self.inspect_sim.parameters(),
+            )
+            .with_annotations(self.inspect_sim.annotations()),
         );
         defs
     }
@@ -326,6 +341,40 @@ impl AciToolset {
                 Err(err) => failed_record(
                     tool_name,
                     "add_skill(invalid args)",
+                    ToolError::InvalidArgs(err.to_string()),
+                ),
+            },
+            InspectSimTool::NAME => match serde_json::from_value::<InspectSimArgs>(args) {
+                Ok(parsed) => {
+                    let target = parsed
+                        .problem_id
+                        .clone()
+                        .unwrap_or_else(|| "ledger".to_string());
+                    match self.inspect_sim.call(&mut ctx, parsed).await {
+                        Ok(out) => {
+                            let header = format!(
+                                "inspect_sim({target}) -> {} problem(s), {} attempt(s)",
+                                out.problem_count, out.attempt_count
+                            );
+                            let json_val = serde_json::to_value(&out).unwrap_or_default();
+                            let rendered = out.rendered.clone();
+                            (
+                                ToolExecutionRecord {
+                                    tool_name: tool_name.to_string(),
+                                    compact_header: header,
+                                    succeeded: true,
+                                    output_text: rendered.clone(),
+                                    output_json: json_val,
+                                },
+                                ToolOutput::text(rendered),
+                            )
+                        }
+                        Err(err) => failed_record(tool_name, &format!("inspect_sim({target})"), err),
+                    }
+                }
+                Err(err) => failed_record(
+                    tool_name,
+                    "inspect_sim(invalid args)",
                     ToolError::InvalidArgs(err.to_string()),
                 ),
             },

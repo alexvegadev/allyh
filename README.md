@@ -28,7 +28,8 @@ Captured in an offline demo workspace with sample data.
 - **Out-of-Tree LanceDB State:** Stores episodic sessions, architectural invariants, structured task queues, and code graph snapshots outside the target repo—either in the OS-native local data directory (Linux: `~/.local/share/allyh/db`, macOS: `~/Library/Application Support/allyh/db`, Windows: `%LOCALAPPDATA%\allyh\db`) or shared object storage (`s3://`, `gs://`, `az://`) partitioned by `(repo_id, scope_id)`.
 - **Bi-Temporal, Conflict-Aware Memory:** New decisions pass through a pre-write hybrid search (`vector` + BM25 FTS) and conflict gate (`ADD`, `UPDATE`, `INVALIDATE`, `NOOP`). Superseded rules are logically invalidated via `invalid_at` / `superseded_by` rather than hard-deleted or left to collide.
 - **Interactive Control Gate:** Enforces a strict `Discovery → Plan Approval → Execution` state machine. Write tools remain locked until you explicitly approve a plan (`[Approve Plan]` / `[Refine]`), and tasks cannot transition to `verified` without a passing `cargo` verification proof.
-- **Prescriptive ACI Tools:** Compact `rig-core` tools (`inspect_symbol`, `edit_by_hash`, `run_verification`, `get_skill`, `add_skill`) reject stale file reads via SHA-256 verification and automatically append structured `cargo check --message-format=json` diagnostics to every edit.
+- **Prescriptive ACI Tools:** Compact `rig-core` tools (`inspect_symbol`, `edit_by_hash`, `run_verification`, `get_skill`, `add_skill`, `inspect_sim`) reject stale file reads via SHA-256 verification and automatically append structured `cargo check --message-format=json` diagnostics to every edit.
+- **Self-Improvement Memory (SIM) & Continual RSI:** Implements Google Cloud AI / Google DeepMind's **SIM** framework ([arXiv:2611.18856](https://arxiv.org/abs/2611.18856)) as meta-level optimizer memory (`harness_versions`, `sim_runs`, `sim_problems`, `sim_attempts` in LanceDB + Appendix D.3 JSON export/import). Tracks recurring harness diagnoses (`P1..Pn`), edit rationales, ex-ante `predicted` vs. ex-post `fixed`/`missed` task outcomes, deterministic alias merges, and `carried_from` provenance across cross-dataset and cross-model transitions (`ColdStart`, `HarnessTransfer`, `ProblemOnly`, `FullSim`), with a versioned runtime `HarnessSpec` and bounded `CompletionInterlock`.
 - **Reusable Procedural Skills (Progressive Disclosure):** Store repo-scoped procedures in LanceDB (`skills` table), inject a lightweight skill catalog into every turn's preamble, expand full instructions automatically when pinned or trigger-matched (or lazily via `get_skill`), and manage or import/export `SKILL.md` files from both the TUI (`/skills`) and CLI (`allyh skills`).
 - **Live Environment & RepoGraph Awareness:** Combines `notify` filesystem watching, `git2` status/diffs, SHA-256 out-of-band edit detection, and incremental `tree-sitter-rust` indexing to inject concise diffs and 1-hop/2-hop symbol *ego-graphs* into each turn's preamble.
 - **Hybrid Routing & Sleep-Time Compute:** Routes primary reasoning to frontier APIs (Anthropic / OpenAI) or large local models, while delegating non-destructive history compaction, conflict judging, and idle LanceDB fragment optimization to a fast local OpenAI-compatible worker (`llama.cpp` / Ollama) with deterministic offline fallbacks.
@@ -62,11 +63,12 @@ Captured in an offline demo workspace with sample data.
 
 | Crate | Responsibility |
 | :--- | :--- |
-| `crates/allyh-memory` | LanceDB connection manager (local & object store), Apache Arrow schemas (`sessions`, `architectural_decisions`, `tasks`, `code_graph_snapshots`, `skills`), `SKILL.md` parser/renderer, hybrid vector + BM25 search, bi-temporal consolidator, and read-only sleep-time worker. |
+| `crates/allyh-memory` | LanceDB connection manager (local & object store), Apache Arrow schemas (`sessions`, `architectural_decisions`, `tasks`, `code_graph_snapshots`, `skills`, `harness_versions`, `sim_runs`, `sim_problems`, `sim_attempts`), `SKILL.md` & Appendix D.3 SIM JSON codecs, hybrid vector + BM25 search, bi-temporal consolidator, and read-only sleep-time worker. |
 | `crates/allyh-env` | `notify` FS watcher, `git2` tracker, SHA-256 out-of-band edit detector, `tree-sitter-rust` RepoGraph indexer, and `cargo --message-format=json` diagnostics runner. |
-| `crates/allyh-tools` | Compact ACI `rig_core::tool::Tool` implementations (`inspect_symbol`, `edit_by_hash`, `run_verification`, `get_skill`, `add_skill`) with write-gate enforcement and post-edit compiler hooks. |
-| `crates/allyh-core` | Tokio orchestrator actor, `ControlGate`, `HybridRouter`, `DynamicPreambleAssembler`, non-destructive `CompactingHistory`, and local LLM conflict judge. |
-| `crates/allyh-tui` | `allyh` binary: 60 FPS Ratatui split-pane UI, `syntect` Markdown/code highlighting, collapsible Tool Cards, Coherence Inspector sidebar, and interactive gate modals. |
+| `crates/allyh-tools` | Compact ACI `rig_core::tool::Tool` implementations (`inspect_symbol`, `edit_by_hash`, `run_verification`, `get_skill`, `add_skill`, `inspect_sim`) with write-gate enforcement and post-edit compiler hooks. |
+| `crates/allyh-core` | Tokio orchestrator actor, `HarnessSpec`, `CompletionInterlock`, `ControlGate`, `HybridRouter`, `DynamicPreambleAssembler`, non-destructive `CompactingHistory`, and local LLM conflict judge. |
+| `crates/allyh-sim` | Continual Recursive Self-Improvement (CRSI) engine: disjoint `EvolveSplit` / `HeldOutSplit` isolation, SIM-conditioned Proposer & two-stage Selector (`ColdStart`, `HarnessTransfer`, `ProblemOnly`, `FullSim`), `AllyHRuntimeEvaluator`, `CommandHarnessEvaluator`, and `UnifiedMultiModelEvaluator`. |
+| `crates/allyh-tui` | `allyh` binary: 60 FPS Ratatui split-pane UI, `syntect` Markdown/code highlighting, collapsible Tool Cards, Coherence Inspector sidebar, interactive gate modals, and `allyh skills` / `allyh sim` CLIs. |
 
 ---
 
@@ -129,6 +131,33 @@ allyh skills export release-flow --out release-flow/SKILL.md
 allyh skills remove release-flow
 ```
 
+### Self-Improvement Memory (SIM) & Continual RSI
+
+Inspect SIM ledgers, export/import canonical arXiv:2611.18856 Appendix D.3 JSON files, and run source or continuation CRSI optimization loops from the CLI:
+
+```bash
+# Inspect active harness version, SIM lineage, and recurring problem entries
+allyh sim status
+allyh sim list
+allyh sim show P1
+
+# Export or import portable Appendix D.3 SIM JSON ledgers
+allyh sim export --out sim-ledger.json
+allyh sim import sim-ledger.json --arm carried-sim
+
+# Run source RSI on a benchmark suite's disjoint evolve split
+allyh sim evolve --suite bench_source.json --rounds 10 --candidates 5 --mode full-sim
+
+# Continue CRSI across a new benchmark or policy model carrying (H_S, M_S)
+allyh sim continue --from-run source-rsi --suite bench_target.json --model openai:gpt-4o --mode full-sim
+
+# Evaluate the evolved harness strictly on the held-out split outside the loop
+allyh sim eval --harness active --suite bench_target.json --split held-out --rollouts 5
+
+# Activate any stored harness version for interactive TUI sessions
+allyh sim use <version-id-or-label>
+```
+
 ### Self-Update
 
 AllyH supports in-place updates from GitHub Releases via the `update` subcommand:
@@ -180,6 +209,7 @@ When no API keys or local servers are configured, AllyH runs cleanly in determin
 | `/model <spec>` | Switch the active reasoning model at runtime |
 | `/memories` | List active architectural invariants from LanceDB (`invalid_at IS NULL`) |
 | `/skills` | List registered skills (`show <name>`, `pin <name>`, `import <path>`, `remove <name>`) |
+| `/sim` | Inspect active harness & SIM ledger (`list`, `show <P-id>`, `harness`, `use <id>`, `export [path]`) |
 | `/pin <id-prefix>` | Pin or unpin an invariant so it is always injected into the preamble |
 | `/invalidate <id-prefix>` | Logically invalidate a stale rule (`invalid_at = NOW()`) |
 | `/db-status` | Show active LanceDB URI, backend type, partition IDs, and table row counts |
@@ -211,6 +241,8 @@ The acceptance suite verifies:
 3. Detecting an out-of-band manual file edit via SHA-256 mismatch, incrementally re-indexing with `tree-sitter`, and injecting the diff summary.
 4. Overriding the invariant in Session C so the old rule is logically superseded (`invalid_at` + `superseded_by`) without retrieval conflict.
 5. Strict `(repo_id, scope_id)` partition isolation across separate repositories and agent scopes sharing the same LanceDB URI.
+
+The workspace suite also includes the **5-Step SIM & CRSI Acceptance Suite** (`crates/allyh-sim/tests/sim_acceptance_suite.rs`), verifying offline source RSI, disjoint evolve/held-out split isolation, deterministic alias merging (`P6 -> P1`), cross-dataset/cross-model continuation across all four transfer modes (`ColdStart`, `HarnessTransfer`, `ProblemOnly`, `FullSim`), unified multi-model evaluation, and end-to-end `HarnessSpec` activation in `AllyHOrchestrator`.
 
 ---
 

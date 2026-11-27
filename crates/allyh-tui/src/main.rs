@@ -1,6 +1,7 @@
 mod app;
 mod cli;
 mod highlight;
+mod sim_cli;
 mod skills_cli;
 mod theme;
 mod ui;
@@ -92,6 +93,17 @@ async fn main() -> Result<()> {
                     &args.repo,
                     args.db_uri.as_deref(),
                     &args.scope,
+                )
+                .await
+            }
+            CliCommand::Sim(sim_args) => {
+                sim_cli::run_cli(
+                    sim_args,
+                    &args.repo,
+                    args.db_uri.as_deref(),
+                    &args.scope,
+                    args.model.as_deref(),
+                    args.worker_model.as_deref(),
                 )
                 .await
             }
@@ -337,6 +349,9 @@ mod tests {
             active_tasks: Vec::new(),
             activated_memories: Vec::new(),
             skills_count: 0,
+            active_harness_label: "seed (default)".into(),
+            sim_problems_count: 0,
+            sim_run_id: None,
             active_model_label: "API: claude-sonnet-4-6".into(),
             worker_model_label: "Local 9B".into(),
             worker_status: WorkerStatus::Idle,
@@ -679,5 +694,82 @@ mod tests {
         assert!(rendered.contains("[PINNED]"));
         assert!(rendered.contains("Skills"));
         assert!(rendered.contains("3"));
+    }
+
+    #[test]
+    fn test_sim_slash_commands_and_inspector_rendering() {
+        use allyh_core::UiEvent;
+        use allyh_memory::{SimAttemptInput, SimLedger, SimMemoryMode, SimProblemRef};
+
+        let mut snap = sample_snapshot(ControlGateState::Discovery);
+        snap.active_harness_label = "tb4-r2 (r2)".into();
+        snap.sim_problems_count = 2;
+        let mut app = AppState::new(snap, "allyh".into());
+
+        assert!(matches!(
+            app.parse_submission("/sim"),
+            Some(UserCommand::RequestSimSummary)
+        ));
+        assert!(matches!(
+            app.parse_submission("/sim list"),
+            Some(UserCommand::RequestSimProblems)
+        ));
+        assert!(matches!(
+            app.parse_submission("/sim show P3"),
+            Some(UserCommand::ShowSimProblem(ref id)) if id == "P3"
+        ));
+        assert!(matches!(
+            app.parse_submission("/sim P5"),
+            Some(UserCommand::ShowSimProblem(ref id)) if id == "P5"
+        ));
+        assert!(matches!(
+            app.parse_submission("/sim harness"),
+            Some(UserCommand::ShowActiveHarness)
+        ));
+        assert!(matches!(
+            app.parse_submission("/sim use hv-1234"),
+            Some(UserCommand::UseHarness(ref id)) if id == "hv-1234"
+        ));
+
+        let mut ledger = SimLedger::new_source(
+            "r",
+            "s",
+            "target-tb4",
+            "tb4",
+            "tb4",
+            "anthropic:claude-sonnet-4-6",
+            "anthropic:claude-sonnet-4-6",
+            "hv-0",
+            SimMemoryMode::FullSim,
+        );
+        ledger
+            .record_accepted_attempt(SimAttemptInput {
+                problem_ref: SimProblemRef::New("premature stop".into()),
+                round: 1,
+                sample: "s1".into(),
+                accepted: true,
+                backfilled: false,
+                what: "Enable interlock".into(),
+                files: vec!["interlock.rs".into()],
+                predicted: vec!["t1".into()],
+                fixed: vec!["t1".into()],
+                missed: vec![],
+                passed: 1,
+                total: 1,
+                score: 100.0,
+                domain: "tb4".into(),
+                benchmark: "tb4".into(),
+                policy_model: "anthropic:claude-sonnet-4-6".into(),
+                harness_version_id: "hv-1".into(),
+            })
+            .expect("record");
+
+        app.apply_ui_event(UiEvent::SimProblems(Some(ledger)));
+        let highlighter = MarkdownHighlighter::new();
+        let rendered = screen(&mut app, &highlighter, 120, 36);
+        assert!(rendered.contains("SIM Problem Ledger (1)"));
+        assert!(rendered.contains("premature stop"));
+        assert!(rendered.contains("tb4-r2 (r2)"));
+        assert!(rendered.contains("2 problem(s)"));
     }
 }

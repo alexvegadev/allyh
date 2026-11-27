@@ -223,3 +223,92 @@ async fn test_skill_tools_work_in_discovery_mode_and_dispatch() {
     assert!(!missing_rec.succeeded);
     assert!(missing_rec.output_text.contains("release-checklist"));
 }
+
+#[tokio::test]
+async fn test_inspect_sim_tool_reads_ledger_and_resolves_aliases() {
+    use allyh_memory::{SimAttemptInput, SimLedger, SimMemoryMode, SimProblemEntry, SimProblemRef};
+
+    let tmp = TempDir::new().expect("tmp");
+    let repo_dir = tmp.path().join("repo");
+    let db_dir = tmp.path().join("db");
+    std::fs::create_dir_all(repo_dir.join("src")).expect("mkdir");
+    std::fs::write(repo_dir.join("src/lib.rs"), "pub fn sim() {}\n").expect("write");
+
+    let store = MemoryStore::connect(
+        StorageConfig::from_local_path(&db_dir),
+        Arc::new(DeterministicHashEmbedder),
+    )
+    .await
+    .expect("connect");
+
+    let repo_id = compute_repo_id(&repo_dir.to_string_lossy());
+    let env = Arc::new(EnvironmentMonitor::new(
+        &repo_dir,
+        repo_id.clone(),
+        DEFAULT_SCOPE_ID,
+        store.clone(),
+    ));
+    let toolset = AciToolset::new(env, store.clone(), Arc::new(AtomicBool::new(false)), false);
+
+    assert!(
+        toolset
+            .definitions()
+            .iter()
+            .any(|d| d.name.as_str() == "inspect_sim")
+    );
+
+    let mut ledger = SimLedger::new_source(
+        &repo_id,
+        DEFAULT_SCOPE_ID,
+        "source-arm",
+        "coding",
+        "bench-1",
+        "offline",
+        "offline",
+        "hv-0",
+        SimMemoryMode::FullSim,
+    );
+    ledger
+        .record_accepted_attempt(SimAttemptInput {
+            problem_ref: SimProblemRef::New("premature stop".into()),
+            round: 1,
+            sample: "s1".into(),
+            accepted: true,
+            backfilled: false,
+            what: "Enable completion interlock".into(),
+            files: vec!["interlock.rs".into()],
+            predicted: vec!["t1".into()],
+            fixed: vec!["t1".into()],
+            missed: vec![],
+            passed: 1,
+            total: 1,
+            score: 100.0,
+            domain: "coding".into(),
+            benchmark: "bench-1".into(),
+            policy_model: "offline".into(),
+            harness_version_id: "hv-1".into(),
+        })
+        .expect("record");
+    ledger.problems.push(SimProblemEntry {
+        id: "P6".into(),
+        name: "premature stop".into(),
+        opened_round: 2,
+        origin_domain: "coding".into(),
+        origin_run_id: ledger.run.run_id.clone(),
+        attempts: vec![],
+    });
+    ledger.merge_identical_problems();
+    store.save_sim_ledger(&ledger).await.expect("save ledger");
+
+    // Full ledger inspection in Discovery mode
+    let (full_rec, _) = toolset.dispatch("inspect_sim", serde_json::json!({})).await;
+    assert!(full_rec.succeeded);
+    assert!(full_rec.output_text.contains("Enable completion interlock"));
+
+    // Alias lookup (`P6` -> `P1`)
+    let (alias_rec, _) = toolset
+        .dispatch("inspect_sim", serde_json::json!({ "problem_id": "P6" }))
+        .await;
+    assert!(alias_rec.succeeded);
+    assert!(alias_rec.output_text.contains("Resolved alias `P6` -> `P1`"));
+}

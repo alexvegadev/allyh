@@ -3,6 +3,7 @@ use allyh_memory::{ScoredDecision, SkillRecord, TaskRecord, TaskStatus};
 use serde::{Deserialize, Serialize};
 
 use crate::gate::ControlGateState;
+use crate::harness::HarnessSpec;
 
 /// Assembled system preamble + token estimate for the current turn.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17,6 +18,7 @@ pub struct PreambleInputs<'a> {
     pub repo_id: &'a str,
     pub scope_id: &'a str,
     pub gate_state: &'a ControlGateState,
+    pub harness: &'a HarnessSpec,
     pub env_delta: &'a EnvDelta,
     pub tasks: &'a [TaskRecord],
     pub memories: &'a [ScoredDecision],
@@ -26,29 +28,60 @@ pub struct PreambleInputs<'a> {
     pub rolling_summary: Option<&'a str>,
 }
 
-/// Builds the dynamic per-turn preamble combining `EnvDelta`, active `tasks`,
+/// Builds the dynamic per-turn preamble combining `HarnessSpec` policies, `EnvDelta`, active `tasks`,
 /// top-k active `architectural_decisions` (`invalid_at IS NULL`), and 1-hop `RepoGraph` neighborhoods.
 pub struct DynamicPreambleAssembler;
 
 impl DynamicPreambleAssembler {
     pub fn assemble(inputs: &PreambleInputs<'_>) -> AssembledPreamble {
         let mut sections = Vec::new();
+        let harness = inputs.harness;
 
-        sections.push(format!(
-            "# AllyH Coherence-First Agent Harness\n\
-             Repository Partition: `repo_id={}` | `scope_id={}`\n\
-             Control Gate Mode: `{}`\n\
-             Operating Rules:\n\
-             - Enforce all active Architectural Invariants below without requiring in-repo Markdown plans.\n\
-             - Always inspect symbols (`inspect_symbol`) to obtain fresh SHA-256 hashes before calling `edit_by_hash`.\n\
-             - When a skill in the Available Skills catalog applies, call `get_skill` to load its full procedure; use `add_skill` to persist new reusable workflows.\n\
-             - Work incrementally on the single active `in_progress` task and verify with `run_verification`.",
-            &inputs.repo_id[..inputs.repo_id.len().min(12)],
-            inputs.scope_id,
-            inputs.gate_state.label(),
-        ));
+        let mut header_lines = vec![
+            "# AllyH Coherence-First Agent Harness".to_string(),
+            format!(
+                "Repository Partition: `repo_id={}` | `scope_id={}`",
+                &inputs.repo_id[..inputs.repo_id.len().min(12)],
+                inputs.scope_id
+            ),
+            format!("Control Gate Mode: `{}`", inputs.gate_state.label()),
+            "Operating Rules:".to_string(),
+        ];
+        for rule in &harness.preamble.base_operating_rules {
+            header_lines.push(format!("- {rule}"));
+        }
+        if !harness.tools.stale_hash_hint.trim().is_empty() {
+            header_lines.push(format!("- {}", harness.tools.stale_hash_hint.trim()));
+        }
+        sections.push(header_lines.join("\n"));
 
-        if let Some(summary) = inputs.rolling_summary
+        if !harness.preamble.verification_guidelines.is_empty() {
+            let mut lines = vec!["## Verification Guidelines".to_string()];
+            for g in &harness.preamble.verification_guidelines {
+                lines.push(format!("- {g}"));
+            }
+            sections.push(lines.join("\n"));
+        }
+
+        if !harness.preamble.domain_guidance.is_empty() {
+            let mut lines = vec!["## Domain Guidance".to_string()];
+            for g in &harness.preamble.domain_guidance {
+                lines.push(format!("- {g}"));
+            }
+            sections.push(lines.join("\n"));
+        }
+
+        if let Some(fmt_hint) = harness
+            .model_adaptation
+            .output_format_guidance
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+        {
+            sections.push(format!("## Model Output Guidelines\n{}", fmt_hint.trim()));
+        }
+
+        if harness.preamble.include_rolling_summary
+            && let Some(summary) = inputs.rolling_summary
             && !summary.trim().is_empty()
         {
             sections.push(format!("## Rolling Episodic Summary\n{}", summary.trim()));

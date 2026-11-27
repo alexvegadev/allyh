@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use arrow_array::builder::{FixedSizeListBuilder, Float32Builder, ListBuilder, StringBuilder};
 use arrow_array::{
-    Array, FixedSizeListArray, Float32Array, ListArray, RecordBatch, StringArray,
-    TimestampMicrosecondArray, UInt64Array,
+    Array, BooleanArray, FixedSizeListArray, Float32Array, ListArray, RecordBatch, StringArray,
+    TimestampMicrosecondArray, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use chrono::{DateTime, Utc};
@@ -19,6 +19,10 @@ pub const TABLE_ARCHITECTURAL_DECISIONS: &str = "architectural_decisions";
 pub const TABLE_TASKS: &str = "tasks";
 pub const TABLE_CODE_GRAPH_SNAPSHOTS: &str = "code_graph_snapshots";
 pub const TABLE_SKILLS: &str = "skills";
+pub const TABLE_HARNESS_VERSIONS: &str = "harness_versions";
+pub const TABLE_SIM_RUNS: &str = "sim_runs";
+pub const TABLE_SIM_PROBLEMS: &str = "sim_problems";
+pub const TABLE_SIM_ATTEMPTS: &str = "sim_attempts";
 
 /// Episodic session summary record stored in `sessions`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -191,6 +195,143 @@ pub struct DbStatusReport {
     pub tasks_count: usize,
     pub code_snapshots_count: usize,
     pub skills_count: usize,
+    pub harness_versions_count: usize,
+    pub sim_runs_count: usize,
+    pub sim_problems_count: usize,
+    pub sim_attempts_count: usize,
+}
+
+// ---------------------------------------------------------------------------
+// Self-Improvement Memory (SIM) & Harness Versioning Records (arXiv:2611.18856)
+// ---------------------------------------------------------------------------
+
+/// Transfer / memory condition governing how SIM conditions target optimization (§3.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SimMemoryMode {
+    /// Start from seed harness H_0 with empty SIM.
+    ColdStart,
+    /// Start from source-evolved harness H_S with empty SIM.
+    HarnessTransfer,
+    /// Start from H_S with root-cause hypotheses only (M_S^c), omitting attempt evidence.
+    ProblemOnly,
+    /// Start from H_S with complete SIM record (M_S) and append target attempts.
+    FullSim,
+}
+
+impl SimMemoryMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ColdStart => "cold_start",
+            Self::HarnessTransfer => "harness_transfer",
+            Self::ProblemOnly => "problem_only",
+            Self::FullSim => "full_sim",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+            "cold_start" | "cold" => Ok(Self::ColdStart),
+            "harness_transfer" | "harness_only" | "no_sim" => Ok(Self::HarnessTransfer),
+            "problem_only" | "root_cause_only" => Ok(Self::ProblemOnly),
+            "full_sim" | "full" | "sim" => Ok(Self::FullSim),
+            other => Err(MemoryError::InvalidSim(format!(
+                "unknown SIM memory mode '{other}' (expected cold_start, harness_transfer, problem_only, or full_sim)"
+            ))),
+        }
+    }
+}
+
+impl std::fmt::Display for SimMemoryMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Versioned executable harness specification persisted out-of-tree in `harness_versions`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HarnessVersionRecord {
+    pub id: String,
+    pub repo_id: String,
+    pub scope_id: String,
+    pub parent_version_id: Option<String>,
+    pub run_id: Option<String>,
+    pub round: u32,
+    pub label: String,
+    pub spec_json: String,
+    pub sha256_hash: String,
+    pub policy_model: String,
+    pub domain: String,
+    pub is_active: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Metadata for a source or continuation CRSI optimization run stored in `sim_runs`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SimRunRecord {
+    pub run_id: String,
+    pub repo_id: String,
+    pub scope_id: String,
+    pub arm_name: String,
+    pub domain: String,
+    pub benchmark: String,
+    pub policy_model: String,
+    pub optimizer_model: String,
+    pub memory_mode: SimMemoryMode,
+    pub seed_harness_id: String,
+    pub current_harness_id: String,
+    pub carried_from_run_id: Option<String>,
+    pub carried_from_domain: Option<String>,
+    pub next_problem_num: u32,
+    pub aliases_json: String,
+    pub rounds_completed: u32,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Recurring harness problem entry m_i = (c_i, ...) stored in `sim_problems`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SimProblemRecord {
+    /// Composite primary key `{run_id}:{problem_id}` so each run's ledger snapshot stays intact.
+    pub row_id: String,
+    pub run_id: String,
+    pub repo_id: String,
+    pub scope_id: String,
+    pub problem_id: String,
+    pub name: String,
+    pub normalized_name: String,
+    pub opened_round: u32,
+    pub origin_domain: String,
+    pub origin_run_id: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Recorded optimization attempt (a_ij, o_ij, p_ij) stored in `sim_attempts`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SimAttemptRecord {
+    pub id: String,
+    pub run_id: String,
+    pub repo_id: String,
+    pub scope_id: String,
+    pub problem_id: String,
+    pub sequence_idx: u32,
+    pub round: u32,
+    pub sample: String,
+    pub accepted: bool,
+    pub backfilled: bool,
+    pub what: String,
+    pub files: Vec<String>,
+    pub predicted: Vec<String>,
+    pub fixed: Vec<String>,
+    pub missed: Vec<String>,
+    pub passed: u32,
+    pub total: u32,
+    pub score: f32,
+    pub domain: String,
+    pub benchmark: String,
+    pub policy_model: String,
+    pub harness_version_id: String,
+    pub created_at: DateTime<Utc>,
 }
 
 // ---------------------------------------------------------------------------
@@ -278,6 +419,91 @@ pub fn skills_schema() -> SchemaRef {
         Field::new("triggers", string_list_type(), false),
         Field::new("created_at", timestamp_utc(), false),
         Field::new("updated_at", timestamp_utc(), false),
+    ]))
+}
+
+pub fn harness_versions_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("repo_id", DataType::Utf8, false),
+        Field::new("scope_id", DataType::Utf8, false),
+        Field::new("parent_version_id", DataType::Utf8, true),
+        Field::new("run_id", DataType::Utf8, true),
+        Field::new("round", DataType::UInt32, false),
+        Field::new("label", DataType::Utf8, false),
+        Field::new("spec_json", DataType::Utf8, false),
+        Field::new("sha256_hash", DataType::Utf8, false),
+        Field::new("policy_model", DataType::Utf8, false),
+        Field::new("domain", DataType::Utf8, false),
+        Field::new("is_active", DataType::Boolean, false),
+        Field::new("created_at", timestamp_utc(), false),
+    ]))
+}
+
+pub fn sim_runs_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("run_id", DataType::Utf8, false),
+        Field::new("repo_id", DataType::Utf8, false),
+        Field::new("scope_id", DataType::Utf8, false),
+        Field::new("arm_name", DataType::Utf8, false),
+        Field::new("domain", DataType::Utf8, false),
+        Field::new("benchmark", DataType::Utf8, false),
+        Field::new("policy_model", DataType::Utf8, false),
+        Field::new("optimizer_model", DataType::Utf8, false),
+        Field::new("memory_mode", DataType::Utf8, false),
+        Field::new("seed_harness_id", DataType::Utf8, false),
+        Field::new("current_harness_id", DataType::Utf8, false),
+        Field::new("carried_from_run_id", DataType::Utf8, true),
+        Field::new("carried_from_domain", DataType::Utf8, true),
+        Field::new("next_problem_num", DataType::UInt32, false),
+        Field::new("aliases_json", DataType::Utf8, false),
+        Field::new("rounds_completed", DataType::UInt32, false),
+        Field::new("created_at", timestamp_utc(), false),
+        Field::new("updated_at", timestamp_utc(), false),
+    ]))
+}
+
+pub fn sim_problems_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("row_id", DataType::Utf8, false),
+        Field::new("run_id", DataType::Utf8, false),
+        Field::new("repo_id", DataType::Utf8, false),
+        Field::new("scope_id", DataType::Utf8, false),
+        Field::new("problem_id", DataType::Utf8, false),
+        Field::new("name", DataType::Utf8, false),
+        Field::new("normalized_name", DataType::Utf8, false),
+        Field::new("opened_round", DataType::UInt32, false),
+        Field::new("origin_domain", DataType::Utf8, false),
+        Field::new("origin_run_id", DataType::Utf8, false),
+        Field::new("created_at", timestamp_utc(), false),
+    ]))
+}
+
+pub fn sim_attempts_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("run_id", DataType::Utf8, false),
+        Field::new("repo_id", DataType::Utf8, false),
+        Field::new("scope_id", DataType::Utf8, false),
+        Field::new("problem_id", DataType::Utf8, false),
+        Field::new("sequence_idx", DataType::UInt32, false),
+        Field::new("round", DataType::UInt32, false),
+        Field::new("sample", DataType::Utf8, false),
+        Field::new("accepted", DataType::Boolean, false),
+        Field::new("backfilled", DataType::Boolean, false),
+        Field::new("what", DataType::Utf8, false),
+        Field::new("files", string_list_type(), false),
+        Field::new("predicted", string_list_type(), false),
+        Field::new("fixed", string_list_type(), false),
+        Field::new("missed", string_list_type(), false),
+        Field::new("passed", DataType::UInt32, false),
+        Field::new("total", DataType::UInt32, false),
+        Field::new("score", DataType::Float32, false),
+        Field::new("domain", DataType::Utf8, false),
+        Field::new("benchmark", DataType::Utf8, false),
+        Field::new("policy_model", DataType::Utf8, false),
+        Field::new("harness_version_id", DataType::Utf8, false),
+        Field::new("created_at", timestamp_utc(), false),
     ]))
 }
 
@@ -714,4 +940,410 @@ fn col_fixed_list<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a FixedSiz
         .column_by_name(name)
         .and_then(|c| c.as_any().downcast_ref::<FixedSizeListArray>())
         .ok_or_else(|| MemoryError::Embedding(format!("missing FixedSizeList column '{name}'")))
+}
+
+fn col_u32<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a UInt32Array> {
+    batch
+        .column_by_name(name)
+        .and_then(|c| c.as_any().downcast_ref::<UInt32Array>())
+        .ok_or_else(|| MemoryError::Embedding(format!("missing UInt32 column '{name}'")))
+}
+
+fn col_f32<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Float32Array> {
+    batch
+        .column_by_name(name)
+        .and_then(|c| c.as_any().downcast_ref::<Float32Array>())
+        .ok_or_else(|| MemoryError::Embedding(format!("missing Float32 column '{name}'")))
+}
+
+fn col_bool<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a BooleanArray> {
+    batch
+        .column_by_name(name)
+        .and_then(|c| c.as_any().downcast_ref::<BooleanArray>())
+        .ok_or_else(|| MemoryError::Embedding(format!("missing Boolean column '{name}'")))
+}
+
+pub fn harness_versions_to_batch(records: &[HarnessVersionRecord]) -> Result<RecordBatch> {
+    let schema = harness_versions_schema();
+    let ids = StringArray::from_iter_values(records.iter().map(|r| r.id.as_str()));
+    let repo_ids = StringArray::from_iter_values(records.iter().map(|r| r.repo_id.as_str()));
+    let scope_ids = StringArray::from_iter_values(records.iter().map(|r| r.scope_id.as_str()));
+    let parent_ids =
+        StringArray::from_iter(records.iter().map(|r| r.parent_version_id.as_deref()));
+    let run_ids = StringArray::from_iter(records.iter().map(|r| r.run_id.as_deref()));
+    let rounds = UInt32Array::from_iter_values(records.iter().map(|r| r.round));
+    let labels = StringArray::from_iter_values(records.iter().map(|r| r.label.as_str()));
+    let specs = StringArray::from_iter_values(records.iter().map(|r| r.spec_json.as_str()));
+    let hashes = StringArray::from_iter_values(records.iter().map(|r| r.sha256_hash.as_str()));
+    let policies = StringArray::from_iter_values(records.iter().map(|r| r.policy_model.as_str()));
+    let domains = StringArray::from_iter_values(records.iter().map(|r| r.domain.as_str()));
+    let actives = BooleanArray::from_iter(records.iter().map(|r| Some(r.is_active)));
+    let created_at = TimestampMicrosecondArray::from_iter_values(
+        records.iter().map(|r| r.created_at.timestamp_micros()),
+    )
+    .with_timezone("UTC");
+
+    Ok(RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(ids),
+            Arc::new(repo_ids),
+            Arc::new(scope_ids),
+            Arc::new(parent_ids),
+            Arc::new(run_ids),
+            Arc::new(rounds),
+            Arc::new(labels),
+            Arc::new(specs),
+            Arc::new(hashes),
+            Arc::new(policies),
+            Arc::new(domains),
+            Arc::new(actives),
+            Arc::new(created_at),
+        ],
+    )?)
+}
+
+pub fn batch_to_harness_versions(batch: &RecordBatch) -> Result<Vec<HarnessVersionRecord>> {
+    let ids = col_str(batch, "id")?;
+    let repo_ids = col_str(batch, "repo_id")?;
+    let scope_ids = col_str(batch, "scope_id")?;
+    let parent_ids = col_str(batch, "parent_version_id")?;
+    let run_ids = col_str(batch, "run_id")?;
+    let rounds = col_u32(batch, "round")?;
+    let labels = col_str(batch, "label")?;
+    let specs = col_str(batch, "spec_json")?;
+    let hashes = col_str(batch, "sha256_hash")?;
+    let policies = col_str(batch, "policy_model")?;
+    let domains = col_str(batch, "domain")?;
+    let actives = col_bool(batch, "is_active")?;
+    let created_at = col_ts(batch, "created_at")?;
+
+    let mut out = Vec::with_capacity(batch.num_rows());
+    for i in 0..batch.num_rows() {
+        out.push(HarnessVersionRecord {
+            id: ids.value(i).to_string(),
+            repo_id: repo_ids.value(i).to_string(),
+            scope_id: scope_ids.value(i).to_string(),
+            parent_version_id: if parent_ids.is_null(i) {
+                None
+            } else {
+                Some(parent_ids.value(i).to_string())
+            },
+            run_id: if run_ids.is_null(i) {
+                None
+            } else {
+                Some(run_ids.value(i).to_string())
+            },
+            round: rounds.value(i),
+            label: labels.value(i).to_string(),
+            spec_json: specs.value(i).to_string(),
+            sha256_hash: hashes.value(i).to_string(),
+            policy_model: policies.value(i).to_string(),
+            domain: domains.value(i).to_string(),
+            is_active: actives.value(i),
+            created_at: micros_to_utc(created_at.value(i)),
+        });
+    }
+    Ok(out)
+}
+
+pub fn sim_runs_to_batch(records: &[SimRunRecord]) -> Result<RecordBatch> {
+    let schema = sim_runs_schema();
+    let run_ids = StringArray::from_iter_values(records.iter().map(|r| r.run_id.as_str()));
+    let repo_ids = StringArray::from_iter_values(records.iter().map(|r| r.repo_id.as_str()));
+    let scope_ids = StringArray::from_iter_values(records.iter().map(|r| r.scope_id.as_str()));
+    let arm_names = StringArray::from_iter_values(records.iter().map(|r| r.arm_name.as_str()));
+    let domains = StringArray::from_iter_values(records.iter().map(|r| r.domain.as_str()));
+    let benchmarks = StringArray::from_iter_values(records.iter().map(|r| r.benchmark.as_str()));
+    let policies = StringArray::from_iter_values(records.iter().map(|r| r.policy_model.as_str()));
+    let optimizers =
+        StringArray::from_iter_values(records.iter().map(|r| r.optimizer_model.as_str()));
+    let modes =
+        StringArray::from_iter_values(records.iter().map(|r| r.memory_mode.as_str()));
+    let seed_ids = StringArray::from_iter_values(records.iter().map(|r| r.seed_harness_id.as_str()));
+    let curr_ids =
+        StringArray::from_iter_values(records.iter().map(|r| r.current_harness_id.as_str()));
+    let carried_runs =
+        StringArray::from_iter(records.iter().map(|r| r.carried_from_run_id.as_deref()));
+    let carried_domains =
+        StringArray::from_iter(records.iter().map(|r| r.carried_from_domain.as_deref()));
+    let next_nums = UInt32Array::from_iter_values(records.iter().map(|r| r.next_problem_num));
+    let aliases = StringArray::from_iter_values(records.iter().map(|r| r.aliases_json.as_str()));
+    let rounds = UInt32Array::from_iter_values(records.iter().map(|r| r.rounds_completed));
+    let created_at = TimestampMicrosecondArray::from_iter_values(
+        records.iter().map(|r| r.created_at.timestamp_micros()),
+    )
+    .with_timezone("UTC");
+    let updated_at = TimestampMicrosecondArray::from_iter_values(
+        records.iter().map(|r| r.updated_at.timestamp_micros()),
+    )
+    .with_timezone("UTC");
+
+    Ok(RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(run_ids),
+            Arc::new(repo_ids),
+            Arc::new(scope_ids),
+            Arc::new(arm_names),
+            Arc::new(domains),
+            Arc::new(benchmarks),
+            Arc::new(policies),
+            Arc::new(optimizers),
+            Arc::new(modes),
+            Arc::new(seed_ids),
+            Arc::new(curr_ids),
+            Arc::new(carried_runs),
+            Arc::new(carried_domains),
+            Arc::new(next_nums),
+            Arc::new(aliases),
+            Arc::new(rounds),
+            Arc::new(created_at),
+            Arc::new(updated_at),
+        ],
+    )?)
+}
+
+pub fn batch_to_sim_runs(batch: &RecordBatch) -> Result<Vec<SimRunRecord>> {
+    let run_ids = col_str(batch, "run_id")?;
+    let repo_ids = col_str(batch, "repo_id")?;
+    let scope_ids = col_str(batch, "scope_id")?;
+    let arm_names = col_str(batch, "arm_name")?;
+    let domains = col_str(batch, "domain")?;
+    let benchmarks = col_str(batch, "benchmark")?;
+    let policies = col_str(batch, "policy_model")?;
+    let optimizers = col_str(batch, "optimizer_model")?;
+    let modes = col_str(batch, "memory_mode")?;
+    let seed_ids = col_str(batch, "seed_harness_id")?;
+    let curr_ids = col_str(batch, "current_harness_id")?;
+    let carried_runs = col_str(batch, "carried_from_run_id")?;
+    let carried_domains = col_str(batch, "carried_from_domain")?;
+    let next_nums = col_u32(batch, "next_problem_num")?;
+    let aliases = col_str(batch, "aliases_json")?;
+    let rounds = col_u32(batch, "rounds_completed")?;
+    let created_at = col_ts(batch, "created_at")?;
+    let updated_at = col_ts(batch, "updated_at")?;
+
+    let mut out = Vec::with_capacity(batch.num_rows());
+    for i in 0..batch.num_rows() {
+        out.push(SimRunRecord {
+            run_id: run_ids.value(i).to_string(),
+            repo_id: repo_ids.value(i).to_string(),
+            scope_id: scope_ids.value(i).to_string(),
+            arm_name: arm_names.value(i).to_string(),
+            domain: domains.value(i).to_string(),
+            benchmark: benchmarks.value(i).to_string(),
+            policy_model: policies.value(i).to_string(),
+            optimizer_model: optimizers.value(i).to_string(),
+            memory_mode: SimMemoryMode::parse(modes.value(i))?,
+            seed_harness_id: seed_ids.value(i).to_string(),
+            current_harness_id: curr_ids.value(i).to_string(),
+            carried_from_run_id: if carried_runs.is_null(i) {
+                None
+            } else {
+                Some(carried_runs.value(i).to_string())
+            },
+            carried_from_domain: if carried_domains.is_null(i) {
+                None
+            } else {
+                Some(carried_domains.value(i).to_string())
+            },
+            next_problem_num: next_nums.value(i),
+            aliases_json: aliases.value(i).to_string(),
+            rounds_completed: rounds.value(i),
+            created_at: micros_to_utc(created_at.value(i)),
+            updated_at: micros_to_utc(updated_at.value(i)),
+        });
+    }
+    Ok(out)
+}
+
+pub fn sim_problems_to_batch(records: &[SimProblemRecord]) -> Result<RecordBatch> {
+    let schema = sim_problems_schema();
+    let row_ids = StringArray::from_iter_values(records.iter().map(|r| r.row_id.as_str()));
+    let run_ids = StringArray::from_iter_values(records.iter().map(|r| r.run_id.as_str()));
+    let repo_ids = StringArray::from_iter_values(records.iter().map(|r| r.repo_id.as_str()));
+    let scope_ids = StringArray::from_iter_values(records.iter().map(|r| r.scope_id.as_str()));
+    let problem_ids = StringArray::from_iter_values(records.iter().map(|r| r.problem_id.as_str()));
+    let names = StringArray::from_iter_values(records.iter().map(|r| r.name.as_str()));
+    let norm_names =
+        StringArray::from_iter_values(records.iter().map(|r| r.normalized_name.as_str()));
+    let opened = UInt32Array::from_iter_values(records.iter().map(|r| r.opened_round));
+    let origin_domains =
+        StringArray::from_iter_values(records.iter().map(|r| r.origin_domain.as_str()));
+    let origin_runs =
+        StringArray::from_iter_values(records.iter().map(|r| r.origin_run_id.as_str()));
+    let created_at = TimestampMicrosecondArray::from_iter_values(
+        records.iter().map(|r| r.created_at.timestamp_micros()),
+    )
+    .with_timezone("UTC");
+
+    Ok(RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(row_ids),
+            Arc::new(run_ids),
+            Arc::new(repo_ids),
+            Arc::new(scope_ids),
+            Arc::new(problem_ids),
+            Arc::new(names),
+            Arc::new(norm_names),
+            Arc::new(opened),
+            Arc::new(origin_domains),
+            Arc::new(origin_runs),
+            Arc::new(created_at),
+        ],
+    )?)
+}
+
+pub fn batch_to_sim_problems(batch: &RecordBatch) -> Result<Vec<SimProblemRecord>> {
+    let row_ids = col_str(batch, "row_id")?;
+    let run_ids = col_str(batch, "run_id")?;
+    let repo_ids = col_str(batch, "repo_id")?;
+    let scope_ids = col_str(batch, "scope_id")?;
+    let problem_ids = col_str(batch, "problem_id")?;
+    let names = col_str(batch, "name")?;
+    let norm_names = col_str(batch, "normalized_name")?;
+    let opened = col_u32(batch, "opened_round")?;
+    let origin_domains = col_str(batch, "origin_domain")?;
+    let origin_runs = col_str(batch, "origin_run_id")?;
+    let created_at = col_ts(batch, "created_at")?;
+
+    let mut out = Vec::with_capacity(batch.num_rows());
+    for i in 0..batch.num_rows() {
+        out.push(SimProblemRecord {
+            row_id: row_ids.value(i).to_string(),
+            run_id: run_ids.value(i).to_string(),
+            repo_id: repo_ids.value(i).to_string(),
+            scope_id: scope_ids.value(i).to_string(),
+            problem_id: problem_ids.value(i).to_string(),
+            name: names.value(i).to_string(),
+            normalized_name: norm_names.value(i).to_string(),
+            opened_round: opened.value(i),
+            origin_domain: origin_domains.value(i).to_string(),
+            origin_run_id: origin_runs.value(i).to_string(),
+            created_at: micros_to_utc(created_at.value(i)),
+        });
+    }
+    Ok(out)
+}
+
+pub fn sim_attempts_to_batch(records: &[SimAttemptRecord]) -> Result<RecordBatch> {
+    let schema = sim_attempts_schema();
+    let ids = StringArray::from_iter_values(records.iter().map(|r| r.id.as_str()));
+    let run_ids = StringArray::from_iter_values(records.iter().map(|r| r.run_id.as_str()));
+    let repo_ids = StringArray::from_iter_values(records.iter().map(|r| r.repo_id.as_str()));
+    let scope_ids = StringArray::from_iter_values(records.iter().map(|r| r.scope_id.as_str()));
+    let problem_ids = StringArray::from_iter_values(records.iter().map(|r| r.problem_id.as_str()));
+    let seqs = UInt32Array::from_iter_values(records.iter().map(|r| r.sequence_idx));
+    let rounds = UInt32Array::from_iter_values(records.iter().map(|r| r.round));
+    let samples = StringArray::from_iter_values(records.iter().map(|r| r.sample.as_str()));
+    let accepted = BooleanArray::from_iter(records.iter().map(|r| Some(r.accepted)));
+    let backfilled = BooleanArray::from_iter(records.iter().map(|r| Some(r.backfilled)));
+    let whats = StringArray::from_iter_values(records.iter().map(|r| r.what.as_str()));
+    let files_vec: Vec<Vec<String>> = records.iter().map(|r| r.files.clone()).collect();
+    let files = build_string_list_array(&files_vec);
+    let pred_vec: Vec<Vec<String>> = records.iter().map(|r| r.predicted.clone()).collect();
+    let predicted = build_string_list_array(&pred_vec);
+    let fixed_vec: Vec<Vec<String>> = records.iter().map(|r| r.fixed.clone()).collect();
+    let fixed = build_string_list_array(&fixed_vec);
+    let missed_vec: Vec<Vec<String>> = records.iter().map(|r| r.missed.clone()).collect();
+    let missed = build_string_list_array(&missed_vec);
+    let passed = UInt32Array::from_iter_values(records.iter().map(|r| r.passed));
+    let total = UInt32Array::from_iter_values(records.iter().map(|r| r.total));
+    let scores = Float32Array::from_iter_values(records.iter().map(|r| r.score));
+    let domains = StringArray::from_iter_values(records.iter().map(|r| r.domain.as_str()));
+    let benchmarks = StringArray::from_iter_values(records.iter().map(|r| r.benchmark.as_str()));
+    let policies = StringArray::from_iter_values(records.iter().map(|r| r.policy_model.as_str()));
+    let harness_ids =
+        StringArray::from_iter_values(records.iter().map(|r| r.harness_version_id.as_str()));
+    let created_at = TimestampMicrosecondArray::from_iter_values(
+        records.iter().map(|r| r.created_at.timestamp_micros()),
+    )
+    .with_timezone("UTC");
+
+    Ok(RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(ids),
+            Arc::new(run_ids),
+            Arc::new(repo_ids),
+            Arc::new(scope_ids),
+            Arc::new(problem_ids),
+            Arc::new(seqs),
+            Arc::new(rounds),
+            Arc::new(samples),
+            Arc::new(accepted),
+            Arc::new(backfilled),
+            Arc::new(whats),
+            Arc::new(files),
+            Arc::new(predicted),
+            Arc::new(fixed),
+            Arc::new(missed),
+            Arc::new(passed),
+            Arc::new(total),
+            Arc::new(scores),
+            Arc::new(domains),
+            Arc::new(benchmarks),
+            Arc::new(policies),
+            Arc::new(harness_ids),
+            Arc::new(created_at),
+        ],
+    )?)
+}
+
+pub fn batch_to_sim_attempts(batch: &RecordBatch) -> Result<Vec<SimAttemptRecord>> {
+    let ids = col_str(batch, "id")?;
+    let run_ids = col_str(batch, "run_id")?;
+    let repo_ids = col_str(batch, "repo_id")?;
+    let scope_ids = col_str(batch, "scope_id")?;
+    let problem_ids = col_str(batch, "problem_id")?;
+    let seqs = col_u32(batch, "sequence_idx")?;
+    let rounds = col_u32(batch, "round")?;
+    let samples = col_str(batch, "sample")?;
+    let accepted = col_bool(batch, "accepted")?;
+    let backfilled = col_bool(batch, "backfilled")?;
+    let whats = col_str(batch, "what")?;
+    let files = col_list(batch, "files")?;
+    let predicted = col_list(batch, "predicted")?;
+    let fixed = col_list(batch, "fixed")?;
+    let missed = col_list(batch, "missed")?;
+    let passed = col_u32(batch, "passed")?;
+    let total = col_u32(batch, "total")?;
+    let scores = col_f32(batch, "score")?;
+    let domains = col_str(batch, "domain")?;
+    let benchmarks = col_str(batch, "benchmark")?;
+    let policies = col_str(batch, "policy_model")?;
+    let harness_ids = col_str(batch, "harness_version_id")?;
+    let created_at = col_ts(batch, "created_at")?;
+
+    let mut out = Vec::with_capacity(batch.num_rows());
+    for i in 0..batch.num_rows() {
+        out.push(SimAttemptRecord {
+            id: ids.value(i).to_string(),
+            run_id: run_ids.value(i).to_string(),
+            repo_id: repo_ids.value(i).to_string(),
+            scope_id: scope_ids.value(i).to_string(),
+            problem_id: problem_ids.value(i).to_string(),
+            sequence_idx: seqs.value(i),
+            round: rounds.value(i),
+            sample: samples.value(i).to_string(),
+            accepted: accepted.value(i),
+            backfilled: backfilled.value(i),
+            what: whats.value(i).to_string(),
+            files: read_string_list(files, i),
+            predicted: read_string_list(predicted, i),
+            fixed: read_string_list(fixed, i),
+            missed: read_string_list(missed, i),
+            passed: passed.value(i),
+            total: total.value(i),
+            score: scores.value(i),
+            domain: domains.value(i).to_string(),
+            benchmark: benchmarks.value(i).to_string(),
+            policy_model: policies.value(i).to_string(),
+            harness_version_id: harness_ids.value(i).to_string(),
+            created_at: micros_to_utc(created_at.value(i)),
+        });
+    }
+    Ok(out)
 }
