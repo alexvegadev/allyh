@@ -35,6 +35,7 @@ impl CargoRunner {
         let target = VerificationTarget {
             kind,
             target_scope: package.map(str::to_string),
+            test_filter: None,
             affected_file: None,
             toolchain_override: Some("rust".to_string()),
         };

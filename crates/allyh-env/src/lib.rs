@@ -2,12 +2,14 @@
 //! and pluggable multi-language toolchain verifier.
 
 pub mod cargo;
+pub mod checkpoint;
 pub mod error;
 pub mod git;
 pub mod graph;
 pub mod lang;
 pub mod lsp;
 pub mod path;
+pub mod search;
 pub mod verify;
 pub mod watcher;
 
@@ -15,8 +17,9 @@ pub use cargo::{
     CargoRunner, CargoVerificationReport, CompilerDiagnostic, VerificationKind,
     parse_cargo_json_diagnostics,
 };
+pub use checkpoint::{CheckpointDiffReport, PlanCheckpoint, RollbackReport};
 pub use error::{EnvError, Result};
-pub use git::{GitState, GitTracker};
+pub use git::{GitBlameLine, GitDiffReport, GitLogEntry, GitState, GitTracker};
 pub use graph::{
     EgoEdge, EgoGraph, EgoNode, FileGraph, RepoGraph, RustIndexer, SymbolInfo, SymbolKind,
 };
@@ -28,6 +31,7 @@ pub use lsp::{
     file_uri_to_rel_path, lsp_language_id_for_path, path_to_file_uri,
 };
 pub use path::{canonicalize_normalized, path_to_slash_string, strip_verbatim_prefix};
+pub use search::{CodeSearchMatch, CodeSearchQuery, TextSearchResult, search_workspace_text};
 pub use verify::custom::{parse_generic_file_line_diagnostics, parse_sarif_diagnostics};
 pub use verify::go::{
     GoVerificationAdapter, parse_go_test_json_diagnostics, parse_go_vet_diagnostics,

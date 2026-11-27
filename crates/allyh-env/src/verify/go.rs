@@ -116,9 +116,20 @@ impl VerificationAdapter for GoVerificationAdapter {
                 ))
             }
             VerificationKind::Test => {
-                let cmd_label = format!("go test -json {pkg_scope}");
+                let mut args = vec!["test".to_string(), "-json".to_string()];
+                if let Some(filter) = target
+                    .test_filter
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    args.push("-run".to_string());
+                    args.push(filter.to_string());
+                }
+                args.push(pkg_scope.to_string());
+                let cmd_label = format!("go {}", args.join(" "));
                 let Ok(out) = Command::new("go")
-                    .args(["test", "-json", pkg_scope])
+                    .args(&args)
                     .current_dir(&workdir)
                     .output()
                     .await

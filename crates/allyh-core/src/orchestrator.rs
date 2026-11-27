@@ -4,7 +4,10 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
-use allyh_env::{EnvDelta, EnvironmentMonitor, LiveFsWatcher, LspServerStatus};
+use allyh_env::{
+    CheckpointDiffReport, EnvDelta, EnvironmentMonitor, LiveFsWatcher, LspServerStatus,
+    PlanCheckpoint, RollbackReport,
+};
 use allyh_memory::{
     CandidateDecision, ConsolidationOutcome, DbStatusReport, DeterministicHashEmbedder,
     EmbeddingProvider, HarnessVersionRecord, MemoryConsolidator, MemoryStore, RepoProfile,
@@ -12,7 +15,7 @@ use allyh_memory::{
     SkillRecord, SleepJob, SleepTimeWorkerHandle, StorageConfig, TaskRecord, WorkerStatus,
     compute_repo_id,
 };
-use allyh_tools::{AciToolset, ToolExecutionRecord};
+use allyh_tools::{AciToolset, PendingCommandApproval, ToolExecutionRecord};
 use chrono::Utc;
 use rig_core::message::{Message, ToolResultContent, UserContent};
 use serde::{Deserialize, Serialize};
@@ -44,6 +47,8 @@ pub struct InspectorSnapshot {
     pub detected_toolchains: Vec<String>,
     #[serde(default)]
     pub active_lsp_servers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_checkpoint_label: Option<String>,
     pub build_status: String,
     pub gate_state: ControlGateState,
     pub active_tasks: Vec<TaskRecord>,
@@ -96,6 +101,11 @@ pub enum UserCommand {
     ResetRepoProfile,
     RequestLspStatus,
     RestartLsp(Option<String>),
+    RequestCheckpointDiff,
+    RollbackCheckpoint,
+    ApproveCommandOnce(String),
+    AllowCommandPattern(String),
+    DenyCommand(String),
     RefreshEnv { run_build_check: bool },
     CompactNow,
     Shutdown,
@@ -144,6 +154,8 @@ pub enum UiEvent {
         detected_toolchains: Vec<String>,
     },
     LspStatus(Vec<LspServerStatus>),
+    CheckpointDiff(Option<CheckpointDiffReport>),
+    CommandApprovalRequested(PendingCommandApproval),
     SystemNotice(String),
     Error(String),
 }
@@ -204,6 +216,7 @@ pub struct AllyHOrchestrator {
     last_env_delta: EnvDelta,
     last_activated_memories: Vec<ScoredDecision>,
     last_preamble_tokens: u64,
+    active_checkpoint: Option<PlanCheckpoint>,
     _fs_watcher: Option<LiveFsWatcher>,
 }
 
@@ -322,6 +335,7 @@ impl AllyHOrchestrator {
             last_env_delta: initial_delta,
             last_activated_memories: initial_active,
             last_preamble_tokens: 0,
+            active_checkpoint: None,
             _fs_watcher: fs_watcher,
         })
     }
@@ -473,9 +487,45 @@ impl AllyHOrchestrator {
     }
 
     pub async fn approve_plan(&mut self) -> Result<Vec<TaskRecord>> {
-        self.gate
+        let plan_label = match self.gate.state() {
+            ControlGateState::PlanApproval { plan } => plan.title.clone(),
+            _ => "Approved Plan".to_string(),
+        };
+        let tasks = self
+            .gate
             .approve_plan(&self.store, &self.repo_id, &self.scope_id)
-            .await
+            .await?;
+        // Capture an atomic out-of-tree pre-execution checkpoint immediately upon plan approval.
+        if let Ok(cp) = PlanCheckpoint::capture(self.env.repo_root(), plan_label) {
+            self.active_checkpoint = Some(cp);
+        }
+        Ok(tasks)
+    }
+
+    /// Manually capture a pre-execution checkpoint of the current workspace out-of-tree.
+    pub fn capture_checkpoint(&mut self, label: impl Into<String>) -> Result<String> {
+        let cp = PlanCheckpoint::capture(self.env.repo_root(), label)?;
+        let id = cp.id.clone();
+        self.active_checkpoint = Some(cp);
+        Ok(id)
+    }
+
+    /// Compute a unified diff between the active checkpoint and the current workspace on disk.
+    pub fn checkpoint_diff(&self) -> Option<CheckpointDiffReport> {
+        self.active_checkpoint
+            .as_ref()
+            .map(|cp| cp.diff_against(self.env.repo_root(), 16_000))
+    }
+
+    /// Atomically restore the workspace to the active checkpoint and re-sync SHA-256 snapshots.
+    pub async fn rollback_checkpoint(&mut self) -> Result<Option<RollbackReport>> {
+        let Some(cp) = self.active_checkpoint.as_ref() else {
+            return Ok(None);
+        };
+        let report = cp.rollback(self.env.repo_root())?;
+        // Re-sync environment snapshots so restored files match LanceDB without drift noise.
+        let _ = self.refresh_env(false).await;
+        Ok(Some(report))
     }
 
     pub fn refine_plan(&mut self) -> ControlGateState {
@@ -671,6 +721,7 @@ impl AllyHOrchestrator {
             detected_languages: self.last_env_delta.detected_languages.clone(),
             detected_toolchains: self.last_env_delta.detected_toolchains.clone(),
             active_lsp_servers,
+            active_checkpoint_label: self.active_checkpoint.as_ref().map(|c| c.label.clone()),
             build_status: self
                 .last_env_delta
                 .build_status
@@ -845,6 +896,37 @@ impl AllyHOrchestrator {
                     .await;
                 if let Some(tx) = ui_tx {
                     let _ = tx.send(UiEvent::ToolCard(record.clone()));
+                    if record
+                        .output_json
+                        .get("approval_required")
+                        .and_then(|v| v.as_bool())
+                        == Some(true)
+                        && let Some(cmd) = record.output_json.get("command").and_then(|v| v.as_str())
+                    {
+                        let _ = tx.send(UiEvent::CommandApprovalRequested(
+                            PendingCommandApproval {
+                                command: cmd.to_string(),
+                                working_dir: record
+                                    .output_json
+                                    .get("working_dir")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or(".")
+                                    .to_string(),
+                                reason: record
+                                    .output_json
+                                    .get("reason")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("Command requires explicit approval.")
+                                    .to_string(),
+                                suggested_pattern: record
+                                    .output_json
+                                    .get("suggested_pattern")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or(cmd)
+                                    .to_string(),
+                            },
+                        ));
+                    }
                 }
                 round_records.push(record.clone());
                 tool_records.push(record);
@@ -1397,6 +1479,48 @@ impl AllyHOrchestrator {
                             let _ = ui_tx.send(UiEvent::Error(err.to_string()));
                         }
                     },
+                    UserCommand::RequestCheckpointDiff => {
+                        let diff = self.checkpoint_diff();
+                        let _ = ui_tx.send(UiEvent::CheckpointDiff(diff));
+                    }
+                    UserCommand::RollbackCheckpoint => match self.rollback_checkpoint().await {
+                        Ok(Some(rep)) => {
+                            let _ = ui_tx.send(UiEvent::SystemNotice(format!(
+                                "Rolled back workspace to checkpoint `{}` ({} file(s) restored, {} created file(s) removed).",
+                                rep.checkpoint_label,
+                                rep.restored_files.len(),
+                                rep.removed_files.len()
+                            )));
+                            if let Ok(snap) = self.inspector_snapshot().await {
+                                let _ = ui_tx.send(UiEvent::InspectorUpdated(snap));
+                            }
+                        }
+                        Ok(None) => {
+                            let _ = ui_tx.send(UiEvent::SystemNotice(
+                                "No active checkpoint to roll back to. Approve a plan with `/plan <goal>` to capture an automatic pre-execution checkpoint.".to_string(),
+                            ));
+                        }
+                        Err(err) => {
+                            let _ = ui_tx.send(UiEvent::Error(err.to_string()));
+                        }
+                    },
+                    UserCommand::ApproveCommandOnce(cmd) => {
+                        self.toolset.command_policy().approve_once(&cmd);
+                        let _ = ui_tx.send(UiEvent::SystemNotice(format!(
+                            "Approved command once: `{cmd}`. Re-run or ask AllyH to retry the command."
+                        )));
+                    }
+                    UserCommand::AllowCommandPattern(pattern) => {
+                        self.toolset.command_policy().allow_pattern(&pattern);
+                        let _ = ui_tx.send(UiEvent::SystemNotice(format!(
+                            "Allowlisted command pattern for this session: `{pattern}`."
+                        )));
+                    }
+                    UserCommand::DenyCommand(cmd) => {
+                        let _ = ui_tx.send(UiEvent::SystemNotice(format!(
+                            "Denied command: `{cmd}`."
+                        )));
+                    }
                     UserCommand::RefreshEnv { run_build_check } => {
                         match self.refresh_env(run_build_check).await {
                             Ok(_) => {

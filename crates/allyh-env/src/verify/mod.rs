@@ -188,11 +188,13 @@ impl DetectedToolchain {
     }
 }
 
-/// Request targeting a specific verification mode, optional scope, affected file, or toolchain.
+/// Request targeting a specific verification mode, optional scope, test filter, affected file, or toolchain.
 #[derive(Debug, Clone, Default)]
 pub struct VerificationTarget {
     pub kind: VerificationKind,
     pub target_scope: Option<String>,
+    /// Optional targeted test name, file, or module filter (for `cargo test`, `pytest`, `vitest`/`jest`, `go test`).
+    pub test_filter: Option<String>,
     pub affected_file: Option<String>,
     pub toolchain_override: Option<String>,
 }

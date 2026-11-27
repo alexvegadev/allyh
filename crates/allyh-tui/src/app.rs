@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use allyh_core::{AllyHOrchestrator, ControlGateState, InspectorSnapshot, UiEvent, UserCommand};
 use allyh_memory::{RepoProfile, WorkerStatus, load_skill_markdown_file};
-use allyh_tools::ToolExecutionRecord;
+use allyh_tools::{PendingCommandApproval, ToolExecutionRecord};
 use crossterm::event::KeyCode;
 use ratatui::style::Style;
 use tui_textarea::TextArea;
@@ -26,6 +26,8 @@ pub const COMMANDS: &[SlashCommand] = &[
     SlashCommand::new("/db-status", "", "Inspect storage and table counts"),
     SlashCommand::new("/config", "[cmd]", "Inspect or override polyglot verification config"),
     SlashCommand::new("/lsp", "[cmd]", "Show LSP bridge status or restart servers"),
+    SlashCommand::new("/diff", "", "Show unified diff since pre-plan checkpoint"),
+    SlashCommand::new("/rollback", "", "Restore workspace to pre-plan checkpoint"),
     SlashCommand::new("/compact", "", "Compact conversation history"),
     SlashCommand::new("/refresh", "", "Rescan files and run project check"),
     SlashCommand::new("/help", "", "Show commands and shortcuts"),
@@ -123,6 +125,7 @@ pub struct AppState {
     pub command_index: usize,
     pub commands_dismissed: bool,
     pub selected_memory_idx: usize,
+    pub pending_command_approval: Option<PendingCommandApproval>,
     pub should_quit: bool,
     pub busy: bool,
 }
@@ -144,6 +147,7 @@ impl AppState {
             command_index: 0,
             commands_dismissed: false,
             selected_memory_idx: 0,
+            pending_command_approval: None,
             should_quit: false,
             busy: false,
         }
@@ -153,7 +157,7 @@ impl AppState {
         matches!(
             self.inspector.gate_state,
             ControlGateState::PlanApproval { .. }
-        )
+        ) || self.pending_command_approval.is_some()
     }
 
     pub fn cycle_focus(&mut self, reverse: bool) {
@@ -312,6 +316,8 @@ impl AppState {
                 "db-status" => Some(UserCommand::RequestDbStatus),
                 "config" => self.parse_config_command(arg),
                 "lsp" => self.parse_lsp_command(arg),
+                "diff" => Some(UserCommand::RequestCheckpointDiff),
+                "rollback" => Some(UserCommand::RollbackCheckpoint),
                 "compact" => Some(UserCommand::CompactNow),
                 "refresh" => Some(UserCommand::RefreshEnv {
                     run_build_check: true,
@@ -730,6 +736,30 @@ impl AppState {
                         statuses.len()
                     )));
                 }
+            }
+            UiEvent::CheckpointDiff(maybe_diff) => match maybe_diff {
+                None => {
+                    self.entries.push(ChatEntry::System(
+                        "No active checkpoint yet. Approve a plan with `/plan <goal>` to capture an automatic pre-execution checkpoint.".to_string(),
+                    ));
+                }
+                Some(report) if !report.has_changes() => {
+                    self.entries.push(ChatEntry::System(format!(
+                        "### Checkpoint Diff (`{}`)\nWorkspace matches checkpoint cleanly (0 changed files).",
+                        report.checkpoint_label
+                    )));
+                }
+                Some(report) => {
+                    self.entries.push(ChatEntry::System(format!(
+                        "### Checkpoint Diff (`{}`)\n- **Summary:** {}\n\n```diff\n{}\n```\n\n_Run `/rollback` to restore all files to this checkpoint._",
+                        report.checkpoint_label,
+                        report.compact_summary(),
+                        report.unified_diff
+                    )));
+                }
+            },
+            UiEvent::CommandApprovalRequested(req) => {
+                self.pending_command_approval = Some(req);
             }
             UiEvent::SystemNotice(msg) => {
                 self.entries.push(ChatEntry::System(msg));

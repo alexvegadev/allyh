@@ -120,13 +120,48 @@ impl VerificationAdapter for TypeScriptVerificationAdapter {
                 ))
             }
             VerificationKind::Test => {
+                let filter = target
+                    .test_filter
+                    .as_deref()
+                    .or(target.target_scope.as_deref())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty() && *s != subproject_rel);
+
+                // Prefer local vitest when present for fast targeted test runs.
+                let has_local_vitest = workdir
+                    .join("node_modules")
+                    .join(".bin")
+                    .join(if cfg!(windows) { "vitest.cmd" } else { "vitest" })
+                    .exists();
+                if has_local_vitest {
+                    let mut v_args: Vec<&str> = vec!["run"];
+                    if let Some(f) = filter {
+                        v_args.push(f);
+                    }
+                    let (cmd_label, output) = run_node_tool(&workdir, "vitest", &v_args).await;
+                    if let Some(out) = output {
+                        let combined = format!(
+                            "{}\n{}",
+                            String::from_utf8_lossy(&out.stdout),
+                            String::from_utf8_lossy(&out.stderr)
+                        );
+                        let diagnostics = parse_tsc_diagnostics(&combined);
+                        return Ok(build_report(
+                            "typescript",
+                            subproject_rel,
+                            target.kind,
+                            cmd_label,
+                            out.status.success(),
+                            diagnostics,
+                            &combined,
+                        ));
+                    }
+                }
+
                 let mut args: Vec<String> = vec!["test".to_string()];
-                if let Some(scope) = target.target_scope.as_deref()
-                    && !scope.trim().is_empty()
-                    && scope.trim() != subproject_rel
-                {
+                if let Some(f) = filter {
                     args.push("--".to_string());
-                    args.push(scope.trim().to_string());
+                    args.push(f.to_string());
                 }
                 let npm = node_bin("npm");
                 let cmd_label = format!("npm {}", args.join(" "));

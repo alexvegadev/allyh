@@ -1,5 +1,6 @@
 use allyh_core::{ControlGateState, ProposedPlan};
 use allyh_memory::TaskStatus;
+use allyh_tools::PendingCommandApproval;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Margin, Rect};
 use ratatui::style::{Color, Style};
@@ -46,7 +47,9 @@ pub fn render(frame: &mut Frame<'_>, app: &mut AppState, highlighter: &MarkdownH
     }
     render_status(frame, status, app);
 
-    if let ControlGateState::PlanApproval { plan } = &app.inspector.gate_state {
+    if let Some(pending) = &app.pending_command_approval {
+        render_command_approval(frame, area, pending);
+    } else if let ControlGateState::PlanApproval { plan } = &app.inspector.gate_state {
         render_plan(frame, area, plan, &mut app.plan_scroll);
     } else {
         render_commands(frame, body, app);
@@ -279,6 +282,9 @@ fn render_inspector(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
             insert_idx,
             field("LSP", snapshot.active_lsp_servers.join(", ")),
         );
+    }
+    if let Some(ref cp_label) = snapshot.active_checkpoint_label {
+        workspace.push(field("Checkpt", cp_label.as_str()));
     }
     if !snapshot.out_of_band_edits.is_empty() {
         workspace.insert(
@@ -527,6 +533,53 @@ fn render_plan(frame: &mut Frame<'_>, screen: Rect, plan: &ProposedPlan, scroll:
         Line::from(vec![
             Span::styled(approve, bold(CANVAS).bg(AMBER)),
             Span::styled("  Esc  Refine", bold(TEXT)),
+        ]),
+        actions,
+    );
+}
+
+fn render_command_approval(frame: &mut Frame<'_>, screen: Rect, req: &PendingCommandApproval) {
+    let lines = vec![
+        Line::styled("Command requires approval", bold(AMBER)),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("Command: ", ink(MUTED)),
+            Span::styled(&req.command, bold(TEXT)),
+        ]),
+        Line::from(vec![
+            Span::styled("Dir:     ", ink(MUTED)),
+            Span::styled(&req.working_dir, ink(TEXT)),
+        ]),
+        Line::from(vec![
+            Span::styled("Pattern: ", ink(MUTED)),
+            Span::styled(&req.suggested_pattern, ink(MINT)),
+        ]),
+        Line::raw(""),
+        Line::styled(&req.reason, ink(MUTED)),
+    ];
+    let body = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let width = if screen.width >= 72 {
+        screen.width.min(96) * 4 / 5
+    } else {
+        screen.width.saturating_sub(2)
+    };
+    let area = centered(screen, width, 12.min(screen.height.saturating_sub(2).max(6)));
+    let block = panel("Command Approval Gate", AMBER).style(ink(TEXT).bg(PANEL));
+    let inner = block.inner(area);
+    let [content, actions] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(inner);
+
+    frame.buffer_mut().set_style(screen, ink(MUTED).bg(CANVAS));
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    frame.render_widget(body, content);
+    frame.render_widget(
+        Line::from(vec![
+            Span::styled(" A  Allow Once ", bold(CANVAS).bg(AMBER)),
+            Span::raw(" "),
+            Span::styled(" P  Allow Pattern ", bold(CANVAS).bg(MINT)),
+            Span::raw(" "),
+            Span::styled(" D/Esc  Deny ", bold(TEXT).bg(EDGE)),
         ]),
         actions,
     );

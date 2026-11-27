@@ -8,9 +8,12 @@ use rig_core::message::ToolName;
 use rig_core::tool::{IntoToolOutput, Tool, ToolContext, ToolOutput};
 use serde::{Deserialize, Serialize};
 
+use crate::command::{CommandPolicyGate, RunCommandArgs, RunCommandTool, suggest_pattern};
 use crate::edit::{EditByHashArgs, EditByHashTool};
 use crate::error::ToolError;
+use crate::git::{GitInspectArgs, GitInspectTool};
 use crate::inspect::{InspectSymbolArgs, InspectSymbolTool};
+use crate::search::{SearchCodeArgs, SearchCodeTool};
 use crate::sim::{InspectSimArgs, InspectSimTool};
 use crate::skill::{AddSkillArgs, AddSkillTool, GetSkillArgs, GetSkillTool};
 use crate::verify::{RunVerificationArgs, RunVerificationTool};
@@ -25,13 +28,18 @@ pub struct ToolExecutionRecord {
     pub output_json: serde_json::Value,
 }
 
-/// Bundled compact ACI toolset (`inspect_symbol`, `edit_by_hash`, `run_verification`,
-/// `get_skill`, `add_skill`, `inspect_sim`) sharing the same repository monitor, LanceDB store, and write gate.
+/// Bundled compact ACI toolset (`inspect_symbol`, `search_code`, `git_inspect`, `edit_by_hash`,
+/// `run_verification`, `run_command`, `get_skill`, `add_skill`, `inspect_sim`) sharing the same
+/// repository monitor, LanceDB store, write gate, and command policy gate.
 #[derive(Clone)]
 pub struct AciToolset {
     inspect: InspectSymbolTool,
+    search: SearchCodeTool,
+    git: GitInspectTool,
     edit: EditByHashTool,
     verify: RunVerificationTool,
+    command: RunCommandTool,
+    command_policy: Arc<CommandPolicyGate>,
     skill: AddSkillTool,
     get_skill: GetSkillTool,
     inspect_sim: InspectSimTool,
@@ -45,10 +53,15 @@ impl AciToolset {
         writes_enabled: Arc<AtomicBool>,
         auto_verify: bool,
     ) -> Self {
+        let command_policy = Arc::new(CommandPolicyGate::new());
         Self {
             inspect: InspectSymbolTool::new(Arc::clone(&env), store.clone()),
+            search: SearchCodeTool::new(Arc::clone(&env), store.clone()),
+            git: GitInspectTool::new(Arc::clone(&env)),
             edit: EditByHashTool::new(Arc::clone(&env), Arc::clone(&writes_enabled), auto_verify),
             verify: RunVerificationTool::new(Arc::clone(&env), store.clone()),
+            command: RunCommandTool::new(Arc::clone(&env), Arc::clone(&command_policy)),
+            command_policy,
             skill: AddSkillTool::new(Arc::clone(&env), store.clone()),
             get_skill: GetSkillTool::new(Arc::clone(&env), store.clone()),
             inspect_sim: InspectSimTool::new(env, store),
@@ -68,12 +81,28 @@ impl AciToolset {
         &self.inspect
     }
 
+    pub fn search_tool(&self) -> &SearchCodeTool {
+        &self.search
+    }
+
+    pub fn git_tool(&self) -> &GitInspectTool {
+        &self.git
+    }
+
     pub fn edit_tool(&self) -> &EditByHashTool {
         &self.edit
     }
 
     pub fn verify_tool(&self) -> &RunVerificationTool {
         &self.verify
+    }
+
+    pub fn command_tool(&self) -> &RunCommandTool {
+        &self.command
+    }
+
+    pub fn command_policy(&self) -> &Arc<CommandPolicyGate> {
+        &self.command_policy
     }
 
     pub fn skill_tool(&self) -> &AddSkillTool {
@@ -98,11 +127,29 @@ impl AciToolset {
             )
             .with_annotations(self.inspect.annotations()),
             ToolDefinition::new(
+                ToolName::new(SearchCodeTool::NAME).expect("valid tool name"),
+                self.search.description(),
+                self.search.parameters(),
+            )
+            .with_annotations(self.search.annotations()),
+            ToolDefinition::new(
+                ToolName::new(GitInspectTool::NAME).expect("valid tool name"),
+                self.git.description(),
+                self.git.parameters(),
+            )
+            .with_annotations(self.git.annotations()),
+            ToolDefinition::new(
                 ToolName::new(RunVerificationTool::NAME).expect("valid tool name"),
                 self.verify.description(),
                 self.verify.parameters(),
             )
             .with_annotations(self.verify.annotations()),
+            ToolDefinition::new(
+                ToolName::new(RunCommandTool::NAME).expect("valid tool name"),
+                self.command.description(),
+                self.command.parameters(),
+            )
+            .with_annotations(self.command.annotations()),
         ];
 
         // Expose `edit_by_hash` definition always so the model knows it exists, while the
@@ -375,6 +422,160 @@ impl AciToolset {
                 Err(err) => failed_record(
                     tool_name,
                     "inspect_sim(invalid args)",
+                    ToolError::InvalidArgs(err.to_string()),
+                ),
+            },
+            SearchCodeTool::NAME => match serde_json::from_value::<SearchCodeArgs>(args) {
+                Ok(parsed) => {
+                    let q = parsed.query.clone();
+                    match self.search.call(&mut ctx, parsed).await {
+                        Ok(out) => {
+                            let header = format!(
+                                "search_code({q}) -> {} match(es), {} semantic hit(s)",
+                                out.text_matches.len(),
+                                out.semantic_hits.len()
+                            );
+                            let json_val = serde_json::to_value(&out).unwrap_or_default();
+                            let mut lines = vec![header.clone()];
+                            if !out.text_matches.is_empty() {
+                                lines.push("Text matches:".to_string());
+                                for m in &out.text_matches {
+                                    lines.push(format!(
+                                        "  {}:{}:{} | {}",
+                                        m.file_path, m.line, m.column, m.snippet
+                                    ));
+                                }
+                            }
+                            if !out.semantic_hits.is_empty() {
+                                lines.push("Semantic hits:".to_string());
+                                for h in &out.semantic_hits {
+                                    let syms = if h.matched_symbols.is_empty() {
+                                        String::new()
+                                    } else {
+                                        format!(" [{}]", h.matched_symbols.join(", "))
+                                    };
+                                    lines.push(format!(
+                                        "  {} ({}, score {:.2}){syms}",
+                                        h.file_path, h.language, h.score
+                                    ));
+                                }
+                            }
+                            let rendered = lines.join("\n");
+                            (
+                                ToolExecutionRecord {
+                                    tool_name: tool_name.to_string(),
+                                    compact_header: header,
+                                    succeeded: true,
+                                    output_text: rendered.clone(),
+                                    output_json: json_val,
+                                },
+                                ToolOutput::text(rendered),
+                            )
+                        }
+                        Err(err) => failed_record(tool_name, &format!("search_code({q})"), err),
+                    }
+                }
+                Err(err) => failed_record(
+                    tool_name,
+                    "search_code(invalid args)",
+                    ToolError::InvalidArgs(err.to_string()),
+                ),
+            },
+            GitInspectTool::NAME => match serde_json::from_value::<GitInspectArgs>(args) {
+                Ok(parsed) => {
+                    let act = parsed.action.clone();
+                    match self.git.call(&mut ctx, parsed).await {
+                        Ok(out) => {
+                            let header = format!("git_inspect({act}) -> OK");
+                            let json_val = serde_json::to_value(&out).unwrap_or_default();
+                            let rendered = out.rendered.clone();
+                            (
+                                ToolExecutionRecord {
+                                    tool_name: tool_name.to_string(),
+                                    compact_header: header,
+                                    succeeded: true,
+                                    output_text: rendered.clone(),
+                                    output_json: json_val,
+                                },
+                                ToolOutput::text(rendered),
+                            )
+                        }
+                        Err(err) => failed_record(tool_name, &format!("git_inspect({act})"), err),
+                    }
+                }
+                Err(err) => failed_record(
+                    tool_name,
+                    "git_inspect(invalid args)",
+                    ToolError::InvalidArgs(err.to_string()),
+                ),
+            },
+            RunCommandTool::NAME => match serde_json::from_value::<RunCommandArgs>(args) {
+                Ok(parsed) => {
+                    let cmd_preview = parsed.command.clone();
+                    let wdir = parsed
+                        .working_dir
+                        .clone()
+                        .unwrap_or_else(|| ".".to_string());
+                    match self.command.call(&mut ctx, parsed).await {
+                        Ok(out) => {
+                            let status = if out.success { "PASS" } else { "FAIL" };
+                            let header = format!(
+                                "run_command({}) -> {status} (exit {})",
+                                cmd_preview, out.exit_code
+                            );
+                            let succeeded = out.success;
+                            let json_val = serde_json::to_value(&out).unwrap_or_default();
+                            let mut rendered = header.clone();
+                            if !out.stdout.trim().is_empty() {
+                                rendered.push_str("\n--- stdout ---\n");
+                                rendered.push_str(out.stdout.trim_end());
+                            }
+                            if !out.stderr.trim().is_empty() {
+                                rendered.push_str("\n--- stderr ---\n");
+                                rendered.push_str(out.stderr.trim_end());
+                            }
+                            (
+                                ToolExecutionRecord {
+                                    tool_name: tool_name.to_string(),
+                                    compact_header: header,
+                                    succeeded,
+                                    output_text: rendered.clone(),
+                                    output_json: json_val,
+                                },
+                                ToolOutput::text(rendered),
+                            )
+                        }
+                        Err(ToolError::CommandApprovalRequired { command, reason }) => {
+                            let msg = format!(
+                                "Command approval required for `{command}`: {reason}"
+                            );
+                            let header = format!("run_command({command}) -> APPROVAL REQUIRED");
+                            let json_val = serde_json::json!({
+                                "approval_required": true,
+                                "command": command,
+                                "working_dir": wdir,
+                                "reason": reason,
+                                "suggested_pattern": suggest_pattern(&cmd_preview),
+                            });
+                            (
+                                ToolExecutionRecord {
+                                    tool_name: tool_name.to_string(),
+                                    compact_header: header,
+                                    succeeded: false,
+                                    output_text: msg.clone(),
+                                    output_json: json_val,
+                                },
+                                ToolOutput::text(msg),
+                            )
+                        }
+                        Err(err) => {
+                            failed_record(tool_name, &format!("run_command({cmd_preview})"), err)
+                        }
+                    }
+                }
+                Err(err) => failed_record(
+                    tool_name,
+                    "run_command(invalid args)",
                     ToolError::InvalidArgs(err.to_string()),
                 ),
             },

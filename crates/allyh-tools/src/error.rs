@@ -28,6 +28,12 @@ pub enum ToolError {
     #[error("Edit target not found in '{file_path}': {reason}")]
     EditTargetNotFound { file_path: String, reason: String },
 
+    #[error("Command approval required for '{command}': {reason}")]
+    CommandApprovalRequired { command: String, reason: String },
+
+    #[error("Command '{command}' timed out after {timeout_secs}s")]
+    CommandTimedOut { command: String, timeout_secs: u64 },
+
     #[error("Invalid tool arguments: {0}")]
     InvalidArgs(String),
 

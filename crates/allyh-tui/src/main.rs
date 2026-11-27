@@ -228,7 +228,27 @@ fn handle_terminal_event(
         return;
     }
 
-    // Interactive Control Gate modal intercepts keys first
+    // Interactive Command Approval Gate modal intercepts keys first
+    if let Some(pending) = app.pending_command_approval.clone() {
+        match key.code {
+            KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Enter => {
+                app.pending_command_approval = None;
+                let _ = cmd_tx.send(UserCommand::ApproveCommandOnce(pending.command));
+            }
+            KeyCode::Char('p') | KeyCode::Char('P') => {
+                app.pending_command_approval = None;
+                let _ = cmd_tx.send(UserCommand::AllowCommandPattern(pending.suggested_pattern));
+            }
+            KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Esc => {
+                app.pending_command_approval = None;
+                let _ = cmd_tx.send(UserCommand::DenyCommand(pending.command));
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    // Interactive Control Gate modal intercepts keys next
     if app.is_gate_modal_open() {
         match key.code {
             KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Enter => {
@@ -359,6 +379,7 @@ mod tests {
             detected_languages: vec!["Rust".into()],
             detected_toolchains: vec!["Rust (cargo)".into()],
             active_lsp_servers: Vec::new(),
+            active_checkpoint_label: None,
             build_status: "cargo check: PASS (0 warnings)".into(),
             gate_state,
             active_tasks: Vec::new(),
@@ -857,5 +878,63 @@ mod tests {
         let rendered = screen(&mut app, &highlighter, 120, 36);
         assert!(rendered.contains("LSP Semantic Bridge (1)"));
         assert!(rendered.contains("rust-analyzer (running)"));
+    }
+
+    #[test]
+    fn test_checkpoint_slash_commands_and_command_approval_modal() {
+        use allyh_core::UiEvent;
+        use allyh_env::CheckpointDiffReport;
+        use allyh_tools::PendingCommandApproval;
+
+        let mut snap = sample_snapshot(ControlGateState::Execution {
+            active_task_id: None,
+        });
+        snap.active_checkpoint_label = Some("Refactor API".into());
+        let mut app = AppState::new(snap, "allyh".into());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let highlighter = MarkdownHighlighter::new();
+
+        assert!(matches!(
+            app.parse_submission("/diff"),
+            Some(UserCommand::RequestCheckpointDiff)
+        ));
+        assert!(matches!(
+            app.parse_submission("/rollback"),
+            Some(UserCommand::RollbackCheckpoint)
+        ));
+
+        app.apply_ui_event(UiEvent::CheckpointDiff(Some(CheckpointDiffReport {
+            checkpoint_id: "cp-1".into(),
+            checkpoint_label: "Refactor API".into(),
+            modified_files: vec!["src/lib.rs".into()],
+            created_files: Vec::new(),
+            deleted_files: Vec::new(),
+            insertions: 1,
+            deletions: 1,
+            unified_diff: "-old\n+new\n".into(),
+        })));
+        let diff_screen = screen(&mut app, &highlighter, 120, 36);
+        assert!(diff_screen.contains("Checkpoint Diff"));
+        assert!(diff_screen.contains("Checkpt"));
+
+        // Command Approval Modal renders & handles Allow Once / Allow Pattern / Deny
+        app.apply_ui_event(UiEvent::CommandApprovalRequested(PendingCommandApproval {
+            command: "cargo publish --dry-run".into(),
+            working_dir: ".".into(),
+            reason: "Mutating or network command".into(),
+            suggested_pattern: "cargo publish".into(),
+        }));
+        assert!(app.is_gate_modal_open());
+        let modal = screen(&mut app, &highlighter, 120, 36);
+        assert!(modal.contains("Command Approval Gate"));
+        assert!(modal.contains("cargo publish --dry-run"));
+        assert!(modal.contains("Allow Pattern"));
+
+        press(&mut app, &tx, KeyCode::Char('p'));
+        assert!(!app.is_gate_modal_open());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(UserCommand::AllowCommandPattern(ref pat)) if pat == "cargo publish"
+        ));
     }
 }

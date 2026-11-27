@@ -19,6 +19,9 @@ pub struct RunVerificationArgs {
     /// Optional workspace package, subdirectory, or test scope (alias: `package`).
     #[serde(default, alias = "package")]
     pub target: Option<String>,
+    /// Optional targeted test name, file, or module filter (for `cargo test`, `pytest`, `vitest`, `go test`).
+    #[serde(default)]
+    pub test_filter: Option<String>,
     /// Optional explicit toolchain override (`rust`, `typescript`, `python`, `go`, `custom`).
     #[serde(default)]
     pub toolchain: Option<String>,
@@ -64,6 +67,7 @@ impl RunVerificationTool {
         let target = VerificationTarget {
             kind,
             target_scope: args.target.clone(),
+            test_filter: args.test_filter.clone(),
             affected_file: args.affected_file.clone(),
             toolchain_override: args.toolchain.clone(),
         };

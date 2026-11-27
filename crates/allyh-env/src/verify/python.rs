@@ -114,6 +114,19 @@ impl VerificationAdapter for PythonVerificationAdapter {
                 {
                     args.push(scope.trim().to_string());
                 }
+                if let Some(filter) = target
+                    .test_filter
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    if filter.contains('/') || filter.contains(".py") || filter.contains("::") {
+                        args.push(filter.to_string());
+                    } else {
+                        args.push("-k".to_string());
+                        args.push(filter.to_string());
+                    }
+                }
                 let cmd_label = format!("pytest {}", args.join(" "));
                 let Ok(out) = Command::new("pytest")
                     .args(&args)

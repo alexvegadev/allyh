@@ -78,27 +78,27 @@ This roadmap defines the highest-leverage capabilities to evolve AllyH from a **
 
 ---
 
-## Milestone 3: Expanded ACI Tools, Code Search & Atomic Checkpoints (`v0.5.0`)
+## Milestone 3: Expanded ACI Tools, Code Search & Atomic Checkpoints (`v0.5.0`) — Completed
 
 **Goal:** Give the agent the missing read/search/test/shell primitives needed for complex real-world repositories while strengthening AllyH's safety and rollback guarantees.
 
 ### 3.1 High-Signal Search & Navigation Tools (`allyh-tools`, `allyh-memory`)
-- [ ] **Add `search_code` ACI tool:** Combine fast ripgrep-style regex/literal search (respecting `.gitignore`, capped output budgets) with hybrid semantic search over LanceDB `code_graph_snapshots` (`vector` + BM25) so the agent can find symbols, error strings, and configs in one call.
-- [ ] **Add `git_inspect` read-only tool:** Structured access to `git log`, `git diff`, `git blame` (for a file/line range), and branch status without needing a raw shell.
-- [ ] **Enhance `edit_by_hash` with multi-hunk atomic edits:** Support batching multiple validated `(target_snippet, replacement_snippet)` hunks in a single file edit (all-or-nothing rollback on mismatch) to cut tool round-trips.
+- [x] **Add `search_code` ACI tool:** Combine fast ripgrep-style regex/literal search (respecting `.gitignore`, capped output budgets) with hybrid semantic search over LanceDB `code_graph_snapshots` (`vector` + symbol/dependency overlap) so the agent can find symbols, error strings, and configs in one call.
+- [x] **Add `git_inspect` read-only tool:** Structured access to `git log`, `git diff`, `git blame` (for a file/line range), and branch status without needing a raw shell.
+- [x] **Enhance `edit_by_hash` with multi-hunk atomic edits:** Support batching multiple validated `(target_snippet, replacement_snippet)` hunks in a single file edit (all-or-nothing rollback on mismatch) to cut tool round-trips.
 
 ### 3.2 Policy-Gated Shell & Targeted Test Execution (`allyh-tools`, `allyh-core`, `allyh-tui`)
-- [ ] **Add `run_command` ACI tool with Command Approval Gate:**
-  - [ ] Read-only / allowlisted commands (configurable per `repo_profile`) run automatically with strict timeout and `HarnessSpec` head/tail output truncation.
-  - [ ] Mutating or network-touching commands pause for explicit TUI approval (`[Allow Once]` / `[Allow Pattern]` / `[Deny]`), matching the Plan Approval Gate UX.
-- [ ] **Targeted test execution in `run_verification`:** Support running a single test name, file, or module filter across `cargo test`, `pytest`, `vitest`/`jest`, and `go test`.
+- [x] **Add `run_command` ACI tool with Command Approval Gate:**
+  - [x] Read-only / allowlisted commands run automatically with strict timeout and head/tail output truncation.
+  - [x] Mutating or network-touching commands pause for explicit TUI approval (`[Allow Once]` / `[Allow Pattern]` / `[Deny]`), matching the Plan Approval Gate UX.
+- [x] **Targeted test execution in `run_verification`:** Support running a single test name, file, or module filter (`test_filter`) across `cargo test`, `pytest`, `vitest`/`jest`, and `go test`.
 
 ### 3.3 Atomic Plan Checkpoints & Instant Rollback (`allyh-env`, `allyh-core`, `allyh-tui`)
-- [ ] **Out-of-tree snapshot checkpoints via `git2`:** Automatically capture a lightweight pre-execution checkpoint (tree/stash ref or out-of-tree patch bundle) whenever a plan transitions `PlanApproval → Execution`.
-- [ ] **Interactive Diff & Rollback (`/diff`, `/rollback`):** View all changes made during the current task/plan with `syntect` highlighting and restore cleanly to the pre-plan checkpoint in one command.
+- [x] **Out-of-tree snapshot checkpoints (`PlanCheckpoint`):** Automatically capture a lightweight pre-execution checkpoint (zero dotfiles/branches written into the target repo) whenever a plan transitions `PlanApproval → Execution`.
+- [x] **Interactive Diff & Rollback (`/diff`, `/rollback`):** View all changes made during the current task/plan with `syntect` highlighting and restore cleanly to the pre-plan checkpoint in one command.
 
 ### Milestone 3 Acceptance Criteria
-- [ ] Unit + integration tests verifying `search_code` hybrid ranking, atomic multi-hunk rollback on partial mismatch, Command Approval Gate refusal when unapproved, and clean file restoration via `/rollback`.
+- [x] Unit + integration tests verifying `search_code` hybrid ranking, `git_inspect` (`status`/`log`/`diff`/`blame`), atomic multi-hunk rollback on partial mismatch, Command Approval Gate refusal/allowlist, and clean file restoration via `/rollback`.
 
 ---
 

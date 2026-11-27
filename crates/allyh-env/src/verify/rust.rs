@@ -62,6 +62,11 @@ impl VerificationAdapter for RustVerificationAdapter {
             args.push("-p".into());
             args.push(pkg.trim().to_string());
         }
+        if target.kind == VerificationKind::Test
+            && let Some(filter) = target.test_filter.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        {
+            args.push(filter.to_string());
+        }
 
         let cargo_bin = std::env::var_os("CARGO")
             .filter(|v| !v.is_empty())

@@ -12,6 +12,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::ToolError;
 
+/// Single search-and-replace hunk inside an atomic multi-hunk [`EditByHashArgs`] edit.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct EditHunk {
+    /// Exact verbatim substring to match inside the file.
+    pub target_snippet: String,
+    /// Replacement text for `target_snippet`.
+    pub replacement_snippet: String,
+}
+
 /// Arguments for [`EditByHashTool`].
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct EditByHashArgs {
@@ -23,6 +32,9 @@ pub struct EditByHashArgs {
     pub target_snippet: Option<String>,
     /// Replacement text for `target_snippet`.
     pub replacement_snippet: Option<String>,
+    /// Optional batch of sequential hunks applied atomically (all-or-nothing rollback if any hunk fails to match).
+    #[serde(default)]
+    pub hunks: Option<Vec<EditHunk>>,
     /// Full replacement file contents (used when creating a file or replacing the entire file).
     pub full_content: Option<String>,
     /// Allow creating a new file when it does not exist yet.
@@ -110,32 +122,27 @@ impl EditByHashTool {
 
         let updated_content = if let Some(full) = args.full_content {
             full
+        } else if let Some(hunks) = args.hunks.as_deref().filter(|h| !h.is_empty()) {
+            // Atomic multi-hunk staging: every hunk must match cleanly before writing a single byte.
+            let mut staged = previous_content.clone();
+            for (idx, hunk) in hunks.iter().enumerate() {
+                staged = apply_single_hunk(
+                    &staged,
+                    &hunk.target_snippet,
+                    &hunk.replacement_snippet,
+                    &rel_path,
+                    Some(idx + 1),
+                )?;
+            }
+            staged
         } else if let (Some(target), Some(replacement)) = (
             args.target_snippet.as_deref(),
             args.replacement_snippet.as_deref(),
         ) {
-            if previous_content.contains(target) {
-                previous_content.replacen(target, replacement, 1)
-            } else if previous_content.contains("\r\n") {
-                // Preserve Windows CRLF files when models emit LF-only snippets from `inspect_symbol`.
-                let crlf_target = to_crlf(target);
-                if !previous_content.contains(&crlf_target) {
-                    return Err(ToolError::EditTargetNotFound {
-                        file_path: rel_path,
-                        reason: "target_snippet was not found verbatim in file".to_string(),
-                    });
-                }
-                let crlf_replacement = to_crlf(replacement);
-                previous_content.replacen(&crlf_target, &crlf_replacement, 1)
-            } else {
-                return Err(ToolError::EditTargetNotFound {
-                    file_path: rel_path,
-                    reason: "target_snippet was not found verbatim in file".to_string(),
-                });
-            }
+            apply_single_hunk(&previous_content, target, replacement, &rel_path, None)?
         } else {
             return Err(ToolError::InvalidArgs(
-                "provide either full_content or both target_snippet and replacement_snippet"
+                "provide full_content, non-empty hunks, or both target_snippet and replacement_snippet"
                     .to_string(),
             ));
         };
@@ -178,6 +185,7 @@ impl EditByHashTool {
                 let target = VerificationTarget {
                     kind: VerificationKind::Check,
                     target_scope: args.target_scope.clone(),
+                    test_filter: None,
                     affected_file: Some(rel_path.clone()),
                     toolchain_override: args.toolchain.clone(),
                 };
@@ -246,6 +254,33 @@ impl Tool for EditByHashTool {
     ) -> Result<Self::Output, Self::Error> {
         self.execute(args).await
     }
+}
+
+fn apply_single_hunk(
+    content: &str,
+    target: &str,
+    replacement: &str,
+    rel_path: &str,
+    hunk_index: Option<usize>,
+) -> Result<String, ToolError> {
+    if content.contains(target) {
+        return Ok(content.replacen(target, replacement, 1));
+    }
+    if content.contains("\r\n") {
+        let crlf_target = to_crlf(target);
+        if content.contains(&crlf_target) {
+            let crlf_replacement = to_crlf(replacement);
+            return Ok(content.replacen(&crlf_target, &crlf_replacement, 1));
+        }
+    }
+    let reason = match hunk_index {
+        Some(idx) => format!("hunk #{idx} target_snippet was not found verbatim in file (atomic rollback)"),
+        None => "target_snippet was not found verbatim in file".to_string(),
+    };
+    Err(ToolError::EditTargetNotFound {
+        file_path: rel_path.to_string(),
+        reason,
+    })
 }
 
 fn to_crlf(text: &str) -> String {

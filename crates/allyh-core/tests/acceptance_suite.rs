@@ -587,6 +587,7 @@ async fn polyglot_monorepo_acceptance_suite() {
             expected_sha256: Some(hash),
             target_snippet: Some("'ok'".into()),
             replacement_snippet: Some("'healthy'".into()),
+            hunks: None,
             full_content: None,
             create_if_missing: None,
             target_scope: None,
@@ -607,6 +608,7 @@ async fn polyglot_monorepo_acceptance_suite() {
         .execute(RunVerificationArgs {
             kind: Some("test".into()),
             target: None,
+            test_filter: None,
             toolchain: None,
             affected_file: Some("web/src/client.ts".into()),
             task_id: Some(task_id.clone()),
@@ -646,5 +648,93 @@ async fn polyglot_monorepo_acceptance_suite() {
         output_json: serde_json::json!({ "verification": { "success": true } }),
     }]);
     assert_eq!(interlock.check_completion("Done"), InterlockDecision::Allow);
+}
+
+#[tokio::test]
+async fn test_atomic_plan_checkpoint_diff_and_rollback() {
+    use allyh_tools::{EditByHashArgs, InspectSymbolArgs};
+
+    let tmp = TempDir::new().expect("tempdir");
+    let db_dir = tmp.path().join("db");
+    let repo_dir = tmp.path().join("repo");
+    std::fs::create_dir_all(repo_dir.join("src")).unwrap();
+    let lib_path = repo_dir.join("src/lib.rs");
+    let orig_code = "pub fn answer() -> i32 { 42 }\n";
+    std::fs::write(&lib_path, orig_code).unwrap();
+
+    let mut orch = AllyHOrchestrator::initialize(
+        make_config(&repo_dir, &db_dir, "default"),
+        offline_router(),
+        None,
+    )
+    .await
+    .expect("init");
+
+    // Approving a plan automatically captures an out-of-tree checkpoint.
+    orch.propose_plan(AllyHOrchestrator::build_quick_plan("Refactor answer"));
+    orch.approve_plan().await.expect("approve");
+    let snap = orch.inspector_snapshot().await.expect("snap");
+    assert_eq!(snap.active_checkpoint_label.as_deref(), Some("Refactor answer"));
+
+    // Modify existing file AND create a new file.
+    let inspected = orch
+        .toolset()
+        .inspect_tool()
+        .execute(InspectSymbolArgs {
+            query: "src/lib.rs".into(),
+            hops: Some(1),
+            start_line: None,
+            end_line: None,
+        })
+        .await
+        .expect("inspect");
+    orch.toolset()
+        .edit_tool()
+        .execute(EditByHashArgs {
+            file_path: "src/lib.rs".into(),
+            expected_sha256: Some(inspected.matched_files[0].sha256_hash.clone()),
+            target_snippet: Some("42".into()),
+            replacement_snippet: Some("99".into()),
+            hunks: None,
+            full_content: None,
+            create_if_missing: None,
+            target_scope: None,
+            toolchain: None,
+        })
+        .await
+        .expect("edit existing");
+    orch.toolset()
+        .edit_tool()
+        .execute(EditByHashArgs {
+            file_path: "src/extra.rs".into(),
+            expected_sha256: None,
+            target_snippet: None,
+            replacement_snippet: None,
+            hunks: None,
+            full_content: Some("pub fn extra() {}\n".into()),
+            create_if_missing: Some(true),
+            target_scope: None,
+            toolchain: None,
+        })
+        .await
+        .expect("create extra");
+
+    let diff = orch.checkpoint_diff().expect("checkpoint diff");
+    assert!(diff.has_changes());
+    assert_eq!(diff.modified_files, vec!["src/lib.rs"]);
+    assert_eq!(diff.created_files, vec!["src/extra.rs"]);
+    assert!(diff.unified_diff.contains("+pub fn answer() -> i32 { 99 }"));
+
+    // Rollback restores modified file byte-for-byte AND removes newly created file.
+    let rollback = orch
+        .rollback_checkpoint()
+        .await
+        .expect("rollback")
+        .expect("rollback report");
+    assert_eq!(rollback.restored_files, vec!["src/lib.rs"]);
+    assert_eq!(rollback.removed_files, vec!["src/extra.rs"]);
+    assert_eq!(std::fs::read_to_string(&lib_path).unwrap(), orig_code);
+    assert!(!repo_dir.join("src/extra.rs").exists());
+    assert!(!orch.checkpoint_diff().unwrap().has_changes());
 }
 
