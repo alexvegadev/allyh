@@ -7,6 +7,7 @@ pub mod error;
 pub mod gate;
 pub mod harness;
 pub mod interlock;
+pub mod mcp_server;
 pub mod orchestrator;
 pub mod preamble;
 pub mod router;
@@ -22,6 +23,7 @@ pub use harness::{
     PreamblePolicy, RetrievalPolicy, ToolPolicy,
 };
 pub use interlock::{CompletionInterlock, InterlockDecision};
+pub use mcp_server::{AllyHMcpServer, McpServerLaunchConfig};
 pub use orchestrator::{
     AllyHOrchestrator, InspectorSnapshot, OrchestratorConfig, TurnOutcome, UiEvent, UserCommand,
 };

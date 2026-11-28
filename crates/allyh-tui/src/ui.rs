@@ -286,6 +286,12 @@ fn render_inspector(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     if let Some(ref cp_label) = snapshot.active_checkpoint_label {
         workspace.push(field("Checkpt", cp_label.as_str()));
     }
+    if snapshot.mcp_servers_count > 0 {
+        workspace.push(field(
+            "MCP",
+            format!("{} connected", snapshot.mcp_servers_count),
+        ));
+    }
     if !snapshot.out_of_band_edits.is_empty() {
         workspace.insert(
             3,

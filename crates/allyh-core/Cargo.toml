@@ -26,3 +26,7 @@ allyh-tools.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 git2.workspace = true
+
+[[test]]
+name = "mcp_roundtrip"
+harness = false

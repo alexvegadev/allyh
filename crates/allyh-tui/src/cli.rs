@@ -39,6 +39,10 @@ pub struct CliArgs {
     /// Disable automatic post-edit project check/type-check verification.
     #[arg(long, default_value_t = false)]
     pub no_auto_check: bool,
+
+    /// Attach an external MCP server for this session (`name=http://...` or `name=cmd arg1 ...`; repeatable).
+    #[arg(long = "mcp-server", value_name = "NAME=SPEC")]
+    pub mcp_servers: Vec<String>,
 }
 
 /// Top-level CLI subcommands.
@@ -54,6 +58,51 @@ pub enum CliCommand {
     Config(ConfigArgs),
     /// Inspect Language Server Protocol (LSP) semantic bridge availability.
     Lsp(LspArgs),
+    /// Run AllyH as an MCP server or manage external MCP server connections.
+    Mcp(McpArgs),
+}
+
+/// Options for `allyh mcp`.
+#[derive(Debug, Clone, Args)]
+pub struct McpArgs {
+    #[command(subcommand)]
+    pub action: McpCommand,
+}
+
+/// Subcommands under `allyh mcp`.
+#[derive(Debug, Clone, Subcommand)]
+pub enum McpCommand {
+    /// Run AllyH as a stdio JSON-RPC 2.0 MCP server exposing memory, RepoGraph, skills, and SIM.
+    Serve,
+    /// Show configured out-of-tree MCP servers stored in LanceDB for this repository.
+    Status {
+        /// Output machine-readable JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Register an external MCP server (stdio or Streamable HTTP/SSE) in LanceDB for this repository.
+    Add {
+        /// Short identifier for the MCP server (tools are exposed as `mcp__<name>__<tool>`).
+        name: String,
+        /// Streamable HTTP / SSE endpoint URL (mutually exclusive with `--command`).
+        #[arg(long, conflicts_with = "command")]
+        url: Option<String>,
+        /// Executable command for stdio transport (mutually exclusive with `--url`).
+        #[arg(long, conflicts_with = "url")]
+        command: Option<String>,
+        /// Arguments passed to `--command` (repeatable).
+        #[arg(long = "arg")]
+        args: Vec<String>,
+        /// Optional HTTP headers (`Key: Value`, repeatable, for `--url`).
+        #[arg(long = "header")]
+        header: Vec<String>,
+    },
+    /// Remove a registered MCP server from LanceDB for this repository.
+    #[command(visible_aliases = ["rm", "delete"])]
+    Remove {
+        /// Server identifier to remove.
+        name: String,
+    },
 }
 
 /// Options for `allyh lsp`.
@@ -647,6 +696,101 @@ mod tests {
             Some(CliCommand::Lsp(LspArgs {
                 action: LspCommand::Status { json: true }
             }))
+        ));
+    }
+
+    #[test]
+    fn parses_mcp_subcommands_and_session_flags() {
+        let tui_with_mcp = CliArgs::try_parse_from([
+            "allyh",
+            "--mcp-server",
+            "docs=https://mcp.example.com/rpc",
+            "--mcp-server",
+            "local_fs=npx -y @modelcontextprotocol/server-filesystem .",
+        ])
+        .expect("parse --mcp-server flags");
+        assert_eq!(tui_with_mcp.mcp_servers.len(), 2);
+
+        let serve = CliArgs::try_parse_from(["allyh", "mcp", "serve", "--scope", "team-a"])
+            .expect("parse mcp serve");
+        assert_eq!(serve.scope, "team-a");
+        assert!(matches!(
+            serve.command,
+            Some(CliCommand::Mcp(McpArgs {
+                action: McpCommand::Serve
+            }))
+        ));
+
+        let status = CliArgs::try_parse_from(["allyh", "mcp", "status", "--json"])
+            .expect("parse mcp status");
+        assert!(matches!(
+            status.command,
+            Some(CliCommand::Mcp(McpArgs {
+                action: McpCommand::Status { json: true }
+            }))
+        ));
+
+        let add = CliArgs::try_parse_from([
+            "allyh",
+            "mcp",
+            "add",
+            "github",
+            "--url",
+            "https://api.githubcopilot.com/mcp/",
+            "--header",
+            "Authorization: Bearer tok",
+        ])
+        .expect("parse mcp add url");
+        assert!(matches!(
+            add.command,
+            Some(CliCommand::Mcp(McpArgs {
+                action: McpCommand::Add {
+                    ref name,
+                    url: Some(ref u),
+                    command: None,
+                    ref header,
+                    ..
+                }
+            })) if name == "github"
+                && u == "https://api.githubcopilot.com/mcp/"
+                && header == &vec!["Authorization: Bearer tok".to_string()]
+        ));
+
+        let add_stdio = CliArgs::try_parse_from([
+            "allyh",
+            "mcp",
+            "add",
+            "allyh-peer",
+            "--command",
+            "allyh",
+            "--arg",
+            "mcp",
+            "--arg",
+            "serve",
+        ])
+        .expect("parse mcp add stdio");
+        assert!(matches!(
+            add_stdio.command,
+            Some(CliCommand::Mcp(McpArgs {
+                action: McpCommand::Add {
+                    ref name,
+                    url: None,
+                    command: Some(ref cmd),
+                    ref args,
+                    ..
+                }
+            })) if name == "allyh-peer"
+                && cmd == "allyh"
+                && args == &vec!["mcp".to_string(), "serve".to_string()]
+        ));
+
+        let remove =
+            CliArgs::try_parse_from(["allyh", "mcp", "rm", "github"]).expect("parse mcp rm");
+        assert!(matches!(
+            remove.command,
+            Some(CliCommand::Mcp(McpArgs {
+                action: McpCommand::Remove { ref name }
+            })) if name == "github"
         ));
     }
 }

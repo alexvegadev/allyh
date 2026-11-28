@@ -398,6 +398,7 @@ impl AllyHRuntimeEvaluator {
             auto_verify: harness.tools.auto_verify,
             idle_optimize_interval: Duration::from_secs(3600),
             enable_fs_watcher: false,
+            extra_mcp_servers: Vec::new(),
         };
         let router = HybridRouter::new(
             policy.clone(),

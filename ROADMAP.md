@@ -102,25 +102,25 @@ This roadmap defines the highest-leverage capabilities to evolve AllyH from a **
 
 ---
 
-## Milestone 4: Dual-Mode MCP (Client & Server) (`v0.6.0`)
+## Milestone 4: Dual-Mode MCP (Client & Server) (`v0.6.0`) — Completed
 
 **Goal:** Make AllyH both an extensible agent host (MCP Client) and a reusable coherence/memory backend for the wider AI coding ecosystem (MCP Server).
 
 ### 4.1 AllyH as an MCP Client (`allyh-tools`, `allyh-core`, `allyh-memory`)
-- [ ] **MCP transport & client manager (`crates/allyh-tools/src/mcp_client.rs`):** Support `stdio` and Streamable HTTP / SSE MCP servers, configured out-of-tree in LanceDB (`repo_profiles`) or via CLI flags.
-- [ ] **Control Gate enforcement on MCP tools:** Map MCP `ToolAnnotations` (`readOnlyHint`, `destructiveHint`) directly onto AllyH's `ControlGate` and `CompletionInterlock` so external write tools remain locked until plan approval.
-- [ ] **Tool Cards & `/mcp` TUI controls:** Render external MCP tool calls as collapsible Tool Cards and inspect connected servers/tools via `/mcp`.
+- [x] **MCP transport & client manager (`crates/allyh-tools/src/mcp_client.rs`):** Support `stdio` and Streamable HTTP / SSE MCP servers, configured out-of-tree in LanceDB (`repo_profiles`) or via CLI flags.
+- [x] **Control Gate enforcement on MCP tools:** Map MCP `ToolAnnotations` (`readOnlyHint`, `destructiveHint`) directly onto AllyH's `ControlGate` and `CompletionInterlock` so external write tools remain locked until plan approval.
+- [x] **Tool Cards & `/mcp` TUI controls:** Render external MCP tool calls as collapsible Tool Cards and inspect connected servers/tools via `/mcp`.
 
 ### 4.2 AllyH as an MCP Server (`allyh mcp serve`) (`allyh-tui`, `allyh-core`)
-- [ ] **Add `allyh mcp serve` CLI subcommand (`crates/allyh-tui/src/cli.rs`):** Expose AllyH's core capabilities over stdio MCP for external editors/agents (VS Code, Cursor, Claude Code, Antigravity, Zed):
-  - [ ] Memory tools: `query_invariants`, `record_decision`, `invalidate_decision`, `pin_decision`
-  - [ ] RepoGraph tools: `inspect_symbol`, `get_ego_graph`, `get_env_delta`
-  - [ ] Skills tools: `list_skills`, `get_skill`, `add_skill`
-  - [ ] SIM / Task tools: `list_tasks`, `inspect_sim`
-- [ ] **Respect `(repo_id, scope_id)` & bi-temporal conflict gates:** External clients writing architectural decisions go through the exact same LanceDB conflict gate and sleep-time consolidation pipeline.
+- [x] **Add `allyh mcp serve` CLI subcommand (`crates/allyh-tui/src/cli.rs`):** Expose AllyH's core capabilities over stdio MCP for external editors/agents (VS Code, Cursor, Claude Code, Antigravity, Zed):
+  - [x] Memory tools: `query_invariants`, `record_decision`, `invalidate_decision`, `pin_decision`
+  - [x] RepoGraph tools: `inspect_symbol`, `get_ego_graph`, `get_env_delta`
+  - [x] Skills tools: `list_skills`, `get_skill`, `add_skill`
+  - [x] SIM / Task tools: `list_tasks`, `inspect_sim`
+- [x] **Respect `(repo_id, scope_id)` & bi-temporal conflict gates:** External clients writing architectural decisions go through the exact same LanceDB conflict gate and sleep-time consolidation pipeline.
 
 ### Milestone 4 Acceptance Criteria
-- [ ] End-to-end MCP client/server round-trip tests proving an external MCP client can query bi-temporal invariants, retrieve polyglot RepoGraph ego-graphs, and trigger conflict-checked decision writes against AllyH's LanceDB store.
+- [x] End-to-end MCP client/server round-trip tests proving an external MCP client can query bi-temporal invariants, retrieve polyglot RepoGraph ego-graphs, and trigger conflict-checked decision writes against AllyH's LanceDB store.
 
 ---
 

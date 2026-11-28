@@ -189,10 +189,42 @@ fn default_unknown_language() -> String {
     "unknown".to_string()
 }
 
+/// Transport specification for an out-of-tree external MCP server stored in [`RepoProfile`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "transport", rename_all = "snake_case")]
+pub enum McpServerTransport {
+    Stdio {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        env: Vec<(String, String)>,
+    },
+    Http {
+        url: String,
+        #[serde(default)]
+        headers: Vec<(String, String)>,
+    },
+}
+
+/// Out-of-tree MCP server registration stored inside [`RepoProfile`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpServerConfig {
+    pub name: String,
+    #[serde(flatten)]
+    pub transport: McpServerTransport,
+    #[serde(default = "default_mcp_enabled")]
+    pub enabled: bool,
+}
+
+fn default_mcp_enabled() -> bool {
+    true
+}
+
 /// Out-of-tree per-repository polyglot configuration stored in `repo_profiles`.
 ///
-/// Allows overriding detected languages, check/lint/test commands, ignore globs, and auto-verify
-/// behavior without writing dotfiles into the target repository.
+/// Allows overriding detected languages, check/lint/test commands, ignore globs, MCP servers,
+/// and auto-verify behavior without writing dotfiles into the target repository.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RepoProfile {
     pub id: String,
@@ -210,6 +242,8 @@ pub struct RepoProfile {
     pub extra_ignore_globs: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_verify_override: Option<bool>,
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerConfig>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -228,6 +262,7 @@ impl RepoProfile {
             test_command: None,
             extra_ignore_globs: Vec::new(),
             auto_verify_override: None,
+            mcp_servers: Vec::new(),
             updated_at: Utc::now(),
         }
     }
@@ -239,6 +274,7 @@ impl RepoProfile {
             && self.test_command.is_none()
             && self.extra_ignore_globs.is_empty()
             && self.auto_verify_override.is_none()
+            && self.mcp_servers.is_empty()
     }
 }
 
@@ -509,6 +545,7 @@ pub fn repo_profiles_schema() -> SchemaRef {
         Field::new("test_command", DataType::Utf8, true),
         Field::new("extra_ignore_globs", string_list_type(), false),
         Field::new("auto_verify_override", DataType::Boolean, true),
+        Field::new("mcp_servers_json", DataType::Utf8, false),
         Field::new("updated_at", timestamp_utc(), false),
     ]))
 }
@@ -1051,6 +1088,11 @@ pub fn repo_profiles_to_batch(records: &[RepoProfile]) -> Result<RecordBatch> {
         .collect();
     let extra_ignore_globs = build_string_list_array(&ignores_vec);
     let auto_verify = BooleanArray::from_iter(records.iter().map(|r| r.auto_verify_override));
+    let mcp_json_vec: Vec<String> = records
+        .iter()
+        .map(|r| serde_json::to_string(&r.mcp_servers).unwrap_or_else(|_| "[]".to_string()))
+        .collect();
+    let mcp_servers_json = StringArray::from_iter_values(mcp_json_vec.iter().map(String::as_str));
     let updated_at = TimestampMicrosecondArray::from_iter_values(
         records.iter().map(|r| r.updated_at.timestamp_micros()),
     )
@@ -1068,6 +1110,7 @@ pub fn repo_profiles_to_batch(records: &[RepoProfile]) -> Result<RecordBatch> {
             Arc::new(test_cmds),
             Arc::new(extra_ignore_globs),
             Arc::new(auto_verify),
+            Arc::new(mcp_servers_json),
             Arc::new(updated_at),
         ],
     )?)
@@ -1083,10 +1126,17 @@ pub fn batch_to_repo_profiles(batch: &RecordBatch) -> Result<Vec<RepoProfile>> {
     let test_cmds = col_str(batch, "test_command")?;
     let extra_ignore_globs = col_list(batch, "extra_ignore_globs")?;
     let auto_verify = col_bool(batch, "auto_verify_override")?;
+    let mcp_col = batch
+        .column_by_name("mcp_servers_json")
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>());
     let updated_at = col_ts(batch, "updated_at")?;
 
     let mut out = Vec::with_capacity(batch.num_rows());
     for i in 0..batch.num_rows() {
+        let mcp_servers = mcp_col
+            .filter(|arr| !arr.is_null(i))
+            .and_then(|arr| serde_json::from_str::<Vec<McpServerConfig>>(arr.value(i)).ok())
+            .unwrap_or_default();
         out.push(RepoProfile {
             id: ids.value(i).to_string(),
             repo_id: repo_ids.value(i).to_string(),
@@ -1097,6 +1147,7 @@ pub fn batch_to_repo_profiles(batch: &RecordBatch) -> Result<Vec<RepoProfile>> {
             test_command: (!test_cmds.is_null(i)).then(|| test_cmds.value(i).to_string()),
             extra_ignore_globs: read_string_list(extra_ignore_globs, i),
             auto_verify_override: (!auto_verify.is_null(i)).then(|| auto_verify.value(i)),
+            mcp_servers,
             updated_at: micros_to_utc(updated_at.value(i)),
         });
     }

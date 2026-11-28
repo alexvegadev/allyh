@@ -23,6 +23,7 @@ fn make_config(repo_dir: &std::path::Path, db_dir: &std::path::Path, scope_id: &
         auto_verify: false,
         idle_optimize_interval: Duration::from_secs(60),
         enable_fs_watcher: false,
+        extra_mcp_servers: Vec::new(),
     }
 }
 

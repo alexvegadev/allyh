@@ -3,6 +3,7 @@ mod cli;
 mod config_cli;
 mod highlight;
 mod lsp_cli;
+mod mcp_cli;
 mod sim_cli;
 mod skills_cli;
 mod theme;
@@ -119,6 +120,16 @@ async fn main() -> Result<()> {
                 .await
             }
             CliCommand::Lsp(lsp_args) => lsp_cli::run_cli(lsp_args, &args.repo).await,
+            CliCommand::Mcp(mcp_args) => {
+                mcp_cli::run_cli(
+                    mcp_args,
+                    &args.repo,
+                    args.db_uri.as_deref(),
+                    &args.scope,
+                    args.embedding_model.as_deref(),
+                )
+                .await
+            }
         };
     }
 
@@ -127,6 +138,11 @@ async fn main() -> Result<()> {
     cfg.auto_verify = !args.no_auto_check;
     if let Some(uri) = &args.db_uri {
         cfg.storage = StorageConfig::from_uri(uri.clone());
+    }
+    for spec in &args.mcp_servers {
+        let parsed = allyh_tools::parse_mcp_server_spec(spec)
+            .with_context(|| format!("invalid --mcp-server '{spec}'"))?;
+        cfg.extra_mcp_servers.push(parsed);
     }
 
     let mut router = HybridRouter::from_env();
@@ -380,6 +396,7 @@ mod tests {
             detected_toolchains: vec!["Rust (cargo)".into()],
             active_lsp_servers: Vec::new(),
             active_checkpoint_label: None,
+            mcp_servers_count: 0,
             build_status: "cargo check: PASS (0 warnings)".into(),
             gate_state,
             active_tasks: Vec::new(),
@@ -520,7 +537,7 @@ mod tests {
         let mut app = AppState::new(sample_snapshot(ControlGateState::Discovery), "demo".into());
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         app.input.insert_str("/m");
-        assert_eq!(app.command_matches().len(), 2);
+        assert_eq!(app.command_matches().len(), 3);
         press(&mut app, &tx, KeyCode::Down);
         press(&mut app, &tx, KeyCode::Tab);
         assert_eq!(app.input.lines(), &["/memories"]);
@@ -936,5 +953,51 @@ mod tests {
             rx.try_recv(),
             Ok(UserCommand::AllowCommandPattern(ref pat)) if pat == "cargo publish"
         ));
+    }
+
+    #[test]
+    fn test_mcp_slash_commands_and_inspector_display() {
+        use allyh_core::UiEvent;
+        use allyh_memory::McpServerTransport;
+        use allyh_tools::McpServerStatus;
+
+        let mut snap = sample_snapshot(ControlGateState::Discovery);
+        snap.mcp_servers_count = 2;
+        let mut app = AppState::new(snap, "allyh".into());
+
+        assert!(matches!(
+            app.parse_submission("/mcp"),
+            Some(UserCommand::RequestMcpStatus)
+        ));
+        assert!(matches!(
+            app.parse_submission("/mcp status"),
+            Some(UserCommand::RequestMcpStatus)
+        ));
+        assert!(matches!(
+            app.parse_submission("/mcp add docs https://mcp.example.com/rpc"),
+            Some(UserCommand::AddMcpServer(ref cfg))
+                if cfg.name == "docs"
+                && matches!(cfg.transport, McpServerTransport::Http { ref url, .. } if url == "https://mcp.example.com/rpc")
+        ));
+        assert!(matches!(
+            app.parse_submission("/mcp remove docs"),
+            Some(UserCommand::RemoveMcpServer(ref name)) if name == "docs"
+        ));
+
+        app.apply_ui_event(UiEvent::McpStatus(vec![McpServerStatus {
+            name: "docs".into(),
+            transport: "http".into(),
+            target: "https://mcp.example.com/rpc".into(),
+            connected: true,
+            tool_count: 2,
+            tools: vec!["mcp__docs__search".into(), "mcp__docs__fetch".into()],
+            last_error: None,
+        }]));
+
+        let highlighter = MarkdownHighlighter::new();
+        let rendered = screen(&mut app, &highlighter, 120, 36);
+        assert!(rendered.contains("2 connected"));
+        assert!(rendered.contains("External MCP Servers (1)"));
+        assert!(rendered.contains("mcp__docs__search"));
     }
 }

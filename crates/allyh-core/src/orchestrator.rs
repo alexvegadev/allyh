@@ -10,12 +10,12 @@ use allyh_env::{
 };
 use allyh_memory::{
     CandidateDecision, ConsolidationOutcome, DbStatusReport, DeterministicHashEmbedder,
-    EmbeddingProvider, HarnessVersionRecord, MemoryConsolidator, MemoryStore, RepoProfile,
-    ScoredDecision, SessionRecord, SimExportDocument, SimLedger, SimProblemEntry, SimRunRecord,
-    SkillRecord, SleepJob, SleepTimeWorkerHandle, StorageConfig, TaskRecord, WorkerStatus,
-    compute_repo_id,
+    EmbeddingProvider, HarnessVersionRecord, McpServerConfig, MemoryConsolidator, MemoryStore,
+    RepoProfile, ScoredDecision, SessionRecord, SimExportDocument, SimLedger, SimProblemEntry,
+    SimRunRecord, SkillRecord, SleepJob, SleepTimeWorkerHandle, StorageConfig, TaskRecord,
+    WorkerStatus, compute_repo_id,
 };
-use allyh_tools::{AciToolset, PendingCommandApproval, ToolExecutionRecord};
+use allyh_tools::{AciToolset, McpServerStatus, PendingCommandApproval, ToolExecutionRecord};
 use chrono::Utc;
 use rig_core::message::{Message, ToolResultContent, UserContent};
 use serde::{Deserialize, Serialize};
@@ -54,6 +54,8 @@ pub struct InspectorSnapshot {
     pub active_tasks: Vec<TaskRecord>,
     pub activated_memories: Vec<ScoredDecision>,
     pub skills_count: usize,
+    #[serde(default)]
+    pub mcp_servers_count: usize,
     pub active_harness_label: String,
     pub sim_problems_count: usize,
     pub sim_run_id: Option<String>,
@@ -101,6 +103,9 @@ pub enum UserCommand {
     ResetRepoProfile,
     RequestLspStatus,
     RestartLsp(Option<String>),
+    RequestMcpStatus,
+    AddMcpServer(McpServerConfig),
+    RemoveMcpServer(String),
     RequestCheckpointDiff,
     RollbackCheckpoint,
     ApproveCommandOnce(String),
@@ -154,6 +159,7 @@ pub enum UiEvent {
         detected_toolchains: Vec<String>,
     },
     LspStatus(Vec<LspServerStatus>),
+    McpStatus(Vec<McpServerStatus>),
     CheckpointDiff(Option<CheckpointDiffReport>),
     CommandApprovalRequested(PendingCommandApproval),
     SystemNotice(String),
@@ -179,6 +185,7 @@ pub struct OrchestratorConfig {
     pub auto_verify: bool,
     pub idle_optimize_interval: Duration,
     pub enable_fs_watcher: bool,
+    pub extra_mcp_servers: Vec<McpServerConfig>,
 }
 
 impl OrchestratorConfig {
@@ -190,6 +197,7 @@ impl OrchestratorConfig {
             auto_verify: true,
             idle_optimize_interval: Duration::from_secs(45),
             enable_fs_watcher: true,
+            extra_mcp_servers: Vec::new(),
         }
     }
 }
@@ -257,6 +265,19 @@ impl AllyHOrchestrator {
             writes_enabled,
             config.auto_verify,
         );
+
+        // Connect any out-of-tree LanceDB RepoProfile MCP servers + CLI-supplied MCP servers.
+        let mut mcp_configs = store
+            .get_repo_profile(&repo_id, &scope_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|p| p.mcp_servers)
+            .unwrap_or_default();
+        mcp_configs.extend(config.extra_mcp_servers);
+        if !mcp_configs.is_empty() {
+            toolset.mcp_clients().sync_configs(&mcp_configs).await;
+        }
 
         let judge = Arc::new(LocalLlmConflictJudge::new(router.clone()));
         let consolidator = MemoryConsolidator::new(store.clone(), judge);
@@ -681,6 +702,14 @@ impl AllyHOrchestrator {
             .list_skills(&self.repo_id, &self.scope_id)
             .await?
             .len();
+        let mcp_servers_count = self
+            .toolset
+            .mcp_clients()
+            .status()
+            .await
+            .into_iter()
+            .filter(|s| s.connected)
+            .count();
         let latest_sim = self
             .store
             .load_sim_ledger(&self.repo_id, &self.scope_id, "")
@@ -731,6 +760,7 @@ impl AllyHOrchestrator {
             active_tasks: tasks,
             activated_memories: memories,
             skills_count,
+            mcp_servers_count,
             active_harness_label: self.active_harness_label(),
             sim_problems_count,
             sim_run_id,
@@ -1479,6 +1509,66 @@ impl AllyHOrchestrator {
                             let _ = ui_tx.send(UiEvent::Error(err.to_string()));
                         }
                     },
+                    UserCommand::RequestMcpStatus => {
+                        let statuses = self.toolset.mcp_clients().status().await;
+                        let _ = ui_tx.send(UiEvent::McpStatus(statuses));
+                    }
+                    UserCommand::AddMcpServer(cfg) => {
+                        let mut profile = self
+                            .get_repo_profile()
+                            .await
+                            .ok()
+                            .flatten()
+                            .unwrap_or_else(|| RepoProfile::empty(&self.repo_id, &self.scope_id));
+                        profile
+                            .mcp_servers
+                            .retain(|s| !s.name.eq_ignore_ascii_case(&cfg.name));
+                        profile.mcp_servers.push(cfg.clone());
+                        let _ = self.store.upsert_repo_profile(&profile).await;
+
+                        match self.toolset.mcp_clients().connect_server(cfg).await {
+                            Ok(status) => {
+                                let _ = ui_tx.send(UiEvent::SystemNotice(format!(
+                                    "Connected MCP server `{}` ({}) — mounted {} tool(s).",
+                                    status.name, status.transport, status.tool_count
+                                )));
+                                if let Ok(snap) = self.inspector_snapshot().await {
+                                    let _ = ui_tx.send(UiEvent::InspectorUpdated(snap));
+                                }
+                            }
+                            Err(err) => {
+                                let _ = ui_tx.send(UiEvent::Error(format!(
+                                    "Saved MCP server config, but connection failed: {err}"
+                                )));
+                            }
+                        }
+                    }
+                    UserCommand::RemoveMcpServer(name) => {
+                        let removed_live = self.toolset.mcp_clients().disconnect_server(&name).await;
+                        let mut removed_profile = false;
+                        if let Ok(Some(mut profile)) = self.get_repo_profile().await {
+                            let before = profile.mcp_servers.len();
+                            profile
+                                .mcp_servers
+                                .retain(|s| !s.name.eq_ignore_ascii_case(&name));
+                            if profile.mcp_servers.len() != before {
+                                removed_profile = true;
+                                let _ = self.store.upsert_repo_profile(&profile).await;
+                            }
+                        }
+                        if removed_live || removed_profile {
+                            let _ = ui_tx.send(UiEvent::SystemNotice(format!(
+                                "Disconnected and removed MCP server `{name}`."
+                            )));
+                            if let Ok(snap) = self.inspector_snapshot().await {
+                                let _ = ui_tx.send(UiEvent::InspectorUpdated(snap));
+                            }
+                        } else {
+                            let _ = ui_tx.send(UiEvent::Error(format!(
+                                "MCP server '{name}' not found."
+                            )));
+                        }
+                    }
                     UserCommand::RequestCheckpointDiff => {
                         let diff = self.checkpoint_diff();
                         let _ = ui_tx.send(UiEvent::CheckpointDiff(diff));
@@ -1553,6 +1643,7 @@ impl AllyHOrchestrator {
                         }
                     }
                     UserCommand::Shutdown => {
+                        self.toolset.mcp_clients().shutdown_all().await;
                         self.env.shutdown_lsp().await;
                         self.sleep_worker.enqueue(SleepJob::Shutdown);
                         break;

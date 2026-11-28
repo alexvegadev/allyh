@@ -18,6 +18,9 @@ pub enum CoreError {
     #[error("JSON serialization error: {0}")]
     Json(#[from] serde_json::Error),
 
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
     #[error("Invalid model specification '{0}'")]
     InvalidModelSpec(String),
 

@@ -492,6 +492,7 @@ async fn five_step_sim_and_crsi_acceptance_suite() {
         auto_verify: false,
         idle_optimize_interval: Duration::from_secs(60),
         enable_fs_watcher: false,
+        extra_mcp_servers: Vec::new(),
     };
     let router = HybridRouter::new(
         ModelProfile::offline_mock("different-model-v3"),

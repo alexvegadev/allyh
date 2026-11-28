@@ -136,6 +136,19 @@ impl MemoryStore {
                 .create_empty_table(TABLE_REPO_PROFILES, repo_profiles_schema())
                 .execute()
                 .await?;
+        } else if let Ok(table) = self.open_table(TABLE_REPO_PROFILES).await
+            && let Ok(schema) = table.schema().await
+            && schema.field_with_name("mcp_servers_json").is_err()
+        {
+            let _ = table
+                .add_columns(
+                    NewColumnTransform::SqlExpressions(vec![(
+                        "mcp_servers_json".to_string(),
+                        "'[]'".to_string(),
+                    )]),
+                    None,
+                )
+                .await;
         }
         if !existing.iter().any(|n| n == TABLE_HARNESS_VERSIONS) {
             self.connection

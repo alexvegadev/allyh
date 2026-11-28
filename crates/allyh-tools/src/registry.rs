@@ -13,6 +13,7 @@ use crate::edit::{EditByHashArgs, EditByHashTool};
 use crate::error::ToolError;
 use crate::git::{GitInspectArgs, GitInspectTool};
 use crate::inspect::{InspectSymbolArgs, InspectSymbolTool};
+use crate::mcp_client::McpClientManager;
 use crate::search::{SearchCodeArgs, SearchCodeTool};
 use crate::sim::{InspectSimArgs, InspectSimTool};
 use crate::skill::{AddSkillArgs, AddSkillTool, GetSkillArgs, GetSkillTool};
@@ -43,6 +44,7 @@ pub struct AciToolset {
     skill: AddSkillTool,
     get_skill: GetSkillTool,
     inspect_sim: InspectSimTool,
+    mcp_clients: McpClientManager,
     writes_enabled: Arc<AtomicBool>,
 }
 
@@ -65,8 +67,13 @@ impl AciToolset {
             skill: AddSkillTool::new(Arc::clone(&env), store.clone()),
             get_skill: GetSkillTool::new(Arc::clone(&env), store.clone()),
             inspect_sim: InspectSimTool::new(env, store),
+            mcp_clients: McpClientManager::new(),
             writes_enabled,
         }
+    }
+
+    pub fn mcp_clients(&self) -> &McpClientManager {
+        &self.mcp_clients
     }
 
     pub fn set_writes_enabled(&self, enabled: bool) {
@@ -189,6 +196,12 @@ impl AciToolset {
             )
             .with_annotations(self.inspect_sim.annotations()),
         );
+        // Append dynamically discovered external MCP tools (with readOnly/destructive annotations).
+        for remote in self.mcp_clients.list_tools() {
+            if let Some(def) = remote.to_rig_definition() {
+                defs.push(def);
+            }
+        }
         defs
     }
 
@@ -579,6 +592,32 @@ impl AciToolset {
                     ToolError::InvalidArgs(err.to_string()),
                 ),
             },
+            other if other.starts_with("mcp__") => {
+                match self
+                    .mcp_clients
+                    .call_tool(other, args, self.writes_enabled())
+                    .await
+                {
+                    Ok((tool, raw_json, rendered, succeeded)) => {
+                        let status = if succeeded { "OK" } else { "ERROR" };
+                        let header = format!(
+                            "mcp:{}:{} -> {status}",
+                            tool.server_name, tool.remote_name
+                        );
+                        (
+                            ToolExecutionRecord {
+                                tool_name: other.to_string(),
+                                compact_header: header,
+                                succeeded,
+                                output_text: rendered.clone(),
+                                output_json: raw_json,
+                            },
+                            ToolOutput::text(rendered),
+                        )
+                    }
+                    Err(err) => failed_record(other, other, err),
+                }
+            }
             other => failed_record(other, other, ToolError::UnknownTool(other.to_string())),
         }
     }

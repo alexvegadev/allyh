@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use allyh_core::{AllyHOrchestrator, ControlGateState, InspectorSnapshot, UiEvent, UserCommand};
 use allyh_memory::{RepoProfile, WorkerStatus, load_skill_markdown_file};
-use allyh_tools::{PendingCommandApproval, ToolExecutionRecord};
+use allyh_tools::{PendingCommandApproval, ToolExecutionRecord, parse_mcp_server_spec};
 use crossterm::event::KeyCode;
 use ratatui::style::Style;
 use tui_textarea::TextArea;
@@ -26,6 +26,7 @@ pub const COMMANDS: &[SlashCommand] = &[
     SlashCommand::new("/db-status", "", "Inspect storage and table counts"),
     SlashCommand::new("/config", "[cmd]", "Inspect or override polyglot verification config"),
     SlashCommand::new("/lsp", "[cmd]", "Show LSP bridge status or restart servers"),
+    SlashCommand::new("/mcp", "[cmd]", "Inspect or manage external MCP servers"),
     SlashCommand::new("/diff", "", "Show unified diff since pre-plan checkpoint"),
     SlashCommand::new("/rollback", "", "Restore workspace to pre-plan checkpoint"),
     SlashCommand::new("/compact", "", "Compact conversation history"),
@@ -316,6 +317,7 @@ impl AppState {
                 "db-status" => Some(UserCommand::RequestDbStatus),
                 "config" => self.parse_config_command(arg),
                 "lsp" => self.parse_lsp_command(arg),
+                "mcp" => self.parse_mcp_command(arg),
                 "diff" => Some(UserCommand::RequestCheckpointDiff),
                 "rollback" => Some(UserCommand::RollbackCheckpoint),
                 "compact" => Some(UserCommand::CompactNow),
@@ -761,6 +763,52 @@ impl AppState {
             UiEvent::CommandApprovalRequested(req) => {
                 self.pending_command_approval = Some(req);
             }
+            UiEvent::McpStatus(statuses) => {
+                if statuses.is_empty() {
+                    self.entries.push(ChatEntry::System(
+                        "### External MCP Servers\n\
+                         No MCP servers connected for this repository partition.\n\
+                         _Use `/mcp add <name> <http-url-or-command>` or `allyh mcp add` to mount external tools._"
+                            .to_string(),
+                    ));
+                } else {
+                    let rows = statuses
+                        .iter()
+                        .map(|s| {
+                            let state = if s.connected { "connected" } else { "disconnected" };
+                            let err_note = s
+                                .last_error
+                                .as_deref()
+                                .map(|e| format!(" — error: {e}"))
+                                .unwrap_or_default();
+                            let tools_preview = if s.tools.is_empty() {
+                                "0 tools".to_string()
+                            } else {
+                                format!(
+                                    "{} tool(s): {}",
+                                    s.tool_count,
+                                    s.tools
+                                        .iter()
+                                        .take(5)
+                                        .cloned()
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                )
+                            };
+                            format!(
+                                "- `{}` (`{}`) [{state}] — `{}` ({tools_preview}){err_note}",
+                                s.name, s.transport, s.target
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    self.entries.push(ChatEntry::System(format!(
+                        "### External MCP Servers ({})\n{rows}\n\n\
+                         _Use `/mcp add <name> <url-or-cmd>` or `/mcp remove <name>`. Mutating MCP tools are enforced by the Control Gate._",
+                        statuses.len()
+                    )));
+                }
+            }
             UiEvent::SystemNotice(msg) => {
                 self.entries.push(ChatEntry::System(msg));
             }
@@ -1038,6 +1086,65 @@ impl AppState {
                     "### LSP Commands\n\
                      - `/lsp` or `/lsp status`  Show discovered/running LSP servers\n\
                      - `/lsp restart [lang]`  Restart all LSP servers or one language family (e.g. `rust`, `typescript`, `python`, `go`)"
+                        .to_string(),
+                ));
+                None
+            }
+        }
+    }
+
+    fn parse_mcp_command(&mut self, arg: &str) -> Option<UserCommand> {
+        let trimmed = arg.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("status") {
+            return Some(UserCommand::RequestMcpStatus);
+        }
+        let mut parts = trimmed.splitn(2, char::is_whitespace);
+        let sub = parts.next().unwrap_or("").to_ascii_lowercase();
+        let rest = parts.next().unwrap_or("").trim();
+
+        match sub.as_str() {
+            "add" => {
+                let mut add_parts = rest.splitn(2, char::is_whitespace);
+                let name = add_parts.next().unwrap_or("").trim();
+                let target = add_parts.next().unwrap_or("").trim();
+                if name.is_empty() || target.is_empty() {
+                    self.entries.push(ChatEntry::System(
+                        "Usage: `/mcp add <name> <http-url-or-command>`\n\
+                         Examples:\n\
+                         - `/mcp add docs https://mcp.example.com/rpc`\n\
+                         - `/mcp add fs npx -y @modelcontextprotocol/server-filesystem .`"
+                            .to_string(),
+                    ));
+                    return None;
+                }
+                let spec = format!("{name}={target}");
+                match parse_mcp_server_spec(&spec) {
+                    Ok(cfg) => Some(UserCommand::AddMcpServer(cfg)),
+                    Err(err) => {
+                        self.entries.push(ChatEntry::Error(format!(
+                            "Invalid MCP server spec: {err}"
+                        )));
+                        None
+                    }
+                }
+            }
+            "remove" | "rm" | "delete" => {
+                if rest.is_empty() {
+                    self.entries.push(ChatEntry::System(
+                        "Usage: `/mcp remove <name>`".to_string(),
+                    ));
+                    None
+                } else {
+                    Some(UserCommand::RemoveMcpServer(rest.to_string()))
+                }
+            }
+            _ => {
+                self.entries.push(ChatEntry::System(
+                    "### MCP Commands\n\
+                     - `/mcp` or `/mcp status`  List connected external MCP servers and mounted tools\n\
+                     - `/mcp add <name> <url-or-cmd>`  Connect & persist an MCP server in out-of-tree LanceDB\n\
+                     - `/mcp remove <name>`  Disconnect & remove a configured MCP server\n\n\
+                     _Run AllyH itself as an MCP server for external editors with `allyh mcp serve`._"
                         .to_string(),
                 ));
                 None

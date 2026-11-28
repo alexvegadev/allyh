@@ -162,6 +162,7 @@ dependencies = [
  "allyh-memory",
  "chrono",
  "hex",
+ "reqwest 0.12.28",
  "rig-core",
  "schemars 1.2.3",
  "serde",
