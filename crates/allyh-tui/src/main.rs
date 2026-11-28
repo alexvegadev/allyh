@@ -1,6 +1,11 @@
 mod app;
+mod ci_cli;
 mod cli;
+mod config_cli;
 mod highlight;
+mod lsp_cli;
+mod mcp_cli;
+mod sim_cli;
 mod skills_cli;
 mod theme;
 mod ui;
@@ -8,13 +13,18 @@ mod update;
 
 use std::io;
 
-use allyh_core::{AllyHOrchestrator, HybridRouter, ModelProfile, OrchestratorConfig, UserCommand};
+use allyh_core::{
+    AllyHOrchestrator, HybridRouter, ModelProfile, OrchestratorConfig, ReasoningEffort, UserCommand,
+};
 use allyh_env::canonicalize_normalized;
 use allyh_memory::{EmbeddingProfile, StorageConfig};
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossterm::cursor::Show;
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -29,7 +39,12 @@ use crate::highlight::MarkdownHighlighter;
 
 fn restore_terminal_state() {
     let _ = disable_raw_mode();
-    let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
+    let _ = execute!(
+        io::stdout(),
+        DisableMouseCapture,
+        LeaveAlternateScreen,
+        Show
+    );
 }
 
 struct TerminalGuard {
@@ -40,7 +55,7 @@ impl TerminalGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode().context("enable raw mode")?;
         let mut stdout = io::stdout();
-        if let Err(err) = execute!(stdout, EnterAlternateScreen) {
+        if let Err(err) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
             let _ = disable_raw_mode();
             return Err(err).context("enter alternate screen");
         }
@@ -58,7 +73,11 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        let _ = execute!(
+            self.terminal.backend_mut(),
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
         let _ = self.terminal.show_cursor();
     }
 }
@@ -95,19 +114,82 @@ async fn main() -> Result<()> {
                 )
                 .await
             }
+            CliCommand::Sim(sim_args) => {
+                sim_cli::run_cli(
+                    sim_args,
+                    &args.repo,
+                    args.db_uri.as_deref(),
+                    &args.scope,
+                    args.model.as_deref(),
+                    args.worker_model.as_deref(),
+                )
+                .await
+            }
+            CliCommand::Config(config_args) => {
+                config_cli::run_cli(
+                    config_args,
+                    &args.repo,
+                    args.db_uri.as_deref(),
+                    &args.scope,
+                )
+                .await
+            }
+            CliCommand::Lsp(lsp_args) => lsp_cli::run_cli(lsp_args, &args.repo).await,
+            CliCommand::Mcp(mcp_args) => {
+                mcp_cli::run_cli(
+                    mcp_args,
+                    &args.repo,
+                    args.db_uri.as_deref(),
+                    &args.scope,
+                    args.embedding_model.as_deref(),
+                )
+                .await
+            }
+            CliCommand::Run(run_args) => {
+                ci_cli::run_headless_cli(
+                    run_args,
+                    &args.repo,
+                    args.db_uri.as_deref(),
+                    &args.scope,
+                    args.model.as_deref(),
+                    args.worker_model.as_deref(),
+                    args.reasoning_effort.as_deref(),
+                    args.embedding_model.as_deref(),
+                )
+                .await
+            }
+            CliCommand::Audit(audit_args) => {
+                ci_cli::run_audit_cli(audit_args, &args.repo, args.db_uri.as_deref(), &args.scope)
+                    .await
+            }
+            CliCommand::Memory(mem_args) => {
+                ci_cli::run_memory_cli(mem_args, &args.repo, args.db_uri.as_deref(), &args.scope)
+                    .await
+            }
+            CliCommand::Worktree(wt_args) => ci_cli::run_worktree_cli(wt_args, &args.repo).await,
         };
     }
 
     let mut cfg = OrchestratorConfig::new(&args.repo);
     cfg.scope_id = args.scope.clone();
-    cfg.auto_cargo_check = !args.no_auto_check;
+    cfg.auto_verify = !args.no_auto_check;
     if let Some(uri) = &args.db_uri {
         cfg.storage = StorageConfig::from_uri(uri.clone());
+    }
+    for spec in &args.mcp_servers {
+        let parsed = allyh_tools::parse_mcp_server_spec(spec)
+            .with_context(|| format!("invalid --mcp-server '{spec}'"))?;
+        cfg.extra_mcp_servers.push(parsed);
     }
 
     let mut router = HybridRouter::from_env();
     if let Some(spec) = &args.model {
         router.set_primary(ModelProfile::parse_spec(spec).context("invalid --model spec")?);
+    }
+    if let Some(effort_spec) = &args.reasoning_effort {
+        let effort = ReasoningEffort::parse_spec(effort_spec)
+            .context("invalid --reasoning-effort value")?;
+        router.set_reasoning_effort(Some(effort));
     }
     if let Some(spec) = &args.worker_model {
         router.set_local_worker(
@@ -188,6 +270,41 @@ fn handle_terminal_event(
     app: &mut AppState,
     cmd_tx: &tokio::sync::mpsc::UnboundedSender<UserCommand>,
 ) {
+    if let Event::Mouse(mouse) = event {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                if app.active_diff_modal.is_some() {
+                    app.diff_scroll.navigate(KeyCode::Up);
+                } else if matches!(
+                    app.inspector.gate_state,
+                    allyh_core::ControlGateState::PlanApproval { .. }
+                ) {
+                    app.plan_scroll.navigate(KeyCode::Up);
+                } else if app.focus == FocusPane::Memories {
+                    app.select_prev_memory();
+                } else {
+                    app.chat_scroll.navigate(KeyCode::Up);
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if app.active_diff_modal.is_some() {
+                    app.diff_scroll.navigate(KeyCode::Down);
+                } else if matches!(
+                    app.inspector.gate_state,
+                    allyh_core::ControlGateState::PlanApproval { .. }
+                ) {
+                    app.plan_scroll.navigate(KeyCode::Down);
+                } else if app.focus == FocusPane::Memories {
+                    app.select_next_memory();
+                } else {
+                    app.chat_scroll.navigate(KeyCode::Down);
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+
     let Event::Key(key) = event else {
         return;
     };
@@ -204,7 +321,52 @@ fn handle_terminal_event(
         return;
     }
 
-    // Interactive Control Gate modal intercepts keys first
+    // One-key copy of latest code block / expanded tool card / diff via OSC 52
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('y' | 'Y'))
+    {
+        copy_latest_snippet(app);
+        return;
+    }
+
+    // Interactive Command Approval Gate modal intercepts keys first
+    if let Some(pending) = app.pending_command_approval.clone() {
+        match key.code {
+            KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Enter => {
+                app.pending_command_approval = None;
+                let _ = cmd_tx.send(UserCommand::ApproveCommandOnce(pending.command));
+            }
+            KeyCode::Char('p') | KeyCode::Char('P') => {
+                app.pending_command_approval = None;
+                let _ = cmd_tx.send(UserCommand::AllowCommandPattern(pending.suggested_pattern));
+            }
+            KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Esc => {
+                app.pending_command_approval = None;
+                let _ = cmd_tx.send(UserCommand::DenyCommand(pending.command));
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    // Interactive Diff Modal intercepts keys when open
+    if app.active_diff_modal.is_some() {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q' | 'Q') => {
+                app.active_diff_modal = None;
+            }
+            KeyCode::Char('s' | 'S') => {
+                app.diff_side_by_side = !app.diff_side_by_side;
+            }
+            KeyCode::Char('y' | 'Y') => {
+                copy_latest_snippet(app);
+            }
+            other => app.diff_scroll.navigate(other),
+        }
+        return;
+    }
+
+    // Interactive Control Gate modal intercepts keys next
     if app.is_gate_modal_open() {
         match key.code {
             KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Enter => {
@@ -288,7 +450,10 @@ fn handle_pane_key(
             }
             _ => {}
         },
-        FocusPane::Chat => app.chat_scroll.navigate(key.code),
+        FocusPane::Chat => match key.code {
+            KeyCode::Char('y' | 'Y') => copy_latest_snippet(app),
+            other => app.chat_scroll.navigate(other),
+        },
         FocusPane::Input => match key.code {
             KeyCode::Enter
                 if !key.modifiers.contains(KeyModifiers::ALT)
@@ -316,6 +481,52 @@ fn handle_pane_key(
     }
 }
 
+fn copy_latest_snippet(app: &mut AppState) {
+    if let Some((kind, content)) = app.latest_copyable_snippet() {
+        write_osc52_clipboard(&content);
+        app.entries.push(crate::app::ChatEntry::System(format!(
+            "Copied {kind} ({} chars) to terminal clipboard (OSC 52).",
+            content.len()
+        )));
+    } else {
+        app.entries.push(crate::app::ChatEntry::System(
+            "Nothing to copy yet (no diff, tool card, or assistant code block).".to_string(),
+        ));
+    }
+}
+
+fn write_osc52_clipboard(text: &str) {
+    use std::io::Write;
+    let encoded = base64_encode(text.as_bytes());
+    let mut out = io::stdout();
+    let _ = write!(out, "\x1b]52;c;{encoded}\x07");
+    let _ = out.flush();
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((triple >> 18) & 0x3F) as usize] as char);
+        out.push(TABLE[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(triple & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,16 +543,29 @@ mod tests {
             git_branch: "master".into(),
             dirty_files: vec!["src/lib.rs".into()],
             out_of_band_edits: Vec::new(),
+            cross_scope_warnings: Vec::new(),
+            detected_languages: vec!["Rust".into()],
+            detected_toolchains: vec!["Rust (cargo)".into()],
+            active_lsp_servers: Vec::new(),
+            active_checkpoint_label: None,
+            mcp_servers_count: 0,
             build_status: "cargo check: PASS (0 warnings)".into(),
             gate_state,
             active_tasks: Vec::new(),
             activated_memories: Vec::new(),
             skills_count: 0,
+            active_harness_label: "seed (default)".into(),
+            sim_problems_count: 0,
+            sim_run_id: None,
             active_model_label: "API: claude-sonnet-4-6".into(),
             worker_model_label: "Local 9B".into(),
             worker_status: WorkerStatus::Idle,
             tokens_used: 18_400,
             token_budget: 128_000,
+            session_input_tokens: 0,
+            session_output_tokens: 0,
+            session_cached_tokens: 0,
+            session_cost_usd: 0.0,
         }
     }
 
@@ -469,7 +693,7 @@ mod tests {
         let mut app = AppState::new(sample_snapshot(ControlGateState::Discovery), "demo".into());
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         app.input.insert_str("/m");
-        assert_eq!(app.command_matches().len(), 2);
+        assert_eq!(app.command_matches().len(), 3);
         press(&mut app, &tx, KeyCode::Down);
         press(&mut app, &tx, KeyCode::Tab);
         assert_eq!(app.input.lines(), &["/memories"]);
@@ -679,5 +903,413 @@ mod tests {
         assert!(rendered.contains("[PINNED]"));
         assert!(rendered.contains("Skills"));
         assert!(rendered.contains("3"));
+    }
+
+    #[test]
+    fn test_sim_slash_commands_and_inspector_rendering() {
+        use allyh_core::UiEvent;
+        use allyh_memory::{SimAttemptInput, SimLedger, SimMemoryMode, SimProblemRef};
+
+        let mut snap = sample_snapshot(ControlGateState::Discovery);
+        snap.active_harness_label = "tb4-r2 (r2)".into();
+        snap.sim_problems_count = 2;
+        let mut app = AppState::new(snap, "allyh".into());
+
+        assert!(matches!(
+            app.parse_submission("/sim"),
+            Some(UserCommand::RequestSimSummary)
+        ));
+        assert!(matches!(
+            app.parse_submission("/sim list"),
+            Some(UserCommand::RequestSimProblems)
+        ));
+        assert!(matches!(
+            app.parse_submission("/sim show P3"),
+            Some(UserCommand::ShowSimProblem(ref id)) if id == "P3"
+        ));
+        assert!(matches!(
+            app.parse_submission("/sim P5"),
+            Some(UserCommand::ShowSimProblem(ref id)) if id == "P5"
+        ));
+        assert!(matches!(
+            app.parse_submission("/sim harness"),
+            Some(UserCommand::ShowActiveHarness)
+        ));
+        assert!(matches!(
+            app.parse_submission("/sim use hv-1234"),
+            Some(UserCommand::UseHarness(ref id)) if id == "hv-1234"
+        ));
+
+        let mut ledger = SimLedger::new_source(
+            "r",
+            "s",
+            "target-tb4",
+            "tb4",
+            "tb4",
+            "anthropic:claude-sonnet-4-6",
+            "anthropic:claude-sonnet-4-6",
+            "hv-0",
+            SimMemoryMode::FullSim,
+        );
+        ledger
+            .record_accepted_attempt(SimAttemptInput {
+                problem_ref: SimProblemRef::New("premature stop".into()),
+                round: 1,
+                sample: "s1".into(),
+                accepted: true,
+                backfilled: false,
+                what: "Enable interlock".into(),
+                files: vec!["interlock.rs".into()],
+                predicted: vec!["t1".into()],
+                fixed: vec!["t1".into()],
+                missed: vec![],
+                passed: 1,
+                total: 1,
+                score: 100.0,
+                domain: "tb4".into(),
+                benchmark: "tb4".into(),
+                policy_model: "anthropic:claude-sonnet-4-6".into(),
+                harness_version_id: "hv-1".into(),
+            })
+            .expect("record");
+
+        app.apply_ui_event(UiEvent::SimProblems(Some(ledger)));
+        let highlighter = MarkdownHighlighter::new();
+        let rendered = screen(&mut app, &highlighter, 120, 36);
+        assert!(rendered.contains("SIM Problem Ledger (1)"));
+        assert!(rendered.contains("premature stop"));
+        assert!(rendered.contains("tb4-r2 (r2)"));
+        assert!(rendered.contains("2 problem(s)"));
+    }
+
+    #[test]
+    fn test_config_slash_commands_and_polyglot_inspector_display() {
+        let mut snap = sample_snapshot(ControlGateState::Discovery);
+        snap.detected_languages = vec!["Rust".into(), "TypeScript".into()];
+        snap.detected_toolchains = vec!["Rust (cargo)".into(), "TypeScript/JS (web)".into()];
+        let mut app = AppState::new(snap, "monorepo".into());
+
+        assert!(matches!(
+            app.parse_submission("/config"),
+            Some(UserCommand::RequestRepoProfile)
+        ));
+        assert!(matches!(
+            app.parse_submission("/config set-check npx tsc --noEmit"),
+            Some(UserCommand::SaveRepoProfile(ref p))
+                if p.check_command.as_deref() == Some("npx tsc --noEmit")
+        ));
+        assert!(matches!(
+            app.parse_submission("/config reset"),
+            Some(UserCommand::ResetRepoProfile)
+        ));
+
+        let highlighter = MarkdownHighlighter::new();
+        let rendered = screen(&mut app, &highlighter, 120, 36);
+        assert!(rendered.contains("Stack"));
+        assert!(rendered.contains("Rust, TypeScript"));
+        assert!(rendered.contains("Tools"));
+    }
+
+    #[test]
+    fn test_lsp_slash_commands_and_inspector_display() {
+        use allyh_core::UiEvent;
+        use allyh_env::{LspServerState, LspServerStatus};
+
+        let mut snap = sample_snapshot(ControlGateState::Discovery);
+        snap.active_lsp_servers = vec!["rust-analyzer (running)".into()];
+        let mut app = AppState::new(snap, "allyh".into());
+
+        assert!(matches!(
+            app.parse_submission("/lsp"),
+            Some(UserCommand::RequestLspStatus)
+        ));
+        assert!(matches!(
+            app.parse_submission("/lsp status"),
+            Some(UserCommand::RequestLspStatus)
+        ));
+        assert!(matches!(
+            app.parse_submission("/lsp restart"),
+            Some(UserCommand::RestartLsp(None))
+        ));
+        assert!(matches!(
+            app.parse_submission("/lsp restart rust"),
+            Some(UserCommand::RestartLsp(Some(ref s))) if s == "rust"
+        ));
+
+        app.apply_ui_event(UiEvent::LspStatus(vec![LspServerStatus {
+            family: "rust".into(),
+            server_name: "rust-analyzer".into(),
+            command: "rust-analyzer".into(),
+            state: LspServerState::Running,
+            open_documents: 2,
+            cached_diagnostic_files: 1,
+            restart_count: 0,
+            last_error: None,
+        }]));
+
+        let highlighter = MarkdownHighlighter::new();
+        let rendered = screen(&mut app, &highlighter, 120, 36);
+        assert!(rendered.contains("LSP Semantic Bridge (1)"));
+        assert!(rendered.contains("rust-analyzer (running)"));
+    }
+
+    #[test]
+    fn test_checkpoint_slash_commands_and_command_approval_modal() {
+        use allyh_core::UiEvent;
+        use allyh_env::CheckpointDiffReport;
+        use allyh_tools::PendingCommandApproval;
+
+        let mut snap = sample_snapshot(ControlGateState::Execution {
+            active_task_id: None,
+        });
+        snap.active_checkpoint_label = Some("Refactor API".into());
+        let mut app = AppState::new(snap, "allyh".into());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let highlighter = MarkdownHighlighter::new();
+
+        assert!(matches!(
+            app.parse_submission("/diff"),
+            Some(UserCommand::RequestCheckpointDiff)
+        ));
+        assert!(matches!(
+            app.parse_submission("/rollback"),
+            Some(UserCommand::RollbackCheckpoint)
+        ));
+
+        app.apply_ui_event(UiEvent::CheckpointDiff(Some(CheckpointDiffReport {
+            checkpoint_id: "cp-1".into(),
+            checkpoint_label: "Refactor API".into(),
+            modified_files: vec!["src/lib.rs".into()],
+            created_files: Vec::new(),
+            deleted_files: Vec::new(),
+            insertions: 1,
+            deletions: 1,
+            unified_diff: "-old\n+new\n".into(),
+        })));
+        let diff_modal_screen = screen(&mut app, &highlighter, 120, 36);
+        assert!(diff_modal_screen.contains("Checkpoint Diff Viewer"));
+        press(&mut app, &tx, KeyCode::Esc);
+        let diff_screen = screen(&mut app, &highlighter, 120, 36);
+        assert!(diff_screen.contains("Checkpoint Diff"));
+        assert!(diff_screen.contains("Checkpt"));
+
+        // Command Approval Modal renders & handles Allow Once / Allow Pattern / Deny
+        app.apply_ui_event(UiEvent::CommandApprovalRequested(PendingCommandApproval {
+            command: "cargo publish --dry-run".into(),
+            working_dir: ".".into(),
+            reason: "Mutating or network command".into(),
+            suggested_pattern: "cargo publish".into(),
+        }));
+        assert!(app.is_gate_modal_open());
+        let modal = screen(&mut app, &highlighter, 120, 36);
+        assert!(modal.contains("Command Approval Gate"));
+        assert!(modal.contains("cargo publish --dry-run"));
+        assert!(modal.contains("Allow Pattern"));
+
+        press(&mut app, &tx, KeyCode::Char('p'));
+        assert!(!app.is_gate_modal_open());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(UserCommand::AllowCommandPattern(ref pat)) if pat == "cargo publish"
+        ));
+    }
+
+    #[test]
+    fn test_mcp_slash_commands_and_inspector_display() {
+        use allyh_core::UiEvent;
+        use allyh_memory::McpServerTransport;
+        use allyh_tools::McpServerStatus;
+
+        let mut snap = sample_snapshot(ControlGateState::Discovery);
+        snap.mcp_servers_count = 2;
+        let mut app = AppState::new(snap, "allyh".into());
+
+        assert!(matches!(
+            app.parse_submission("/mcp"),
+            Some(UserCommand::RequestMcpStatus)
+        ));
+        assert!(matches!(
+            app.parse_submission("/mcp status"),
+            Some(UserCommand::RequestMcpStatus)
+        ));
+        assert!(matches!(
+            app.parse_submission("/mcp add docs https://mcp.example.com/rpc"),
+            Some(UserCommand::AddMcpServer(ref cfg))
+                if cfg.name == "docs"
+                && matches!(cfg.transport, McpServerTransport::Http { ref url, .. } if url == "https://mcp.example.com/rpc")
+        ));
+        assert!(matches!(
+            app.parse_submission("/mcp remove docs"),
+            Some(UserCommand::RemoveMcpServer(ref name)) if name == "docs"
+        ));
+
+        app.apply_ui_event(UiEvent::McpStatus(vec![McpServerStatus {
+            name: "docs".into(),
+            transport: "http".into(),
+            target: "https://mcp.example.com/rpc".into(),
+            connected: true,
+            tool_count: 2,
+            tools: vec!["mcp__docs__search".into(), "mcp__docs__fetch".into()],
+            last_error: None,
+        }]));
+
+        let highlighter = MarkdownHighlighter::new();
+        let rendered = screen(&mut app, &highlighter, 120, 36);
+        assert!(rendered.contains("2 connected"));
+        assert!(rendered.contains("External MCP Servers (1)"));
+        assert!(rendered.contains("mcp__docs__search"));
+    }
+
+    #[test]
+    fn test_status_bar_displays_prompt_cache_and_cost_telemetry() {
+        let mut snap = sample_snapshot(ControlGateState::Discovery);
+        snap.session_input_tokens = 20_000;
+        snap.session_output_tokens = 1_500;
+        snap.session_cached_tokens = 15_000;
+        snap.session_cost_usd = 0.034;
+
+        let mut app = AppState::new(snap, "allyh".into());
+        let highlighter = MarkdownHighlighter::new();
+        let rendered = screen(&mut app, &highlighter, 120, 36);
+        assert!(
+            rendered.contains("Cache 75%"),
+            "status bar should display prompt cache hit ratio, got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("$0.034"),
+            "status bar should display estimated session USD cost, got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn test_tui_diff_modal_timeline_sessions_mouse_and_copy() {
+        use allyh_core::UiEvent;
+        use allyh_env::CheckpointDiffReport;
+        use allyh_memory::{ArchitecturalDecision, SessionRecord};
+        use chrono::Utc;
+        use crossterm::event::{MouseEvent, MouseEventKind};
+
+        let mut snap = sample_snapshot(ControlGateState::Discovery);
+        snap.cross_scope_warnings = vec!["src/lib.rs (task-2)".into()];
+        let mut app = AppState::new(snap, "allyh".into());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let highlighter = MarkdownHighlighter::new();
+
+        // /timeline & /sessions slash parsing
+        assert!(matches!(
+            app.parse_submission("/timeline"),
+            Some(UserCommand::RequestTimeline)
+        ));
+        assert!(matches!(
+            app.parse_submission("/sessions"),
+            Some(UserCommand::RequestSessions)
+        ));
+        assert!(matches!(
+            app.parse_submission("/sessions resume sess-42"),
+            Some(UserCommand::ResumeSession(ref id)) if id == "sess-42"
+        ));
+
+        // Render bi-temporal timeline + session list
+        let now = Utc::now();
+        app.apply_ui_event(UiEvent::Timeline(vec![
+            ArchitecturalDecision {
+                id: "dec-old-1111".into(),
+                repo_id: "r".into(),
+                scope_id: "default".into(),
+                topic: "http".into(),
+                rule_statement: "Use hyper".into(),
+                rationale: "Initial".into(),
+                affected_paths: Vec::new(),
+                vector: Vec::new(),
+                valid_at: now,
+                invalid_at: Some(now),
+                superseded_by: Some("dec-new-2222".into()),
+            },
+            ArchitecturalDecision {
+                id: "dec-new-2222".into(),
+                repo_id: "r".into(),
+                scope_id: "default".into(),
+                topic: "http".into(),
+                rule_statement: "Use reqwest".into(),
+                rationale: "Unified TLS".into(),
+                affected_paths: Vec::new(),
+                vector: Vec::new(),
+                valid_at: now,
+                invalid_at: None,
+                superseded_by: None,
+            },
+        ]));
+        app.apply_ui_event(UiEvent::SessionsList {
+            current_session_id: "sess-cur-1".into(),
+            sessions: vec![SessionRecord {
+                session_id: "sess-cur-1".into(),
+                repo_id: "r".into(),
+                scope_id: "default".into(),
+                started_at: now,
+                ended_at: None,
+                rolling_summary: "Refactored MCP client".into(),
+                token_budget_used: 4_000,
+                input_tokens: 10_000,
+                output_tokens: 500,
+                cached_input_tokens: 7_000,
+                cache_creation_tokens: 0,
+                estimated_cost_usd: 0.012,
+            }],
+        });
+
+        let base_screen = screen(&mut app, &highlighter, 120, 36);
+        assert!(base_screen.contains("Bi-Temporal Memory Timeline (2)"));
+        assert!(base_screen.contains("SUPERSEDED"));
+        assert!(base_screen.contains("Repository Sessions (1)"));
+        assert!(base_screen.contains("Overlap"));
+
+        // Interactive Diff Modal opens on CheckpointDiff, toggles side-by-side, handles mouse wheel & copy
+        app.apply_ui_event(UiEvent::CheckpointDiff(Some(CheckpointDiffReport {
+            checkpoint_id: "cp-9".into(),
+            checkpoint_label: "Auth refactor".into(),
+            modified_files: vec!["src/auth.rs".into()],
+            created_files: Vec::new(),
+            deleted_files: Vec::new(),
+            insertions: 1,
+            deletions: 1,
+            unified_diff: "diff --git a/src/auth.rs b/src/auth.rs\n@@ -1 +1 @@\n-old()\n+new()\n"
+                .into(),
+        })));
+        assert!(app.active_diff_modal.is_some());
+        let diff_unified = screen(&mut app, &highlighter, 120, 36);
+        assert!(diff_unified.contains("Diff Viewer"));
+        assert!(diff_unified.contains("Unified"));
+
+        // Toggle side-by-side with `s`
+        press(&mut app, &tx, KeyCode::Char('s'));
+        assert!(app.diff_side_by_side);
+        let diff_sbs = screen(&mut app, &highlighter, 120, 36);
+        assert!(diff_sbs.contains("Side-by-Side"));
+
+        // Mouse scroll works without panicking
+        handle_terminal_event(
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 10,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            }),
+            &mut app,
+            &tx,
+        );
+
+        // One-key copy (`y`) extracts the diff and posts confirmation
+        let snippet = app.latest_copyable_snippet().expect("diff snippet");
+        assert_eq!(snippet.0, "checkpoint diff");
+        assert!(snippet.1.contains("+new()"));
+        press(&mut app, &tx, KeyCode::Char('y'));
+        assert!(app.entries.iter().any(|e| matches!(
+            e,
+            crate::app::ChatEntry::System(msg) if msg.contains("Copied checkpoint diff")
+        )));
+
+        // Close modal with Esc
+        press(&mut app, &tx, KeyCode::Esc);
+        assert!(app.active_diff_modal.is_none());
     }
 }

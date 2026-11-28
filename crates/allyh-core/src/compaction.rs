@@ -28,6 +28,7 @@ pub struct CompactingHistory {
     rolling_summary: String,
     keep_recent_units: usize,
     compaction_ratio: f64,
+    max_rollup_chars: usize,
 }
 
 impl CompactingHistory {
@@ -37,7 +38,20 @@ impl CompactingHistory {
             rolling_summary: initial_summary,
             keep_recent_units: 6,
             compaction_ratio: 0.70,
+            max_rollup_chars: 2400,
         }
+    }
+
+    /// Apply compaction budgets from an active [`crate::harness::HarnessSpec`].
+    pub fn apply_policy(
+        &mut self,
+        keep_recent_units: usize,
+        compaction_ratio: f64,
+        max_rollup_chars: usize,
+    ) {
+        self.keep_recent_units = keep_recent_units.max(1);
+        self.compaction_ratio = compaction_ratio.clamp(0.20, 0.95);
+        self.max_rollup_chars = max_rollup_chars.max(400);
     }
 
     pub fn rolling_summary(&self) -> &str {
@@ -111,7 +125,7 @@ impl CompactingHistory {
             .await
         {
             Ok(text) if !text.trim().is_empty() => text.trim().to_string(),
-            _ => deterministic_rollup(&self.rolling_summary, &transcript),
+            _ => deterministic_rollup(&self.rolling_summary, &transcript, self.max_rollup_chars),
         };
 
         self.rolling_summary = summarized;
@@ -159,7 +173,7 @@ fn render_units_for_summary(units: &[HistoryUnit]) -> String {
     lines.join("\n")
 }
 
-fn deterministic_rollup(existing: &str, newly_evicted: &str) -> String {
+fn deterministic_rollup(existing: &str, newly_evicted: &str, max_rollup_chars: usize) -> String {
     let mut combined = String::new();
     if !existing.trim().is_empty() {
         combined.push_str(existing.trim());
@@ -170,8 +184,8 @@ fn deterministic_rollup(existing: &str, newly_evicted: &str) -> String {
         combined.push_str(line);
         combined.push('\n');
     }
-    if combined.len() > 2400 {
-        let start = combined.len().saturating_sub(2400);
+    if combined.len() > max_rollup_chars {
+        let start = combined.len().saturating_sub(max_rollup_chars);
         let safe = combined
             .char_indices()
             .find(|(idx, _)| *idx >= start)

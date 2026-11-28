@@ -3,6 +3,12 @@ name = "allyh-core"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+bedrock = []
+vertex = []
+enterprise-providers = ["bedrock", "vertex"]
+
 [dependencies]
 tokio.workspace = true
 futures.workspace = true
@@ -10,6 +16,8 @@ serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
 uuid.workspace = true
+sha2.workspace = true
+hex.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true
@@ -24,3 +32,7 @@ allyh-tools.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 git2.workspace = true
+
+[[test]]
+name = "mcp_roundtrip"
+harness = false

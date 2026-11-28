@@ -1,24 +1,31 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use allyh_memory::{CodeGraphSnapshot, MemoryStore};
+use allyh_memory::{CodeGraphSnapshot, MemoryStore, RepoProfile};
 use chrono::{DateTime, Utc};
+use ignore::WalkBuilder;
+use ignore::overrides::OverrideBuilder;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use similar::TextDiff;
 use tokio::sync::mpsc;
-use walkdir::WalkDir;
 
 use crate::cargo::{CargoRunner, CargoVerificationReport, VerificationKind};
 use crate::error::{EnvError, Result};
 use crate::git::{GitState, GitTracker};
-use crate::graph::{EgoGraph, RustIndexer};
+use crate::graph::{EgoGraph, RepoGraph};
+use crate::lang::{LanguageRegistry, SourceLanguage};
+use crate::lsp::{
+    DEFAULT_LSP_DIAGNOSTIC_WAIT, LspManager, LspServerStatus, collect_lsp_diagnostics_report,
+    enrich_ego_graph_with_lsp,
+};
 use crate::path::{
     canonicalize_normalized, has_windows_drive_prefix, path_to_slash_string, strip_root_prefix,
     strip_verbatim_prefix,
 };
+use crate::verify::{DetectedToolchain, ToolchainVerifier, VerificationReport, VerificationTarget};
 
 /// Filesystem change notification emitted by the live `notify` watcher.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,15 +44,34 @@ pub struct OutOfBandEdit {
     pub diff_summary: String,
 }
 
+/// Cross-agent file overlap detected when another active `scope_id` sharing the same
+/// LanceDB `repo_id` has modified or claimed a file also present/dirty in this workspace.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CrossScopeClaim {
+    pub other_scope_id: String,
+    pub file_path: String,
+    pub other_sha256: String,
+    pub local_sha256: Option<String>,
+    pub diverged: bool,
+}
+
 /// Structured environment delta computed before every agent turn.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EnvDelta {
     pub generated_at: Option<DateTime<Utc>>,
     pub git: GitState,
     pub out_of_band_edits: Vec<OutOfBandEdit>,
+    #[serde(default)]
+    pub cross_scope_claims: Vec<CrossScopeClaim>,
     pub recent_fs_events: Vec<FsChangeEvent>,
     pub reindexed_files: Vec<String>,
     pub build_status: Option<String>,
+    #[serde(default)]
+    pub detected_languages: Vec<String>,
+    #[serde(default)]
+    pub detected_toolchains: Vec<String>,
+    #[serde(default)]
+    pub active_lsp_servers: Vec<String>,
 }
 
 impl EnvDelta {
@@ -58,6 +84,21 @@ impl EnvDelta {
             self.git.branch,
             self.git.head_commit.as_deref().unwrap_or("none")
         ));
+        if !self.detected_languages.is_empty() {
+            lines.push(format!(
+                "- Languages: {}",
+                self.detected_languages.join(", ")
+            ));
+        }
+        if !self.detected_toolchains.is_empty() {
+            lines.push(format!(
+                "- Toolchains: {}",
+                self.detected_toolchains.join(", ")
+            ));
+        }
+        if !self.active_lsp_servers.is_empty() {
+            lines.push(format!("- LSP: {}", self.active_lsp_servers.join(", ")));
+        }
         if let Some(status) = &self.build_status {
             lines.push(format!("- Last verification: {status}"));
         }
@@ -79,8 +120,27 @@ impl EnvDelta {
                 lines.push(format!("  - `{}`: {}", edit.file_path, edit.diff_summary));
             }
         }
+        if !self.cross_scope_claims.is_empty() {
+            lines.push(
+                "- Cross-agent scope overlap warnings (shared LanceDB partition):".to_string(),
+            );
+            for claim in self.cross_scope_claims.iter().take(10) {
+                let status = if claim.diverged {
+                    "diverged SHA-256"
+                } else {
+                    "active claim"
+                };
+                lines.push(format!(
+                    "  - `{}` also touched by scope `{}` ({status})",
+                    claim.file_path, claim.other_scope_id
+                ));
+            }
+        }
         if !self.git.diff_summary.is_empty() && self.out_of_band_edits.is_empty() {
-            lines.push(format!("- Working-tree diff:\n```diff\n{}\n```", self.git.diff_summary));
+            lines.push(format!(
+                "- Working-tree diff:\n```diff\n{}\n```",
+                self.git.diff_summary
+            ));
         }
         lines.join("\n")
     }
@@ -132,8 +192,8 @@ impl LiveFsWatcher {
     }
 }
 
-/// Coordinates repository hashing, incremental `tree-sitter` indexing, `git2` status,
-/// `notify` event buffering, and `cargo` verification for a workspace.
+/// Coordinates repository hashing, incremental polyglot `tree-sitter` indexing, `git2` status,
+/// `notify` event buffering, and pluggable toolchain verification for a workspace.
 #[derive(Clone)]
 pub struct EnvironmentMonitor {
     repo_root: PathBuf,
@@ -142,6 +202,9 @@ pub struct EnvironmentMonitor {
     store: MemoryStore,
     git: GitTracker,
     cargo: CargoRunner,
+    registry: LanguageRegistry,
+    verifier: ToolchainVerifier,
+    lsp: LspManager,
     /// In-memory last-known file contents for concise out-of-band diff generation.
     last_known_contents: Arc<Mutex<HashMap<String, String>>>,
     /// Pending filesystem events received from `LiveFsWatcher`.
@@ -158,6 +221,9 @@ impl EnvironmentMonitor {
         let root = strip_verbatim_prefix(&repo_root.into());
         let git = GitTracker::new(&root);
         let cargo = CargoRunner::new(&root);
+        let registry = LanguageRegistry::default_all();
+        let verifier = ToolchainVerifier::new(&root);
+        let lsp = LspManager::discover_default(&root);
         Self {
             repo_root: root,
             repo_id: repo_id.into(),
@@ -165,9 +231,34 @@ impl EnvironmentMonitor {
             store,
             git,
             cargo,
+            registry,
+            verifier,
+            lsp,
             last_known_contents: Arc::new(Mutex::new(HashMap::new())),
             pending_events: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Replace the auto-discovered [`LspManager`] (e.g., to disable LSP or inject custom/mock servers).
+    pub fn with_lsp_manager(mut self, lsp: LspManager) -> Self {
+        self.lsp = lsp;
+        self
+    }
+
+    pub fn lsp(&self) -> &LspManager {
+        &self.lsp
+    }
+
+    pub async fn lsp_status(&self) -> Vec<LspServerStatus> {
+        self.lsp.status().await
+    }
+
+    pub async fn restart_lsp(&self, family: Option<&str>) -> Result<Vec<LspServerStatus>> {
+        self.lsp.restart(family).await
+    }
+
+    pub async fn shutdown_lsp(&self) {
+        self.lsp.shutdown_all().await;
     }
 
     pub fn repo_root(&self) -> &Path {
@@ -188,6 +279,31 @@ impl EnvironmentMonitor {
 
     pub fn cargo(&self) -> &CargoRunner {
         &self.cargo
+    }
+
+    pub fn language_registry(&self) -> &LanguageRegistry {
+        &self.registry
+    }
+
+    pub fn verifier(&self) -> &ToolchainVerifier {
+        &self.verifier
+    }
+
+    pub fn detect_toolchains(&self) -> Vec<DetectedToolchain> {
+        self.verifier.detect_toolchains()
+    }
+
+    pub fn has_any_toolchain(&self) -> bool {
+        self.verifier.has_any_toolchain()
+    }
+
+    /// Load the optional out-of-tree [`RepoProfile`] stored in LanceDB for this partition.
+    pub async fn load_repo_profile(&self) -> Option<RepoProfile> {
+        self.store
+            .get_repo_profile(&self.repo_id, &self.scope_id)
+            .await
+            .ok()
+            .flatten()
     }
 
     /// Spawn a live `notify` watcher and buffer incoming events into this monitor.
@@ -292,23 +408,23 @@ impl EnvironmentMonitor {
         hex::encode(hasher.finalize())
     }
 
-    /// Re-index a single source file into `code_graph_snapshots`.
+    /// Re-index a single source file into `code_graph_snapshots` using the polyglot `LanguageRegistry`.
     pub async fn index_file(&self, rel_path: &str, turn: u64) -> Result<CodeGraphSnapshot> {
         let (normalized, abs_path) = self.resolve_safe_path(rel_path)?;
         let content = std::fs::read_to_string(&abs_path)?;
         let hash = Self::sha256_str(&content);
         self.cache_file_content(&normalized, &content);
 
-        let file_graph = if normalized.ends_with(".rs") {
-            RustIndexer::index_source(&content).unwrap_or_default()
-        } else {
-            Default::default()
-        };
+        let (lang, file_graph) = self
+            .registry
+            .index_path(&normalized, &content)
+            .unwrap_or_else(|_| (SourceLanguage::from_path(&normalized), Default::default()));
 
         let symbols_json = serde_json::to_string(&file_graph.symbols)?;
         let embed_text = format!(
-            "{} {} {}",
+            "{} {} {} {}",
             normalized,
+            lang.as_str(),
             file_graph
                 .symbols
                 .iter()
@@ -323,6 +439,7 @@ impl EnvironmentMonitor {
             repo_id: self.repo_id.clone(),
             scope_id: self.scope_id.clone(),
             file_path: normalized,
+            language: lang.as_str().to_string(),
             sha256_hash: hash,
             last_read_turn: turn,
             symbols_json,
@@ -333,15 +450,22 @@ impl EnvironmentMonitor {
         Ok(snapshot)
     }
 
-    /// Scan workspace source files, compare SHA-256 hashes against LanceDB `code_graph_snapshots`,
-    /// detect out-of-band manual user edits, trigger incremental `tree-sitter` re-indexing,
-    /// and produce an [`EnvDelta`] ready for the Dynamic Preamble Assembler.
+    /// Scan workspace source files (respecting `.gitignore` and `RepoProfile` ignore overrides),
+    /// compare SHA-256 hashes against LanceDB `code_graph_snapshots`, detect out-of-band manual
+    /// user edits, trigger incremental polyglot `tree-sitter` re-indexing, and produce an
+    /// [`EnvDelta`] ready for the Dynamic Preamble Assembler.
     pub async fn sync_and_collect_delta(
         &self,
         turn: u64,
         run_build_check: bool,
     ) -> Result<EnvDelta> {
         let git = self.git.inspect()?;
+        let profile = self.load_repo_profile().await;
+        let extra_ignores = profile
+            .as_ref()
+            .map(|p| p.extra_ignore_globs.as_slice())
+            .unwrap_or(&[]);
+
         let existing_snapshots = self
             .store
             .list_code_snapshots(&self.repo_id, &self.scope_id)
@@ -351,13 +475,19 @@ impl EnvironmentMonitor {
             .map(|s| (s.file_path.clone(), s))
             .collect();
 
-        let disk_files = self.discover_source_files();
+        let disk_files = self.discover_source_files(extra_ignores);
         let disk_set: HashSet<String> = disk_files.iter().cloned().collect();
 
         let mut out_of_band_edits = Vec::new();
         let mut reindexed_files = Vec::new();
+        let mut detected_langs: BTreeSet<String> = BTreeSet::new();
 
         for rel_path in &disk_files {
+            let lang = SourceLanguage::from_path(rel_path);
+            if lang.is_code() {
+                detected_langs.insert(lang.display_name().to_string());
+            }
+
             let abs = self.repo_root.join(rel_path);
             let Ok(content) = std::fs::read_to_string(&abs) else {
                 continue;
@@ -366,13 +496,11 @@ impl EnvironmentMonitor {
 
             match existing_map.get(rel_path) {
                 Some(prev) if prev.sha256_hash == current_hash => {
-                    // Cache baseline content on first observation in this session.
                     if let Ok(mut guard) = self.last_known_contents.lock() {
                         guard.entry(rel_path.clone()).or_insert(content);
                     }
                 }
                 Some(prev) => {
-                    // Out-of-band edit detected! Compute a concise diff summary and re-index.
                     let prev_content = self
                         .last_known_contents
                         .lock()
@@ -397,14 +525,16 @@ impl EnvironmentMonitor {
                     reindexed_files.push(rel_path.clone());
                 }
                 None => {
-                    // Newly created file on disk; index it.
                     let is_after_initial_scan = !existing_map.is_empty();
                     if is_after_initial_scan {
                         out_of_band_edits.push(OutOfBandEdit {
                             file_path: rel_path.clone(),
                             previous_hash: None,
                             current_hash: Some(current_hash),
-                            diff_summary: format!("new file created ({} lines)", content.lines().count()),
+                            diff_summary: format!(
+                                "new file created ({} lines)",
+                                content.lines().count()
+                            ),
                         });
                     }
                     self.index_file(rel_path, turn).await?;
@@ -434,35 +564,141 @@ impl EnvironmentMonitor {
             .map(|mut g| std::mem::take(&mut *g))
             .unwrap_or_default();
 
-        let build_status = if run_build_check && self.cargo.has_cargo_manifest() {
-            match self.cargo.run(VerificationKind::Check, None).await {
+        let detected_languages = if let Some(ref prof) = profile
+            && !prof.languages_override.is_empty()
+        {
+            prof.languages_override.clone()
+        } else {
+            detected_langs.into_iter().collect()
+        };
+
+        let mut detected_toolchains: Vec<String> = self
+            .verifier
+            .detect_toolchains()
+            .into_iter()
+            .map(|tc| tc.display_badge())
+            .collect();
+        if let Some(ref prof) = profile
+            && (prof.check_command.is_some()
+                || prof.lint_command.is_some()
+                || prof.test_command.is_some())
+        {
+            detected_toolchains.insert(0, "Custom profile".to_string());
+        }
+
+        let has_verifier = !detected_toolchains.is_empty();
+        let build_status = if run_build_check && has_verifier {
+            match self
+                .verifier
+                .run(&VerificationTarget::default(), profile.as_ref())
+                .await
+            {
                 Ok(report) => Some(report.compact_status_line()),
-                Err(err) => Some(format!("cargo check error: {err}")),
+                Err(err) => Some(format!("verification error: {err}")),
             }
         } else {
             None
         };
 
+        let active_lsp_servers = self.lsp.active_badges(&detected_languages).await;
+
+        // Cross-agent hash/claim awareness across sibling scopes sharing the same LanceDB repo_id.
+        let mut cross_scope_claims = Vec::new();
+        if let Ok(other_snaps) = self
+            .store
+            .list_other_scope_code_snapshots(&self.repo_id, &self.scope_id)
+            .await
+            && !other_snaps.is_empty()
+        {
+            let local_latest: HashMap<String, String> = self
+                .store
+                .list_code_snapshots(&self.repo_id, &self.scope_id)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|s| (s.file_path, s.sha256_hash))
+                .collect();
+            let dirty_set: HashSet<&str> = git
+                .dirty_files
+                .iter()
+                .chain(git.untracked_files.iter())
+                .map(String::as_str)
+                .collect();
+
+            for other in other_snaps {
+                let local_hash = local_latest.get(&other.file_path).cloned();
+                let diverged = local_hash
+                    .as_deref()
+                    .is_some_and(|lh| lh != other.sha256_hash);
+                let local_dirty = dirty_set.contains(other.file_path.as_str());
+                if diverged || local_dirty {
+                    cross_scope_claims.push(CrossScopeClaim {
+                        other_scope_id: other.scope_id,
+                        file_path: other.file_path,
+                        other_sha256: other.sha256_hash,
+                        local_sha256: local_hash,
+                        diverged,
+                    });
+                }
+            }
+        }
+
         Ok(EnvDelta {
             generated_at: Some(Utc::now()),
             git,
             out_of_band_edits,
+            cross_scope_claims,
             recent_fs_events,
             reindexed_files,
             build_status,
+            detected_languages,
+            detected_toolchains,
+            active_lsp_servers,
         })
     }
 
-    /// Build a 1-hop or 2-hop RepoGraph ego-graph around a symbol/file from LanceDB snapshots.
+    /// Build a 1-hop or 2-hop RepoGraph ego-graph around a symbol/file from LanceDB snapshots,
+    /// automatically enriching edges with type-resolved LSP references/call-hierarchy when available.
     pub async fn ego_graph_for(&self, query_symbol: &str, max_hops: usize) -> Result<EgoGraph> {
         let snapshots = self
             .store
             .list_code_snapshots(&self.repo_id, &self.scope_id)
             .await?;
-        Ok(RustIndexer::build_ego_graph(&snapshots, query_symbol, max_hops))
+        let base = RepoGraph::build_ego_graph(&snapshots, query_symbol, max_hops);
+        Ok(enrich_ego_graph_with_lsp(base, &snapshots, &self.repo_root, &self.lsp).await)
     }
 
-    /// Run `cargo check` / `clippy` / `test` inside the workspace.
+    /// Attempt sub-second post-edit diagnostics via an active LSP server before falling back to CLI.
+    pub async fn lsp_diagnostics_for_edit(
+        &self,
+        rel_path: &str,
+        abs_path: &Path,
+        content: &str,
+        content_hash: &str,
+    ) -> Option<VerificationReport> {
+        collect_lsp_diagnostics_report(
+            rel_path,
+            abs_path,
+            content,
+            content_hash,
+            &self.repo_root,
+            &self.lsp,
+            DEFAULT_LSP_DIAGNOSTIC_WAIT,
+        )
+        .await
+    }
+
+    /// Run language-agnostic verification using the pluggable [`ToolchainVerifier`] and
+    /// any configured out-of-tree [`RepoProfile`] overrides.
+    pub async fn run_verification(
+        &self,
+        target: &VerificationTarget,
+    ) -> Result<VerificationReport> {
+        let profile = self.load_repo_profile().await;
+        self.verifier.run(target, profile.as_ref()).await
+    }
+
+    /// Backward-compatible Rust helper running `cargo check` / `clippy` / `test`.
     pub async fn run_cargo(
         &self,
         kind: VerificationKind,
@@ -471,28 +707,47 @@ impl EnvironmentMonitor {
         self.cargo.run(kind, package).await
     }
 
-    fn discover_source_files(&self) -> Vec<String> {
-        let mut files = Vec::new();
-        for entry in WalkDir::new(&self.repo_root)
-            .into_iter()
+    fn discover_source_files(&self, extra_ignore_globs: &[String]) -> Vec<String> {
+        let mut builder = WalkBuilder::new(&self.repo_root);
+        builder
+            .hidden(true)
+            .git_ignore(true)
+            .git_global(true)
+            .git_exclude(true)
+            .ignore(true)
+            .require_git(false)
             .filter_entry(|e| {
                 e.depth() == 0 || !is_ignored_entry(e.file_name().to_str().unwrap_or(""))
-            })
-            .flatten()
-        {
-            if !entry.file_type().is_file() {
+            });
+
+        if !extra_ignore_globs.is_empty() {
+            let mut overrides = OverrideBuilder::new(&self.repo_root);
+            for glob in extra_ignore_globs {
+                let trimmed = glob.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let negated = if trimmed.starts_with('!') {
+                    trimmed.to_string()
+                } else {
+                    format!("!{trimmed}")
+                };
+                let _ = overrides.add(&negated);
+            }
+            if let Ok(built) = overrides.build() {
+                builder.overrides(built);
+            }
+        }
+
+        let mut files = Vec::new();
+        for entry in builder.build().flatten() {
+            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
                 continue;
             }
             let path = entry.path();
-            let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
-                continue;
-            };
-            if !matches!(ext, "rs" | "toml") {
-                continue;
-            }
             if let Ok(rel) = path.strip_prefix(&self.repo_root) {
                 let rel_str = rel.to_string_lossy().replace('\\', "/");
-                if !should_ignore_rel_path(&rel_str) {
+                if !should_ignore_rel_path(&rel_str) && self.registry.is_tracked_file(&rel_str) {
                     files.push(rel_str);
                 }
             }
@@ -544,7 +799,21 @@ pub fn normalize_rel_path(path: &str) -> String {
 fn is_ignored_entry(name: &str) -> bool {
     matches!(
         name,
-        ".git" | "target" | "node_modules" | ".idea" | ".vscode" | "dist"
+        ".git"
+            | "target"
+            | "node_modules"
+            | ".venv"
+            | "venv"
+            | "__pycache__"
+            | ".pytest_cache"
+            | ".mypy_cache"
+            | ".ruff_cache"
+            | ".next"
+            | "vendor"
+            | ".idea"
+            | ".vscode"
+            | "dist"
+            | "build"
     )
 }
 
@@ -555,7 +824,18 @@ fn should_ignore_rel_path(rel: &str) -> bool {
         || rel == "target"
         || rel.starts_with(".git/")
         || rel.starts_with("target/")
+        || rel.starts_with("node_modules/")
+        || rel.starts_with(".venv/")
+        || rel.starts_with("venv/")
+        || rel.starts_with("vendor/")
         || rel.contains("/target/")
         || rel.contains("/.git/")
+        || rel.contains("/node_modules/")
+        || rel.contains("/__pycache__/")
+        || rel.contains("/.venv/")
+        || rel.contains("/vendor/")
         || rel == "Cargo.lock"
+        || rel == "package-lock.json"
+        || rel == "pnpm-lock.yaml"
+        || rel == "yarn.lock"
 }

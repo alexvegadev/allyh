@@ -2,7 +2,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use allyh_env::{
-    CargoVerificationReport, EnvironmentMonitor, VerificationKind, summarize_text_diff,
+    EnvironmentMonitor, VerificationKind, VerificationReport, VerificationTarget,
+    summarize_text_diff,
 };
 use rig_core::completion::ToolAnnotations;
 use rig_core::tool::{Tool, ToolContext, ToolExecutionError, args_schema};
@@ -10,6 +11,15 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ToolError;
+
+/// Single search-and-replace hunk inside an atomic multi-hunk [`EditByHashArgs`] edit.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct EditHunk {
+    /// Exact verbatim substring to match inside the file.
+    pub target_snippet: String,
+    /// Replacement text for `target_snippet`.
+    pub replacement_snippet: String,
+}
 
 /// Arguments for [`EditByHashTool`].
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -22,45 +32,54 @@ pub struct EditByHashArgs {
     pub target_snippet: Option<String>,
     /// Replacement text for `target_snippet`.
     pub replacement_snippet: Option<String>,
+    /// Optional batch of sequential hunks applied atomically (all-or-nothing rollback if any hunk fails to match).
+    #[serde(default)]
+    pub hunks: Option<Vec<EditHunk>>,
     /// Full replacement file contents (used when creating a file or replacing the entire file).
     pub full_content: Option<String>,
     /// Allow creating a new file when it does not exist yet.
     pub create_if_missing: Option<bool>,
-    /// Optional Cargo package name (`-p <pkg>`) for faster post-edit `cargo check`.
-    pub cargo_package: Option<String>,
+    /// Optional package, subdirectory, or test scope for faster post-edit verification (alias: `cargo_package`).
+    #[serde(default, alias = "cargo_package")]
+    pub target_scope: Option<String>,
+    /// Optional explicit toolchain override (`rust`, `typescript`, `python`, `go`, `custom`).
+    #[serde(default)]
+    pub toolchain: Option<String>,
 }
 
-/// Prescriptive output returned by [`EditByHashTool`], always including post-edit compiler diagnostics.
+/// Prescriptive output returned by [`EditByHashTool`], including post-edit diagnostics from
+/// the affected sub-project's toolchain verifier.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EditByHashOutput {
     pub file_path: String,
     pub previous_sha256: Option<String>,
     pub new_sha256: String,
     pub diff_summary: String,
-    pub cargo_check: Option<CargoVerificationReport>,
+    #[serde(alias = "cargo_check")]
+    pub verification: Option<VerificationReport>,
     pub prescriptive_diagnostics: String,
 }
 
-/// Hash-verified file editor with automatic post-edit `cargo check --message-format=json` hook.
+/// Hash-verified file editor with automatic post-edit verification hook across supported toolchains.
 #[derive(Clone)]
 pub struct EditByHashTool {
     env: Arc<EnvironmentMonitor>,
     /// Enforces the Control Gate: edits are rejected while AllyH is in Discovery / PlanApproval mode.
     writes_enabled: Arc<AtomicBool>,
-    /// Automatically run `cargo check --message-format=json` after every edit.
-    auto_cargo_check: bool,
+    /// Automatically run post-edit check verification on the affected sub-project.
+    auto_verify: bool,
 }
 
 impl EditByHashTool {
     pub fn new(
         env: Arc<EnvironmentMonitor>,
         writes_enabled: Arc<AtomicBool>,
-        auto_cargo_check: bool,
+        auto_verify: bool,
     ) -> Self {
         Self {
             env,
             writes_enabled,
-            auto_cargo_check,
+            auto_verify,
         }
     }
 
@@ -103,32 +122,27 @@ impl EditByHashTool {
 
         let updated_content = if let Some(full) = args.full_content {
             full
+        } else if let Some(hunks) = args.hunks.as_deref().filter(|h| !h.is_empty()) {
+            // Atomic multi-hunk staging: every hunk must match cleanly before writing a single byte.
+            let mut staged = previous_content.clone();
+            for (idx, hunk) in hunks.iter().enumerate() {
+                staged = apply_single_hunk(
+                    &staged,
+                    &hunk.target_snippet,
+                    &hunk.replacement_snippet,
+                    &rel_path,
+                    Some(idx + 1),
+                )?;
+            }
+            staged
         } else if let (Some(target), Some(replacement)) = (
             args.target_snippet.as_deref(),
             args.replacement_snippet.as_deref(),
         ) {
-            if previous_content.contains(target) {
-                previous_content.replacen(target, replacement, 1)
-            } else if previous_content.contains("\r\n") {
-                // Preserve Windows CRLF files when models emit LF-only snippets from `inspect_symbol`.
-                let crlf_target = to_crlf(target);
-                if !previous_content.contains(&crlf_target) {
-                    return Err(ToolError::EditTargetNotFound {
-                        file_path: rel_path,
-                        reason: "target_snippet was not found verbatim in file".to_string(),
-                    });
-                }
-                let crlf_replacement = to_crlf(replacement);
-                previous_content.replacen(&crlf_target, &crlf_replacement, 1)
-            } else {
-                return Err(ToolError::EditTargetNotFound {
-                    file_path: rel_path,
-                    reason: "target_snippet was not found verbatim in file".to_string(),
-                });
-            }
+            apply_single_hunk(&previous_content, target, replacement, &rel_path, None)?
         } else {
             return Err(ToolError::InvalidArgs(
-                "provide either full_content or both target_snippet and replacement_snippet"
+                "provide full_content, non-empty hunks, or both target_snippet and replacement_snippet"
                     .to_string(),
             ));
         };
@@ -145,27 +159,57 @@ impl EditByHashTool {
         self.env.cache_file_content(&rel_path, &updated_content);
         let _ = self.env.index_file(&rel_path, 0).await;
 
-        let cargo_check = if self.auto_cargo_check && self.env.cargo().has_cargo_manifest() {
-            Some(
+        let profile = self.env.load_repo_profile().await;
+        let should_auto_verify = profile
+            .as_ref()
+            .and_then(|p| p.auto_verify_override)
+            .unwrap_or(self.auto_verify);
+        let has_custom_check = profile
+            .as_ref()
+            .and_then(|p| p.check_command.as_deref())
+            .is_some_and(|c| !c.trim().is_empty());
+
+        let verification = if should_auto_verify {
+            // Fast path: when no custom check command or explicit non-LSP toolchain override is set,
+            // try sub-second LSP diagnostics first, falling back seamlessly to CLI ToolchainVerifier.
+            let lsp_report = if !has_custom_check && args.toolchain.is_none() {
                 self.env
-                    .run_cargo(VerificationKind::Check, args.cargo_package.as_deref())
-                    .await?,
-            )
+                    .lsp_diagnostics_for_edit(&rel_path, &abs_path, &updated_content, &new_sha256)
+                    .await
+            } else {
+                None
+            };
+            if let Some(report) = lsp_report {
+                Some(report)
+            } else if has_custom_check || self.env.has_any_toolchain() {
+                let target = VerificationTarget {
+                    kind: VerificationKind::Check,
+                    target_scope: args.target_scope.clone(),
+                    test_filter: None,
+                    affected_file: Some(rel_path.clone()),
+                    toolchain_override: args.toolchain.clone(),
+                };
+                Some(self.env.run_verification(&target).await?)
+            } else {
+                None
+            }
         } else {
             None
         };
 
-        let prescriptive_diagnostics = cargo_check
+        let prescriptive_diagnostics = verification
             .as_ref()
-            .map(CargoVerificationReport::render_prescriptive)
-            .unwrap_or_else(|| "cargo check skipped (no Cargo.toml or disabled)".to_string());
+            .map(VerificationReport::render_prescriptive)
+            .unwrap_or_else(|| {
+                "verification skipped (no detected toolchain or auto-check disabled)".to_string()
+            });
 
         Ok(EditByHashOutput {
             file_path: rel_path,
             previous_sha256,
             new_sha256,
             diff_summary,
-            cargo_check,
+            verification,
             prescriptive_diagnostics,
         })
     }
@@ -178,7 +222,7 @@ impl Tool for EditByHashTool {
     type Error = ToolError;
 
     fn description(&self) -> String {
-        "Edit or create a workspace file only if its SHA-256 hash matches expected_sha256, then automatically run `cargo check --message-format=json` and return prescriptive compiler diagnostics.".to_string()
+        "Edit or create a workspace file only if its SHA-256 hash matches expected_sha256, then automatically run the affected sub-project's type-check/compiler verification and return prescriptive diagnostics.".to_string()
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -187,7 +231,7 @@ impl Tool for EditByHashTool {
 
     fn annotations(&self) -> ToolAnnotations {
         ToolAnnotations::default()
-            .with_title("Hash-Verified File Edit + Cargo Check")
+            .with_title("Hash-Verified File Edit + Auto Check")
             .with_read_only(false)
             .with_destructive(true)
             .with_open_world(false)
@@ -210,6 +254,33 @@ impl Tool for EditByHashTool {
     ) -> Result<Self::Output, Self::Error> {
         self.execute(args).await
     }
+}
+
+fn apply_single_hunk(
+    content: &str,
+    target: &str,
+    replacement: &str,
+    rel_path: &str,
+    hunk_index: Option<usize>,
+) -> Result<String, ToolError> {
+    if content.contains(target) {
+        return Ok(content.replacen(target, replacement, 1));
+    }
+    if content.contains("\r\n") {
+        let crlf_target = to_crlf(target);
+        if content.contains(&crlf_target) {
+            let crlf_replacement = to_crlf(replacement);
+            return Ok(content.replacen(&crlf_target, &crlf_replacement, 1));
+        }
+    }
+    let reason = match hunk_index {
+        Some(idx) => format!("hunk #{idx} target_snippet was not found verbatim in file (atomic rollback)"),
+        None => "target_snippet was not found verbatim in file".to_string(),
+    };
+    Err(ToolError::EditTargetNotFound {
+        file_path: rel_path.to_string(),
+        reason,
+    })
 }
 
 fn to_crlf(text: &str) -> String {

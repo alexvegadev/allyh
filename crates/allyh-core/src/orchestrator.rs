@@ -4,13 +4,18 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
-use allyh_env::{EnvDelta, EnvironmentMonitor, LiveFsWatcher};
-use allyh_memory::{
-    CandidateDecision, ConsolidationOutcome, DbStatusReport, DeterministicHashEmbedder,
-    EmbeddingProvider, MemoryConsolidator, MemoryStore, ScoredDecision, SessionRecord, SkillRecord,
-    SleepJob, SleepTimeWorkerHandle, StorageConfig, TaskRecord, WorkerStatus, compute_repo_id,
+use allyh_env::{
+    CheckpointDiffReport, EnvDelta, EnvironmentMonitor, LiveFsWatcher, LspServerStatus,
+    PlanCheckpoint, RollbackReport,
 };
-use allyh_tools::{AciToolset, ToolExecutionRecord};
+use allyh_memory::{
+    ArchitecturalDecision, CandidateDecision, ConsolidationOutcome, DbStatusReport,
+    DeterministicHashEmbedder, EmbeddingProvider, HarnessVersionRecord, McpServerConfig,
+    MemoryConsolidator, MemoryStore, RepoProfile, ScoredDecision, SessionRecord, SimExportDocument,
+    SimLedger, SimProblemEntry, SimRunRecord, SkillRecord, SleepJob, SleepTimeWorkerHandle,
+    StorageConfig, TaskRecord, WorkerStatus, compute_repo_id,
+};
+use allyh_tools::{AciToolset, McpServerStatus, PendingCommandApproval, ToolExecutionRecord};
 use chrono::Utc;
 use rig_core::message::{Message, ToolResultContent, UserContent};
 use serde::{Deserialize, Serialize};
@@ -21,8 +26,10 @@ use crate::compaction::CompactingHistory;
 use crate::consolidation::{LocalLlmConflictJudge, extract_candidate_decisions};
 use crate::error::Result;
 use crate::gate::{ControlGate, ControlGateState, ProposedPlan, ProposedTaskSpec};
+use crate::harness::HarnessSpec;
+use crate::interlock::{CompletionInterlock, InterlockDecision};
 use crate::preamble::{AssembledPreamble, DynamicPreambleAssembler, PreambleInputs};
-use crate::router::{HybridRouter, ModelProfile};
+use crate::router::{CompletionCallOptions, HybridRouter, ModelProfile, SessionTelemetry};
 
 /// Live snapshot pushed to the TUI Coherence Inspector sidebar & status bar.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,16 +41,39 @@ pub struct InspectorSnapshot {
     pub git_branch: String,
     pub dirty_files: Vec<String>,
     pub out_of_band_edits: Vec<String>,
+    #[serde(default)]
+    pub cross_scope_warnings: Vec<String>,
+    #[serde(default)]
+    pub detected_languages: Vec<String>,
+    #[serde(default)]
+    pub detected_toolchains: Vec<String>,
+    #[serde(default)]
+    pub active_lsp_servers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_checkpoint_label: Option<String>,
     pub build_status: String,
     pub gate_state: ControlGateState,
     pub active_tasks: Vec<TaskRecord>,
     pub activated_memories: Vec<ScoredDecision>,
     pub skills_count: usize,
+    #[serde(default)]
+    pub mcp_servers_count: usize,
+    pub active_harness_label: String,
+    pub sim_problems_count: usize,
+    pub sim_run_id: Option<String>,
     pub active_model_label: String,
     pub worker_model_label: String,
     pub worker_status: WorkerStatus,
     pub tokens_used: u64,
     pub token_budget: u64,
+    #[serde(default)]
+    pub session_input_tokens: u64,
+    #[serde(default)]
+    pub session_output_tokens: u64,
+    #[serde(default)]
+    pub session_cached_tokens: u64,
+    #[serde(default)]
+    pub session_cost_usd: f64,
 }
 
 /// Commands dispatched from the TUI (or programmatic client) to the core orchestrator actor.
@@ -61,6 +91,9 @@ pub enum UserCommand {
     },
     RecordDecision(CandidateDecision),
     RequestMemories,
+    RequestTimeline,
+    RequestSessions,
+    ResumeSession(String),
     RequestSkills,
     ShowSkill(String),
     PinSkill(String),
@@ -71,7 +104,26 @@ pub enum UserCommand {
         instructions: String,
         triggers: Vec<String>,
     },
+    RequestSimSummary,
+    RequestSimProblems,
+    ShowSimProblem(String),
+    ExportSim(PathBuf),
+    ShowActiveHarness,
+    UseHarness(String),
     RequestDbStatus,
+    RequestRepoProfile,
+    SaveRepoProfile(RepoProfile),
+    ResetRepoProfile,
+    RequestLspStatus,
+    RestartLsp(Option<String>),
+    RequestMcpStatus,
+    AddMcpServer(McpServerConfig),
+    RemoveMcpServer(String),
+    RequestCheckpointDiff,
+    RollbackCheckpoint,
+    ApproveCommandOnce(String),
+    AllowCommandPattern(String),
+    DenyCommand(String),
     RefreshEnv { run_build_check: bool },
     CompactNow,
     Shutdown,
@@ -90,6 +142,11 @@ pub enum UiEvent {
     InspectorUpdated(InspectorSnapshot),
     WorkerStatusChanged(WorkerStatus),
     MemoriesList(Vec<ScoredDecision>),
+    Timeline(Vec<ArchitecturalDecision>),
+    SessionsList {
+        current_session_id: String,
+        sessions: Vec<SessionRecord>,
+    },
     SkillsList {
         skills: Vec<SkillRecord>,
         pinned_ids: HashSet<String>,
@@ -98,7 +155,31 @@ pub enum UiEvent {
         skill: SkillRecord,
         pinned: bool,
     },
+    SimSummary {
+        ledger: Option<SimLedger>,
+        active_harness_label: String,
+        active_harness_hash: String,
+    },
+    SimProblems(Option<SimLedger>),
+    SimProblemDetail {
+        problem: SimProblemEntry,
+        resolved_from: Option<String>,
+    },
+    ActiveHarnessDetail {
+        label: String,
+        version_id: Option<String>,
+        spec: HarnessSpec,
+    },
     DbStatus(DbStatusReport),
+    RepoProfileDetail {
+        profile: Option<RepoProfile>,
+        detected_languages: Vec<String>,
+        detected_toolchains: Vec<String>,
+    },
+    LspStatus(Vec<LspServerStatus>),
+    McpStatus(Vec<McpServerStatus>),
+    CheckpointDiff(Option<CheckpointDiffReport>),
+    CommandApprovalRequested(PendingCommandApproval),
     SystemNotice(String),
     Error(String),
 }
@@ -111,6 +192,7 @@ pub struct TurnOutcome {
     pub env_delta: EnvDelta,
     pub tool_records: Vec<ToolExecutionRecord>,
     pub consolidated_decisions: Vec<ConsolidationOutcome>,
+    pub turn_telemetry: SessionTelemetry,
 }
 
 /// Configuration for initializing an [`AllyHOrchestrator`] session.
@@ -119,9 +201,10 @@ pub struct OrchestratorConfig {
     pub repo_root: PathBuf,
     pub storage: StorageConfig,
     pub scope_id: String,
-    pub auto_cargo_check: bool,
+    pub auto_verify: bool,
     pub idle_optimize_interval: Duration,
     pub enable_fs_watcher: bool,
+    pub extra_mcp_servers: Vec<McpServerConfig>,
 }
 
 impl OrchestratorConfig {
@@ -130,9 +213,10 @@ impl OrchestratorConfig {
             repo_root: repo_root.into(),
             storage: StorageConfig::default_local(),
             scope_id: allyh_memory::DEFAULT_SCOPE_ID.to_string(),
-            auto_cargo_check: true,
+            auto_verify: true,
             idle_optimize_interval: Duration::from_secs(45),
             enable_fs_watcher: true,
+            extra_mcp_servers: Vec::new(),
         }
     }
 }
@@ -141,6 +225,7 @@ impl OrchestratorConfig {
 /// Control Gate, hybrid model routing, history compaction, and sleep-time consolidation.
 pub struct AllyHOrchestrator {
     session_id: String,
+    session_started_at: chrono::DateTime<Utc>,
     repo_id: String,
     scope_id: String,
     turn_counter: u64,
@@ -152,11 +237,15 @@ pub struct AllyHOrchestrator {
     gate: ControlGate,
     router: HybridRouter,
     history: CompactingHistory,
+    active_harness: HarnessSpec,
+    active_harness_record: Option<HarnessVersionRecord>,
     pinned_decision_ids: HashSet<String>,
     pinned_skill_ids: HashSet<String>,
     last_env_delta: EnvDelta,
     last_activated_memories: Vec<ScoredDecision>,
     last_preamble_tokens: u64,
+    session_telemetry: SessionTelemetry,
+    active_checkpoint: Option<PlanCheckpoint>,
     _fs_watcher: Option<LiveFsWatcher>,
 }
 
@@ -195,8 +284,21 @@ impl AllyHOrchestrator {
             Arc::clone(&env),
             store.clone(),
             writes_enabled,
-            config.auto_cargo_check,
+            config.auto_verify,
         );
+
+        // Connect any out-of-tree LanceDB RepoProfile MCP servers + CLI-supplied MCP servers.
+        let mut mcp_configs = store
+            .get_repo_profile(&repo_id, &scope_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|p| p.mcp_servers)
+            .unwrap_or_default();
+        mcp_configs.extend(config.extra_mcp_servers);
+        if !mcp_configs.is_empty() {
+            toolset.mcp_clients().sync_configs(&mcp_configs).await;
+        }
 
         let judge = Arc::new(LocalLlmConflictJudge::new(router.clone()));
         let consolidator = MemoryConsolidator::new(store.clone(), judge);
@@ -214,14 +316,20 @@ impl AllyHOrchestrator {
         let initial_delta = env.sync_and_collect_delta(0, false).await?;
 
         let session_id = Uuid::new_v4().to_string();
+        let session_started_at = Utc::now();
         let initial_session = SessionRecord {
             session_id: session_id.clone(),
             repo_id: repo_id.clone(),
             scope_id: scope_id.clone(),
-            started_at: Utc::now(),
+            started_at: session_started_at,
             ended_at: None,
             rolling_summary: prior_summary.clone(),
             token_budget_used: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_creation_tokens: 0,
+            estimated_cost_usd: 0.0,
         };
         store.upsert_session(&initial_session).await?;
 
@@ -237,8 +345,27 @@ impl AllyHOrchestrator {
             })
             .collect();
 
+        let active_harness_record = store
+            .get_active_harness_version(&repo_id, &scope_id)
+            .await?;
+        let active_harness = match &active_harness_record {
+            Some(rec) => HarnessSpec::from_version_record(rec).unwrap_or_else(|err| {
+                tracing::warn!(error = %err, version_id = %rec.id, "falling back to default seed harness");
+                HarnessSpec::default_seed()
+            }),
+            None => HarnessSpec::default_seed(),
+        };
+
+        let mut history = CompactingHistory::new(prior_summary);
+        history.apply_policy(
+            active_harness.compaction.keep_recent_units,
+            active_harness.compaction.compaction_ratio,
+            active_harness.compaction.max_rollup_chars,
+        );
+
         Ok(Self {
             session_id,
+            session_started_at,
             repo_id,
             scope_id,
             turn_counter: 0,
@@ -249,12 +376,16 @@ impl AllyHOrchestrator {
             toolset,
             gate,
             router,
-            history: CompactingHistory::new(prior_summary),
+            history,
+            active_harness,
+            active_harness_record,
             pinned_decision_ids: HashSet::new(),
             pinned_skill_ids: HashSet::new(),
             last_env_delta: initial_delta,
             last_activated_memories: initial_active,
             last_preamble_tokens: 0,
+            session_telemetry: SessionTelemetry::default(),
+            active_checkpoint: None,
             _fs_watcher: fs_watcher,
         })
     }
@@ -287,6 +418,114 @@ impl AllyHOrchestrator {
         &self.router
     }
 
+    pub fn active_harness(&self) -> &HarnessSpec {
+        &self.active_harness
+    }
+
+    pub fn active_harness_record(&self) -> Option<&HarnessVersionRecord> {
+        self.active_harness_record.as_ref()
+    }
+
+    pub fn active_harness_label(&self) -> String {
+        match &self.active_harness_record {
+            Some(rec) => format!("{} (r{})", rec.label, rec.round),
+            None => "seed (default)".to_string(),
+        }
+    }
+
+    /// Apply an in-memory [`HarnessSpec`] immediately (used by CRSI evaluators and tests).
+    pub fn set_active_harness_spec(
+        &mut self,
+        spec: HarnessSpec,
+        record: Option<HarnessVersionRecord>,
+    ) -> Result<()> {
+        spec.validate()?;
+        self.history.apply_policy(
+            spec.compaction.keep_recent_units,
+            spec.compaction.compaction_ratio,
+            spec.compaction.max_rollup_chars,
+        );
+        self.active_harness = spec;
+        self.active_harness_record = record;
+        Ok(())
+    }
+
+    /// Activate a persisted [`HarnessVersionRecord`] from LanceDB by ID, prefix, or label.
+    pub async fn activate_harness_version(
+        &mut self,
+        version_id_or_prefix: &str,
+    ) -> Result<HarnessVersionRecord> {
+        let rec = self
+            .store
+            .set_active_harness_version(&self.repo_id, &self.scope_id, version_id_or_prefix)
+            .await?;
+        let spec = HarnessSpec::from_version_record(&rec)?;
+        self.set_active_harness_spec(spec, Some(rec.clone()))?;
+        Ok(rec)
+    }
+
+    /// Detect whether the active reasoning model differs from the policy model recorded on
+    /// the active evolved harness or latest SIM run (cross-model CRSI shift signal).
+    pub async fn model_shift_notice(&self) -> Option<String> {
+        let current_model = &self.router.primary().model_id;
+        let source_policy = self
+            .active_harness_record
+            .as_ref()
+            .map(|r| r.policy_model.as_str())
+            .filter(|p| !p.trim().is_empty());
+
+        let latest_run = self
+            .store
+            .latest_sim_run(&self.repo_id, &self.scope_id)
+            .await
+            .ok()
+            .flatten();
+
+        let prev_policy = source_policy.or_else(|| {
+            latest_run
+                .as_ref()
+                .map(|r| r.policy_model.as_str())
+                .filter(|p| !p.trim().is_empty())
+        })?;
+
+        if !prev_policy.eq_ignore_ascii_case(current_model)
+            && !prev_policy.ends_with(current_model)
+        {
+            let run_hint = latest_run
+                .as_ref()
+                .map(|r| format!(" (`allyh sim continue --from-run {}`)", &r.run_id[..r.run_id.len().min(8)]))
+                .unwrap_or_default();
+            return Some(format!(
+                "Cross-model shift detected: active harness/SIM was tuned for `{prev_policy}`, now running `{current_model}`. Inspect with `/sim` or continue CRSI{run_hint}."
+            ));
+        }
+        None
+    }
+
+    pub async fn load_sim_ledger(&self, run_id_or_arm: &str) -> Result<Option<SimLedger>> {
+        Ok(self
+            .store
+            .load_sim_ledger(&self.repo_id, &self.scope_id, run_id_or_arm)
+            .await?)
+    }
+
+    pub async fn list_sim_runs(&self) -> Result<Vec<SimRunRecord>> {
+        Ok(self
+            .store
+            .list_sim_runs(&self.repo_id, &self.scope_id)
+            .await?)
+    }
+
+    pub async fn export_sim_document(
+        &self,
+        run_id_or_arm: Option<&str>,
+    ) -> Result<Option<SimExportDocument>> {
+        Ok(self
+            .store
+            .export_sim_document(&self.repo_id, &self.scope_id, run_id_or_arm)
+            .await?)
+    }
+
     pub fn switch_model(&mut self, spec: &str) -> Result<ModelProfile> {
         let profile = ModelProfile::parse_spec(spec)?;
         self.router.set_primary(profile.clone());
@@ -298,9 +537,45 @@ impl AllyHOrchestrator {
     }
 
     pub async fn approve_plan(&mut self) -> Result<Vec<TaskRecord>> {
-        self.gate
+        let plan_label = match self.gate.state() {
+            ControlGateState::PlanApproval { plan } => plan.title.clone(),
+            _ => "Approved Plan".to_string(),
+        };
+        let tasks = self
+            .gate
             .approve_plan(&self.store, &self.repo_id, &self.scope_id)
-            .await
+            .await?;
+        // Capture an atomic out-of-tree pre-execution checkpoint immediately upon plan approval.
+        if let Ok(cp) = PlanCheckpoint::capture(self.env.repo_root(), plan_label) {
+            self.active_checkpoint = Some(cp);
+        }
+        Ok(tasks)
+    }
+
+    /// Manually capture a pre-execution checkpoint of the current workspace out-of-tree.
+    pub fn capture_checkpoint(&mut self, label: impl Into<String>) -> Result<String> {
+        let cp = PlanCheckpoint::capture(self.env.repo_root(), label)?;
+        let id = cp.id.clone();
+        self.active_checkpoint = Some(cp);
+        Ok(id)
+    }
+
+    /// Compute a unified diff between the active checkpoint and the current workspace on disk.
+    pub fn checkpoint_diff(&self) -> Option<CheckpointDiffReport> {
+        self.active_checkpoint
+            .as_ref()
+            .map(|cp| cp.diff_against(self.env.repo_root(), 16_000))
+    }
+
+    /// Atomically restore the workspace to the active checkpoint and re-sync SHA-256 snapshots.
+    pub async fn rollback_checkpoint(&mut self) -> Result<Option<RollbackReport>> {
+        let Some(cp) = self.active_checkpoint.as_ref() else {
+            return Ok(None);
+        };
+        let report = cp.rollback(self.env.repo_root())?;
+        // Re-sync environment snapshots so restored files match LanceDB without drift noise.
+        let _ = self.refresh_env(false).await;
+        Ok(Some(report))
     }
 
     pub fn refine_plan(&mut self) -> ControlGateState {
@@ -345,6 +620,32 @@ impl AllyHOrchestrator {
     /// Query live LanceDB metrics for `/db-status`.
     pub async fn db_status(&self) -> Result<DbStatusReport> {
         Ok(self.store.status_report(&self.repo_id, &self.scope_id).await?)
+    }
+
+    /// Fetch the stored out-of-tree [`RepoProfile`] for this partition, if configured.
+    pub async fn get_repo_profile(&self) -> Result<Option<RepoProfile>> {
+        Ok(self
+            .store
+            .get_repo_profile(&self.repo_id, &self.scope_id)
+            .await?)
+    }
+
+    /// Persist an out-of-tree [`RepoProfile`] override in LanceDB and refresh environment metadata.
+    pub async fn save_repo_profile(&mut self, mut profile: RepoProfile) -> Result<RepoProfile> {
+        profile.repo_id = self.repo_id.clone();
+        profile.scope_id = self.scope_id.clone();
+        self.store.upsert_repo_profile(&profile).await?;
+        let _ = self.refresh_env(false).await;
+        Ok(profile)
+    }
+
+    /// Remove any stored [`RepoProfile`] override and restore automatic toolchain detection.
+    pub async fn reset_repo_profile(&mut self) -> Result<()> {
+        self.store
+            .delete_repo_profile(&self.repo_id, &self.scope_id)
+            .await?;
+        let _ = self.refresh_env(false).await;
+        Ok(())
     }
 
     /// List all skills registered for this `(repo_id, scope_id)` partition.
@@ -430,6 +731,20 @@ impl AllyHOrchestrator {
             .list_skills(&self.repo_id, &self.scope_id)
             .await?
             .len();
+        let mcp_servers_count = self
+            .toolset
+            .mcp_clients()
+            .status()
+            .await
+            .into_iter()
+            .filter(|s| s.connected)
+            .count();
+        let latest_sim = self
+            .store
+            .load_sim_ledger(&self.repo_id, &self.scope_id, "")
+            .await?;
+        let sim_problems_count = latest_sim.as_ref().map(|l| l.problems.len()).unwrap_or(0);
+        let sim_run_id = latest_sim.map(|l| l.run.run_id);
         let mut memories = self.last_activated_memories.clone();
         for m in &mut memories {
             m.pinned = self.pinned_decision_ids.contains(&m.decision.id);
@@ -441,6 +756,18 @@ impl AllyHOrchestrator {
             .iter()
             .map(|e| format!("{}: {}", e.file_path, e.diff_summary))
             .collect();
+        let cross_scope_warnings = self
+            .last_env_delta
+            .cross_scope_claims
+            .iter()
+            .map(|c| format!("{} ({})", c.file_path, c.other_scope_id))
+            .collect();
+
+        let active_lsp_servers = self
+            .env
+            .lsp()
+            .active_badges(&self.last_env_delta.detected_languages)
+            .await;
 
         Ok(InspectorSnapshot {
             repo_id: self.repo_id.clone(),
@@ -455,6 +782,11 @@ impl AllyHOrchestrator {
             git_branch: self.last_env_delta.git.branch.clone(),
             dirty_files: self.last_env_delta.git.dirty_files.clone(),
             out_of_band_edits: oob,
+            cross_scope_warnings,
+            detected_languages: self.last_env_delta.detected_languages.clone(),
+            detected_toolchains: self.last_env_delta.detected_toolchains.clone(),
+            active_lsp_servers,
+            active_checkpoint_label: self.active_checkpoint.as_ref().map(|c| c.label.clone()),
             build_status: self
                 .last_env_delta
                 .build_status
@@ -464,11 +796,19 @@ impl AllyHOrchestrator {
             active_tasks: tasks,
             activated_memories: memories,
             skills_count,
+            mcp_servers_count,
+            active_harness_label: self.active_harness_label(),
+            sim_problems_count,
+            sim_run_id,
             active_model_label: self.router.primary().label.clone(),
             worker_model_label: self.router.local_worker().label.clone(),
             worker_status: self.sleep_worker.status(),
             tokens_used: self.last_preamble_tokens + self.history.estimated_tokens(),
             token_budget: self.router.primary().context_window_tokens,
+            session_input_tokens: self.session_telemetry.input_tokens,
+            session_output_tokens: self.session_telemetry.output_tokens,
+            session_cached_tokens: self.session_telemetry.cached_input_tokens,
+            session_cost_usd: self.session_telemetry.estimated_cost_usd,
         })
     }
 
@@ -507,7 +847,12 @@ impl AllyHOrchestrator {
             .collect();
         let matched_skills = self
             .store
-            .match_skills(&self.repo_id, &self.scope_id, prompt, 3)
+            .match_skills(
+                &self.repo_id,
+                &self.scope_id,
+                prompt,
+                self.active_harness.retrieval.skill_match_top_k,
+            )
             .await?;
         for skill in matched_skills {
             if !active_skills.iter().any(|s| s.id == skill.id) {
@@ -515,10 +860,14 @@ impl AllyHOrchestrator {
             }
         }
 
-        let sym_queries = DynamicPreambleAssembler::extract_symbol_queries(prompt, &env_delta);
+        let mut sym_queries = DynamicPreambleAssembler::extract_symbol_queries(prompt, &env_delta);
+        sym_queries.truncate(self.active_harness.retrieval.max_symbol_queries.max(1));
         let mut ego_graphs = Vec::new();
         for q in &sym_queries {
-            if let Ok(ego) = self.env.ego_graph_for(q, 1).await
+            if let Ok(ego) = self
+                .env
+                .ego_graph_for(q, self.active_harness.retrieval.ego_graph_hops)
+                .await
                 && (!ego.center_definitions.is_empty() || !ego.hop1_neighbors.is_empty())
             {
                 ego_graphs.push(ego);
@@ -529,6 +878,7 @@ impl AllyHOrchestrator {
             repo_id: &self.repo_id,
             scope_id: &self.scope_id,
             gate_state: self.gate.state(),
+            harness: &self.active_harness,
             env_delta: &env_delta,
             tasks: &tasks,
             memories: &memories,
@@ -551,12 +901,25 @@ impl AllyHOrchestrator {
 
         self.history.push_message(Message::user(prompt));
 
-        // 5. Run completion + compact ACI tool-use loop.
+        // 5. Run completion + compact ACI tool-use loop with CompletionInterlock.
         let tool_defs = self.toolset.definitions();
         let mut tool_records = Vec::new();
         let mut final_text = String::new();
+        let mut turn_telemetry = SessionTelemetry::default();
+        let max_rounds = self.active_harness.tools.max_tool_rounds.max(1);
+        let mut interlock = CompletionInterlock::new(self.active_harness.completion_interlock.clone());
+        let call_options = CompletionCallOptions {
+            cache_key: Some(format!(
+                "allyh:{}:{}:{}",
+                &self.repo_id[..self.repo_id.len().min(12)],
+                self.scope_id,
+                &preamble.stable_prefix_hash[..preamble.stable_prefix_hash.len().min(16)]
+            )),
+            enable_prompt_cache: true,
+            reasoning_effort: None,
+        };
 
-        for _round in 0..6 {
+        for round in 0..max_rounds {
             let (tok_tx, mut tok_rx) = mpsc::unbounded_channel::<String>();
             let ui_clone = ui_tx.cloned();
             let forward_handle = tokio::spawn(async move {
@@ -570,9 +933,19 @@ impl AllyHOrchestrator {
             let messages = self.history.messages();
             let response = self
                 .router
-                .run_primary(&preamble.text, &messages, &tool_defs, Some(tok_tx))
+                .run_primary_with_options(
+                    &preamble.text,
+                    &messages,
+                    &tool_defs,
+                    &call_options,
+                    Some(tok_tx),
+                )
                 .await?;
             let _ = forward_handle.await;
+
+            self.session_telemetry
+                .record_usage(self.router.primary(), &response.usage);
+            turn_telemetry.record_usage(self.router.primary(), &response.usage);
 
             let calls: Vec<_> = response.tool_calls().cloned().collect();
             let text = response.text();
@@ -584,6 +957,16 @@ impl AllyHOrchestrator {
                 if let Some(msg) = response.message() {
                     self.history.push_message(msg);
                 }
+                if round + 1 < max_rounds
+                    && let InterlockDecision::Reject { reminder, .. } =
+                        interlock.check_completion(&final_text)
+                {
+                    if let Some(tx) = ui_tx {
+                        let _ = tx.send(UiEvent::SystemNotice(reminder.clone()));
+                    }
+                    self.history.push_message(Message::user(reminder));
+                    continue;
+                }
                 break;
             }
 
@@ -593,6 +976,7 @@ impl AllyHOrchestrator {
                 atomic_pair.push(ast_msg);
             }
             let mut result_contents = Vec::new();
+            let mut round_records = Vec::new();
             for call in calls {
                 let (record, output) = self
                     .toolset
@@ -603,20 +987,60 @@ impl AllyHOrchestrator {
                     .await;
                 if let Some(tx) = ui_tx {
                     let _ = tx.send(UiEvent::ToolCard(record.clone()));
+                    if record
+                        .output_json
+                        .get("approval_required")
+                        .and_then(|v| v.as_bool())
+                        == Some(true)
+                        && let Some(cmd) = record.output_json.get("command").and_then(|v| v.as_str())
+                    {
+                        let _ = tx.send(UiEvent::CommandApprovalRequested(
+                            PendingCommandApproval {
+                                command: cmd.to_string(),
+                                working_dir: record
+                                    .output_json
+                                    .get("working_dir")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or(".")
+                                    .to_string(),
+                                reason: record
+                                    .output_json
+                                    .get("reason")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("Command requires explicit approval.")
+                                    .to_string(),
+                                suggested_pattern: record
+                                    .output_json
+                                    .get("suggested_pattern")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or(cmd)
+                                    .to_string(),
+                            },
+                        ));
+                    }
                 }
+                round_records.push(record.clone());
                 tool_records.push(record);
+                let formatted = self.active_harness.format_tool_output(&output.render());
                 result_contents.push(UserContent::tool_result(
                     call.id,
                     call.function.name,
-                    vec![ToolResultContent::text(output.render())],
+                    vec![ToolResultContent::text(formatted)],
                 ));
             }
+            interlock.observe_tool_round(&round_records);
             if !result_contents.is_empty() {
                 atomic_pair.push(Message::User {
                     content: result_contents,
                 });
             }
             self.history.push_atomic_group(atomic_pair);
+
+            if round + 1 < max_rounds
+                && let Some(budget_notice) = interlock.budget_reminder_if_due(round, max_rounds)
+            {
+                self.history.push_message(Message::user(budget_notice));
+            }
         }
 
         // 6. Post-turn bi-temporal decision consolidation & sleep-time optimization.
@@ -636,15 +1060,20 @@ impl AllyHOrchestrator {
             self.sleep_worker.enqueue(SleepJob::OptimizeTables);
         }
 
-        // Persist updated session record out-of-tree.
+        // Persist updated session record (with cumulative cache & USD cost telemetry) out-of-tree.
         let session_record = SessionRecord {
             session_id: self.session_id.clone(),
             repo_id: self.repo_id.clone(),
             scope_id: self.scope_id.clone(),
-            started_at: Utc::now(),
+            started_at: self.session_started_at,
             ended_at: None,
             rolling_summary: self.history.rolling_summary().to_string(),
             token_budget_used: self.last_preamble_tokens + self.history.estimated_tokens(),
+            input_tokens: self.session_telemetry.input_tokens,
+            output_tokens: self.session_telemetry.output_tokens,
+            cached_input_tokens: self.session_telemetry.cached_input_tokens,
+            cache_creation_tokens: self.session_telemetry.cache_creation_tokens,
+            estimated_cost_usd: self.session_telemetry.estimated_cost_usd,
         };
         let _ = self.store.upsert_session(&session_record).await;
 
@@ -664,16 +1093,19 @@ impl AllyHOrchestrator {
             env_delta,
             tool_records,
             consolidated_decisions,
+            turn_telemetry,
         })
     }
 
     async fn refresh_activated_memories(&mut self, query: &str) -> Result<Vec<ScoredDecision>> {
+        let top_k = self.active_harness.retrieval.decision_top_k.max(1);
+        let fallback_k = self.active_harness.retrieval.fallback_decision_count;
         let mut results = if query.trim().is_empty() {
             self.store
                 .list_active_decisions(&self.repo_id, &self.scope_id)
                 .await?
                 .into_iter()
-                .take(8)
+                .take(top_k)
                 .map(|decision| ScoredDecision {
                     decision,
                     score: 1.0,
@@ -682,7 +1114,7 @@ impl AllyHOrchestrator {
                 .collect()
         } else {
             self.store
-                .hybrid_search_decisions(&self.repo_id, &self.scope_id, query, 8)
+                .hybrid_search_decisions(&self.repo_id, &self.scope_id, query, top_k)
                 .await?
         };
 
@@ -707,14 +1139,14 @@ impl AllyHOrchestrator {
                 }
             }
         }
-        // If query returned nothing (e.g. brand-new wording), still surface up to 5 active invariants.
-        if results.is_empty() {
+        // If query returned nothing (e.g. brand-new wording), still surface up to fallback_k active invariants.
+        if results.is_empty() && fallback_k > 0 {
             results = self
                 .store
                 .list_active_decisions(&self.repo_id, &self.scope_id)
                 .await?
                 .into_iter()
-                .take(5)
+                .take(fallback_k)
                 .map(|decision| ScoredDecision {
                     decision,
                     score: 0.5,
@@ -800,6 +1232,9 @@ impl AllyHOrchestrator {
                                 "Switched active reasoning model to {}",
                                 profile.label
                             )));
+                            if let Some(shift_msg) = self.model_shift_notice().await {
+                                let _ = ui_tx.send(UiEvent::SystemNotice(shift_msg));
+                            }
                             if let Ok(snap) = self.inspector_snapshot().await {
                                 let _ = ui_tx.send(UiEvent::InspectorUpdated(snap));
                             }
@@ -863,6 +1298,80 @@ impl AllyHOrchestrator {
                             let _ = ui_tx.send(UiEvent::Error(err.to_string()));
                         }
                     },
+                    UserCommand::RequestTimeline => {
+                        match self
+                            .store
+                            .list_all_decisions(&self.repo_id, &self.scope_id)
+                            .await
+                        {
+                            Ok(all) => {
+                                let _ = ui_tx.send(UiEvent::Timeline(all));
+                            }
+                            Err(err) => {
+                                let _ = ui_tx.send(UiEvent::Error(err.to_string()));
+                            }
+                        }
+                    }
+                    UserCommand::RequestSessions => {
+                        match self
+                            .store
+                            .list_sessions(&self.repo_id, &self.scope_id)
+                            .await
+                        {
+                            Ok(sessions) => {
+                                let _ = ui_tx.send(UiEvent::SessionsList {
+                                    current_session_id: self.session_id.clone(),
+                                    sessions,
+                                });
+                            }
+                            Err(err) => {
+                                let _ = ui_tx.send(UiEvent::Error(err.to_string()));
+                            }
+                        }
+                    }
+                    UserCommand::ResumeSession(prefix) => {
+                        match self
+                            .store
+                            .get_session_by_prefix(&self.repo_id, &self.scope_id, &prefix)
+                            .await
+                        {
+                            Ok(Some(target)) => {
+                                self.session_id = target.session_id.clone();
+                                self.session_started_at = target.started_at;
+                                self.session_telemetry = SessionTelemetry {
+                                    input_tokens: target.input_tokens,
+                                    output_tokens: target.output_tokens,
+                                    cached_input_tokens: target.cached_input_tokens,
+                                    cache_creation_tokens: target.cache_creation_tokens,
+                                    estimated_cost_usd: target.estimated_cost_usd,
+                                };
+                                let mut restored =
+                                    CompactingHistory::new(target.rolling_summary.clone());
+                                restored.apply_policy(
+                                    self.active_harness.compaction.keep_recent_units,
+                                    self.active_harness.compaction.compaction_ratio,
+                                    self.active_harness.compaction.max_rollup_chars,
+                                );
+                                self.history = restored;
+                                let _ = ui_tx.send(UiEvent::SystemNotice(format!(
+                                    "Resumed session `{}` (started {}, rolling summary loaded).",
+                                    &target.session_id[..target.session_id.len().min(8)],
+                                    target.started_at.format("%Y-%m-%d %H:%M UTC"),
+                                )));
+                                if let Ok(snap) = self.inspector_snapshot().await {
+                                    let _ = ui_tx.send(UiEvent::InspectorUpdated(snap));
+                                }
+                            }
+                            Ok(None) => {
+                                let _ = ui_tx.send(UiEvent::Error(format!(
+                                    "Session '{prefix}' not found for this repository partition."
+                                )));
+                            }
+                            Err(err) => {
+                                let _ = ui_tx.send(UiEvent::Error(err.to_string()));
+                            }
+                        }
+                    }
                     UserCommand::RequestSkills => match self.list_skills().await {
                         Ok(skills) => {
                             let _ = ui_tx.send(UiEvent::SkillsList {
@@ -961,6 +1470,116 @@ impl AllyHOrchestrator {
                             }
                         }
                     }
+                    UserCommand::RequestSimSummary => match self.load_sim_ledger("").await {
+                        Ok(ledger) => {
+                            let _ = ui_tx.send(UiEvent::SimSummary {
+                                ledger,
+                                active_harness_label: self.active_harness_label(),
+                                active_harness_hash: self.active_harness.sha256_hash(),
+                            });
+                        }
+                        Err(err) => {
+                            let _ = ui_tx.send(UiEvent::Error(err.to_string()));
+                        }
+                    },
+                    UserCommand::RequestSimProblems => match self.load_sim_ledger("").await {
+                        Ok(ledger) => {
+                            let _ = ui_tx.send(UiEvent::SimProblems(ledger));
+                        }
+                        Err(err) => {
+                            let _ = ui_tx.send(UiEvent::Error(err.to_string()));
+                        }
+                    },
+                    UserCommand::ShowSimProblem(raw_id) => match self.load_sim_ledger("").await {
+                        Ok(Some(ledger)) => {
+                            let canonical = ledger.resolve_alias(&raw_id);
+                            let resolved_from = (!canonical.eq_ignore_ascii_case(raw_id.trim()))
+                                .then(|| raw_id.trim().to_string());
+                            if let Some(problem) = ledger.get_problem(&canonical).cloned() {
+                                let _ = ui_tx.send(UiEvent::SimProblemDetail {
+                                    problem,
+                                    resolved_from,
+                                });
+                            } else {
+                                let _ = ui_tx.send(UiEvent::Error(format!(
+                                    "SIM problem '{raw_id}' not found. Run `/sim list` to see recorded problems."
+                                )));
+                            }
+                        }
+                        Ok(None) => {
+                            let _ = ui_tx.send(UiEvent::SystemNotice(
+                                "No Self-Improvement Memory (SIM) runs recorded for this partition yet.".to_string(),
+                            ));
+                        }
+                        Err(err) => {
+                            let _ = ui_tx.send(UiEvent::Error(err.to_string()));
+                        }
+                    },
+                    UserCommand::ExportSim(path) => match self.export_sim_document(None).await {
+                        Ok(Some(doc)) => match serde_json::to_string_pretty(&doc) {
+                            Ok(json) => {
+                                if let Some(parent) = path.parent()
+                                    && !parent.as_os_str().is_empty()
+                                {
+                                    let _ = std::fs::create_dir_all(parent);
+                                }
+                                match std::fs::write(&path, json) {
+                                    Ok(()) => {
+                                        let _ = ui_tx.send(UiEvent::SystemNotice(format!(
+                                            "Exported SIM ledger ({} problem(s)) to `{}`.",
+                                            doc.problems.len(),
+                                            path.display()
+                                        )));
+                                    }
+                                    Err(err) => {
+                                        let _ = ui_tx.send(UiEvent::Error(format!(
+                                            "Failed to write SIM export '{}': {err}",
+                                            path.display()
+                                        )));
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                let _ = ui_tx.send(UiEvent::Error(err.to_string()));
+                            }
+                        },
+                        Ok(None) => {
+                            let _ = ui_tx.send(UiEvent::SystemNotice(
+                                "No SIM run available to export.".to_string(),
+                            ));
+                        }
+                        Err(err) => {
+                            let _ = ui_tx.send(UiEvent::Error(err.to_string()));
+                        }
+                    },
+                    UserCommand::ShowActiveHarness => {
+                        let _ = ui_tx.send(UiEvent::ActiveHarnessDetail {
+                            label: self.active_harness_label(),
+                            version_id: self
+                                .active_harness_record
+                                .as_ref()
+                                .map(|r| r.id.clone()),
+                            spec: self.active_harness.clone(),
+                        });
+                    }
+                    UserCommand::UseHarness(id_or_prefix) => {
+                        match self.activate_harness_version(&id_or_prefix).await {
+                            Ok(rec) => {
+                                let _ = ui_tx.send(UiEvent::SystemNotice(format!(
+                                    "Activated harness `{}` (id: `{}`, round {}).",
+                                    rec.label,
+                                    &rec.id[..rec.id.len().min(8)],
+                                    rec.round
+                                )));
+                                if let Ok(snap) = self.inspector_snapshot().await {
+                                    let _ = ui_tx.send(UiEvent::InspectorUpdated(snap));
+                                }
+                            }
+                            Err(err) => {
+                                let _ = ui_tx.send(UiEvent::Error(err.to_string()));
+                            }
+                        }
+                    }
                     UserCommand::RequestDbStatus => match self.db_status().await {
                         Ok(report) => {
                             let _ = ui_tx.send(UiEvent::DbStatus(report));
@@ -969,6 +1588,170 @@ impl AllyHOrchestrator {
                             let _ = ui_tx.send(UiEvent::Error(err.to_string()));
                         }
                     },
+                    UserCommand::RequestRepoProfile => match self.get_repo_profile().await {
+                        Ok(profile) => {
+                            let _ = ui_tx.send(UiEvent::RepoProfileDetail {
+                                profile,
+                                detected_languages: self.last_env_delta.detected_languages.clone(),
+                                detected_toolchains: self.last_env_delta.detected_toolchains.clone(),
+                            });
+                        }
+                        Err(err) => {
+                            let _ = ui_tx.send(UiEvent::Error(err.to_string()));
+                        }
+                    },
+                    UserCommand::SaveRepoProfile(profile) => {
+                        match self.save_repo_profile(profile).await {
+                            Ok(saved) => {
+                                let _ = ui_tx.send(UiEvent::SystemNotice(format!(
+                                    "Saved out-of-tree repository profile in LanceDB (check: {}, lint: {}, test: {}).",
+                                    saved.check_command.as_deref().unwrap_or("auto"),
+                                    saved.lint_command.as_deref().unwrap_or("auto"),
+                                    saved.test_command.as_deref().unwrap_or("auto"),
+                                )));
+                                if let Ok(snap) = self.inspector_snapshot().await {
+                                    let _ = ui_tx.send(UiEvent::InspectorUpdated(snap));
+                                }
+                            }
+                            Err(err) => {
+                                let _ = ui_tx.send(UiEvent::Error(err.to_string()));
+                            }
+                        }
+                    }
+                    UserCommand::ResetRepoProfile => match self.reset_repo_profile().await {
+                        Ok(()) => {
+                            let _ = ui_tx.send(UiEvent::SystemNotice(
+                                "Reset repository profile; restored automatic language and toolchain detection.".to_string(),
+                            ));
+                            if let Ok(snap) = self.inspector_snapshot().await {
+                                let _ = ui_tx.send(UiEvent::InspectorUpdated(snap));
+                            }
+                        }
+                        Err(err) => {
+                            let _ = ui_tx.send(UiEvent::Error(err.to_string()));
+                        }
+                    },
+                    UserCommand::RequestLspStatus => {
+                        let statuses = self.env.lsp_status().await;
+                        let _ = ui_tx.send(UiEvent::LspStatus(statuses));
+                    }
+                    UserCommand::RestartLsp(family) => match self.env.restart_lsp(family.as_deref()).await {
+                        Ok(statuses) => {
+                            let target = family.as_deref().unwrap_or("all");
+                            let _ = ui_tx.send(UiEvent::SystemNotice(format!(
+                                "Restarted LSP server(s) for `{target}`."
+                            )));
+                            let _ = ui_tx.send(UiEvent::LspStatus(statuses));
+                            if let Ok(snap) = self.inspector_snapshot().await {
+                                let _ = ui_tx.send(UiEvent::InspectorUpdated(snap));
+                            }
+                        }
+                        Err(err) => {
+                            let _ = ui_tx.send(UiEvent::Error(err.to_string()));
+                        }
+                    },
+                    UserCommand::RequestMcpStatus => {
+                        let statuses = self.toolset.mcp_clients().status().await;
+                        let _ = ui_tx.send(UiEvent::McpStatus(statuses));
+                    }
+                    UserCommand::AddMcpServer(cfg) => {
+                        let mut profile = self
+                            .get_repo_profile()
+                            .await
+                            .ok()
+                            .flatten()
+                            .unwrap_or_else(|| RepoProfile::empty(&self.repo_id, &self.scope_id));
+                        profile
+                            .mcp_servers
+                            .retain(|s| !s.name.eq_ignore_ascii_case(&cfg.name));
+                        profile.mcp_servers.push(cfg.clone());
+                        let _ = self.store.upsert_repo_profile(&profile).await;
+
+                        match self.toolset.mcp_clients().connect_server(cfg).await {
+                            Ok(status) => {
+                                let _ = ui_tx.send(UiEvent::SystemNotice(format!(
+                                    "Connected MCP server `{}` ({}) — mounted {} tool(s).",
+                                    status.name, status.transport, status.tool_count
+                                )));
+                                if let Ok(snap) = self.inspector_snapshot().await {
+                                    let _ = ui_tx.send(UiEvent::InspectorUpdated(snap));
+                                }
+                            }
+                            Err(err) => {
+                                let _ = ui_tx.send(UiEvent::Error(format!(
+                                    "Saved MCP server config, but connection failed: {err}"
+                                )));
+                            }
+                        }
+                    }
+                    UserCommand::RemoveMcpServer(name) => {
+                        let removed_live = self.toolset.mcp_clients().disconnect_server(&name).await;
+                        let mut removed_profile = false;
+                        if let Ok(Some(mut profile)) = self.get_repo_profile().await {
+                            let before = profile.mcp_servers.len();
+                            profile
+                                .mcp_servers
+                                .retain(|s| !s.name.eq_ignore_ascii_case(&name));
+                            if profile.mcp_servers.len() != before {
+                                removed_profile = true;
+                                let _ = self.store.upsert_repo_profile(&profile).await;
+                            }
+                        }
+                        if removed_live || removed_profile {
+                            let _ = ui_tx.send(UiEvent::SystemNotice(format!(
+                                "Disconnected and removed MCP server `{name}`."
+                            )));
+                            if let Ok(snap) = self.inspector_snapshot().await {
+                                let _ = ui_tx.send(UiEvent::InspectorUpdated(snap));
+                            }
+                        } else {
+                            let _ = ui_tx.send(UiEvent::Error(format!(
+                                "MCP server '{name}' not found."
+                            )));
+                        }
+                    }
+                    UserCommand::RequestCheckpointDiff => {
+                        let diff = self.checkpoint_diff();
+                        let _ = ui_tx.send(UiEvent::CheckpointDiff(diff));
+                    }
+                    UserCommand::RollbackCheckpoint => match self.rollback_checkpoint().await {
+                        Ok(Some(rep)) => {
+                            let _ = ui_tx.send(UiEvent::SystemNotice(format!(
+                                "Rolled back workspace to checkpoint `{}` ({} file(s) restored, {} created file(s) removed).",
+                                rep.checkpoint_label,
+                                rep.restored_files.len(),
+                                rep.removed_files.len()
+                            )));
+                            if let Ok(snap) = self.inspector_snapshot().await {
+                                let _ = ui_tx.send(UiEvent::InspectorUpdated(snap));
+                            }
+                        }
+                        Ok(None) => {
+                            let _ = ui_tx.send(UiEvent::SystemNotice(
+                                "No active checkpoint to roll back to. Approve a plan with `/plan <goal>` to capture an automatic pre-execution checkpoint.".to_string(),
+                            ));
+                        }
+                        Err(err) => {
+                            let _ = ui_tx.send(UiEvent::Error(err.to_string()));
+                        }
+                    },
+                    UserCommand::ApproveCommandOnce(cmd) => {
+                        self.toolset.command_policy().approve_once(&cmd);
+                        let _ = ui_tx.send(UiEvent::SystemNotice(format!(
+                            "Approved command once: `{cmd}`. Re-run or ask AllyH to retry the command."
+                        )));
+                    }
+                    UserCommand::AllowCommandPattern(pattern) => {
+                        self.toolset.command_policy().allow_pattern(&pattern);
+                        let _ = ui_tx.send(UiEvent::SystemNotice(format!(
+                            "Allowlisted command pattern for this session: `{pattern}`."
+                        )));
+                    }
+                    UserCommand::DenyCommand(cmd) => {
+                        let _ = ui_tx.send(UiEvent::SystemNotice(format!(
+                            "Denied command: `{cmd}`."
+                        )));
+                    }
                     UserCommand::RefreshEnv { run_build_check } => {
                         match self.refresh_env(run_build_check).await {
                             Ok(_) => {
@@ -1001,6 +1784,8 @@ impl AllyHOrchestrator {
                         }
                     }
                     UserCommand::Shutdown => {
+                        self.toolset.mcp_clients().shutdown_all().await;
+                        self.env.shutdown_lsp().await;
                         self.sleep_worker.enqueue(SleepJob::Shutdown);
                         break;
                     }
@@ -1026,7 +1811,7 @@ impl AllyHOrchestrator {
                 title,
                 acceptance_criteria: vec![
                     "Changes respect all active LanceDB architectural invariants".to_string(),
-                    "cargo check and cargo test pass with 0 errors".to_string(),
+                    "Automated verification checks and tests pass with 0 errors".to_string(),
                 ],
             }],
         }

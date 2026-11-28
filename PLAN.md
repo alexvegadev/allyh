@@ -27,6 +27,7 @@ Modern LLMs possess sufficient raw coding intelligence, yet fail in long-running
 | **Agent-Computer Interface & Compiler Diagnostics** (*SWE-agent*, *CoDAIM 2026*) | Actionable, prescriptive diagnostics improve repair accuracy by +22%+ even on 7B models. | Group file operations into compact tools, verify edits via file hashes, and automatically append structured `cargo check` / `clippy` diagnostics to every `ToolOutput`. |
 | **Code Dependency Graphs** (*RepoGraph*) | Reading entire files saturates context windows rapidly. | Use `tree-sitter` to build a symbol/reference graph stored in LanceDB and inject compact 1-hop/2-hop *ego-graphs* around target symbols into the dynamic preamble. |
 | **Adaptive Harness & Hierarchical Routing** (*MemoHarness*, *TO-Router*) | Different tasks require different context budgets and model tiers. | Route heavy reasoning/coding to frontier APIs (or large local models) while delegating context compression, diff summarization, and embeddings to fast local models. |
+| **Self-Improvement Memory & CRSI** (*Google Cloud AI / Google DeepMind*, arXiv:2611.18856) | Evolved harnesses alone lose the rationale, outcomes, and provenance behind past edits when benchmarks or policy models change. | Maintain a meta-level SIM ledger (`sim_runs`, `sim_problems`, `sim_attempts`, `harness_versions`) separate from task memory; condition both Proposer and two-stage Selector on the complete SIM ledger over versioned `HarnessSpec`s with strict Evolve/Held-Out split isolation. |
 
 ---
 
@@ -63,11 +64,12 @@ The `allyh` binary runs an event-driven Tokio actor topology so the 60 FPS TUI n
 allyh/
 ├── Cargo.toml                  # Workspace definition
 └── crates/
-    ├── allyh-core/             # State machine, Rig loop, dynamic preamble assembler, gates
-    ├── allyh-memory/           # LanceDB connection manager, Arrow schemas, hybrid search, sleep-time worker
+    ├── allyh-core/             # State machine, HarnessSpec, CompletionInterlock, Rig loop, dynamic preamble assembler, gates
+    ├── allyh-memory/           # LanceDB connection manager, Arrow schemas (including SIM tables), hybrid search, sleep-time worker
     ├── allyh-env/              # notify FS watcher, git2 tracker, tree-sitter RepoGraph, cargo runner
-    ├── allyh-tools/            # Compact ACI rig::tool::Tool implementations with post-edit hooks
-    └── allyh-tui/              # Ratatui + Crossterm binary (`allyh`), multiline input, live inspector
+    ├── allyh-tools/            # Compact ACI rig::tool::Tool implementations (including inspect_sim) with post-edit hooks
+    ├── allyh-sim/              # CRSI optimizer: disjoint splits, SIM Proposer, two-stage Selector, runtime & command evaluators
+    └── allyh-tui/              # Ratatui + Crossterm binary (`allyh`), multiline input, live inspector, skills & sim CLIs
 ```
 
 ---

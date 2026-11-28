@@ -18,11 +18,17 @@ pub enum CoreError {
     #[error("JSON serialization error: {0}")]
     Json(#[from] serde_json::Error),
 
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
     #[error("Invalid model specification '{0}'")]
     InvalidModelSpec(String),
 
     #[error("Control gate error: {0}")]
     ControlGate(String),
+
+    #[error("Invalid harness specification: {0}")]
+    HarnessSpec(String),
 
     #[error("Orchestrator channel closed")]
     ChannelClosed,

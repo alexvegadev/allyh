@@ -1,10 +1,44 @@
 use std::path::{Path, PathBuf};
 
-use git2::{DiffOptions, Repository, StatusOptions};
+use chrono::{DateTime, Utc};
+use git2::{BlameOptions, DiffOptions, Repository, Sort, StatusOptions};
 use serde::{Deserialize, Serialize};
 
-use crate::error::Result;
-use crate::path::{canonicalize_normalized, path_to_slash_string, strip_root_prefix, strip_verbatim_prefix};
+use crate::error::{EnvError, Result};
+use crate::path::{
+    canonicalize_normalized, path_to_slash_string, strip_root_prefix, strip_verbatim_prefix,
+};
+
+/// Single commit entry returned by [`GitTracker::log`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitLogEntry {
+    pub commit: String,
+    pub short_commit: String,
+    pub author: String,
+    pub timestamp: String,
+    pub summary: String,
+}
+
+/// Structured working-tree / staged / branch diff report returned by [`GitTracker::diff`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GitDiffReport {
+    pub files_changed: usize,
+    pub insertions: usize,
+    pub deletions: usize,
+    #[serde(default)]
+    pub changed_files: Vec<String>,
+    pub patch: String,
+    pub truncated: bool,
+}
+
+/// Single line attribution returned by [`GitTracker::blame`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitBlameLine {
+    pub line: usize,
+    pub commit: String,
+    pub author: String,
+    pub content: String,
+}
 
 /// Snapshot of a repository's current Git state.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -32,14 +66,23 @@ impl GitTracker {
     }
 
     /// Return the canonical identifier used to derive `repo_id` (origin URL if present,
-    /// otherwise canonicalized repository root path).
+    /// otherwise canonicalized main repository root — shared across all `git worktree`s).
     pub fn canonical_repo_identifier(&self) -> String {
-        if let Ok(repo) = Repository::discover(&self.repo_root)
-            && let Ok(remote) = repo.find_remote("origin")
-            && let Some(url) = remote.url()
-            && !url.trim().is_empty()
-        {
-            return url.trim().to_string();
+        if let Ok(repo) = Repository::discover(&self.repo_root) {
+            if let Ok(remote) = repo.find_remote("origin")
+                && let Some(url) = remote.url()
+                && !url.trim().is_empty()
+            {
+                return url.trim().to_string();
+            }
+            // For linked git worktrees without an origin remote, resolve to the common main
+            // repository directory so every worktree shares the exact same `repo_id` partition.
+            if repo.is_worktree()
+                && let Some(common_parent) = repo.commondir().parent()
+            {
+                let canonical = canonicalize_normalized(common_parent);
+                return path_to_slash_string(&canonical);
+            }
         }
         let canonical = canonicalize_normalized(&self.repo_root);
         path_to_slash_string(&canonical)
@@ -169,4 +212,259 @@ impl GitTracker {
         let canonical_root = canonicalize_normalized(&self.repo_root);
         strip_root_prefix(path, &self.repo_root, &canonical_root)
     }
+
+    /// Read recent Git commits (`git log`), optionally filtered to commits touching `path_filter`.
+    pub fn log(&self, limit: usize, path_filter: Option<&str>) -> Result<Vec<GitLogEntry>> {
+        let repo = Repository::discover(&self.repo_root)
+            .map_err(|e| EnvError::Command(format!("not a git repository: {e}")))?;
+        let mut revwalk = repo
+            .revwalk()
+            .map_err(|e| EnvError::Command(format!("git revwalk failed: {e}")))?;
+        revwalk.set_sorting(Sort::TIME).ok();
+        if revwalk.push_head().is_err() {
+            return Ok(Vec::new());
+        }
+
+        let norm_filter = path_filter
+            .map(|p| p.trim().replace('\\', "/").trim_matches('/').to_string())
+            .filter(|p| !p.is_empty());
+
+        let max_entries = limit.clamp(1, 50);
+        let mut out = Vec::new();
+        for oid_res in revwalk {
+            let Ok(oid) = oid_res else { continue };
+            let Ok(commit) = repo.find_commit(oid) else {
+                continue;
+            };
+            if let Some(ref filter) = norm_filter
+                && !commit_touches_path(&repo, &commit, filter)
+            {
+                continue;
+            }
+            let full_id = oid.to_string();
+            let short_commit: String = full_id.chars().take(8).collect();
+            let author = commit.author().name().unwrap_or("unknown").to_string();
+            let secs = commit.time().seconds();
+            let timestamp = DateTime::<Utc>::from_timestamp(secs, 0)
+                .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+                .unwrap_or_else(|| secs.to_string());
+            let summary = commit.summary().unwrap_or("").to_string();
+
+            out.push(GitLogEntry {
+                commit: full_id,
+                short_commit,
+                author,
+                timestamp,
+                summary,
+            });
+            if out.len() >= max_entries {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Compute structured unified diff for unstaged (`staged = false`) or staged (`staged = true`) changes.
+    pub fn diff(
+        &self,
+        staged: bool,
+        path_filter: Option<&str>,
+        max_chars: usize,
+    ) -> Result<GitDiffReport> {
+        let repo = Repository::discover(&self.repo_root)
+            .map_err(|e| EnvError::Command(format!("not a git repository: {e}")))?;
+        let mut opts = DiffOptions::new();
+        opts.context_lines(2);
+        if let Some(p) = path_filter.map(str::trim).filter(|s| !s.is_empty()) {
+            opts.pathspec(p.replace('\\', "/"));
+        }
+
+        let diff = if staged {
+            let head_tree = repo
+                .head()
+                .ok()
+                .and_then(|h| h.peel_to_tree().ok());
+            repo.diff_tree_to_index(head_tree.as_ref(), None, Some(&mut opts))
+        } else {
+            repo.diff_index_to_workdir(None, Some(&mut opts))
+        }
+        .map_err(|e| EnvError::Command(format!("git diff failed: {e}")))?;
+
+        let stats = diff
+            .stats()
+            .map_err(|e| EnvError::Command(format!("git diff stats failed: {e}")))?;
+        let cap = max_chars.clamp(256, 32_000);
+        let mut lines = Vec::new();
+        let mut chars = 0usize;
+        let mut truncated = false;
+
+        let _ = diff.print(git2::DiffFormat::Patch, |_delta, _hunk, line| {
+            if chars >= cap {
+                truncated = true;
+                return false;
+            }
+            if let Ok(text) = std::str::from_utf8(line.content()) {
+                let origin = line.origin();
+                let formatted = if matches!(origin, '+' | '-' | ' ') {
+                    format!("{origin}{}", text.trim_end_matches(['\r', '\n']))
+                } else {
+                    text.trim_end_matches(['\r', '\n']).to_string()
+                };
+                chars += formatted.len() + 1;
+                lines.push(formatted);
+            }
+            true
+        });
+
+        let mut changed_files = Vec::new();
+        for delta in diff.deltas() {
+            if let Some(p) = delta.new_file().path().or_else(|| delta.old_file().path()) {
+                let s = path_to_slash_string(p);
+                if !changed_files.contains(&s) {
+                    changed_files.push(s);
+                }
+            }
+        }
+        changed_files.sort();
+
+        Ok(GitDiffReport {
+            files_changed: stats.files_changed(),
+            insertions: stats.insertions(),
+            deletions: stats.deletions(),
+            changed_files,
+            patch: lines.join("\n"),
+            truncated,
+        })
+    }
+
+    /// Compute structured unified diff from a base Git ref (e.g. `main`, `HEAD~1`, or commit SHA)
+    /// to the current working tree (including committed branch changes and staged/unstaged edits).
+    pub fn diff_against_base(&self, base_ref: &str, max_chars: usize) -> Result<GitDiffReport> {
+        let repo = Repository::discover(&self.repo_root)
+            .map_err(|e| EnvError::Command(format!("not a git repository: {e}")))?;
+        let base_obj = repo
+            .revparse_single(base_ref.trim())
+            .map_err(|e| EnvError::Command(format!("unknown base ref '{base_ref}': {e}")))?;
+        let base_tree = base_obj
+            .peel_to_tree()
+            .map_err(|e| EnvError::Command(format!("failed to peel '{base_ref}' to tree: {e}")))?;
+
+        let mut opts = DiffOptions::new();
+        opts.context_lines(2)
+            .include_untracked(true)
+            .recurse_untracked_dirs(true)
+            .show_untracked_content(true);
+
+        let diff = repo
+            .diff_tree_to_workdir_with_index(Some(&base_tree), Some(&mut opts))
+            .map_err(|e| EnvError::Command(format!("git diff against '{base_ref}' failed: {e}")))?;
+        let stats = diff
+            .stats()
+            .map_err(|e| EnvError::Command(format!("git diff stats failed: {e}")))?;
+
+        let mut changed_files = Vec::new();
+        for delta in diff.deltas() {
+            if let Some(p) = delta.new_file().path().or_else(|| delta.old_file().path()) {
+                let s = path_to_slash_string(p);
+                if !s.starts_with("target/") && !s.starts_with(".git/") && !changed_files.contains(&s)
+                {
+                    changed_files.push(s);
+                }
+            }
+        }
+        changed_files.sort();
+
+        let cap = max_chars.clamp(512, 64_000);
+        let mut lines = Vec::new();
+        let mut chars = 0usize;
+        let mut truncated = false;
+        let _ = diff.print(git2::DiffFormat::Patch, |_delta, _hunk, line| {
+            if chars >= cap {
+                truncated = true;
+                return false;
+            }
+            if let Ok(text) = std::str::from_utf8(line.content()) {
+                let origin = line.origin();
+                let formatted = if matches!(origin, '+' | '-' | ' ') {
+                    format!("{origin}{}", text.trim_end_matches(['\r', '\n']))
+                } else {
+                    text.trim_end_matches(['\r', '\n']).to_string()
+                };
+                chars += formatted.len() + 1;
+                lines.push(formatted);
+            }
+            true
+        });
+
+        Ok(GitDiffReport {
+            files_changed: stats.files_changed(),
+            insertions: stats.insertions(),
+            deletions: stats.deletions(),
+            changed_files,
+            patch: lines.join("\n"),
+            truncated,
+        })
+    }
+
+    /// Read structured line-by-line Git blame attribution for `rel_path` in `[start_line..=end_line]`.
+    pub fn blame(
+        &self,
+        rel_path: &str,
+        start_line: usize,
+        end_line: usize,
+    ) -> Result<Vec<GitBlameLine>> {
+        let repo = Repository::discover(&self.repo_root)
+            .map_err(|e| EnvError::Command(format!("not a git repository: {e}")))?;
+        let norm_rel = rel_path.trim().replace('\\', "/").trim_start_matches("./").to_string();
+        let abs = self.repo_root.join(&norm_rel);
+        let content = std::fs::read_to_string(&abs)?;
+        let file_lines: Vec<&str> = content.lines().collect();
+        if file_lines.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let s = start_line.max(1).min(file_lines.len());
+        let e = end_line.max(s).min(file_lines.len()).min(s + 120);
+
+        let mut opts = BlameOptions::new();
+        opts.min_line(s).max_line(e);
+        let blame = repo
+            .blame_file(Path::new(&norm_rel), Some(&mut opts))
+            .map_err(|err| EnvError::Command(format!("git blame failed for `{norm_rel}`: {err}")))?;
+
+        let mut out = Vec::new();
+        for line_no in s..=e {
+            let (commit, author) = match blame.get_line(line_no) {
+                Some(hunk) => {
+                    let cid: String = hunk.final_commit_id().to_string().chars().take(8).collect();
+                    let auth = hunk
+                        .final_signature()
+                        .name()
+                        .unwrap_or("uncommitted")
+                        .to_string();
+                    (cid, auth)
+                }
+                None => ("00000000".to_string(), "uncommitted".to_string()),
+            };
+            out.push(GitBlameLine {
+                line: line_no,
+                commit,
+                author,
+                content: file_lines[line_no - 1].to_string(),
+            });
+        }
+        Ok(out)
+    }
+}
+
+fn commit_touches_path(repo: &Repository, commit: &git2::Commit<'_>, path_prefix: &str) -> bool {
+    let Ok(tree) = commit.tree() else {
+        return false;
+    };
+    let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
+    let mut opts = DiffOptions::new();
+    opts.pathspec(path_prefix);
+    repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut opts))
+        .ok()
+        .is_some_and(|d| d.deltas().len() > 0)
 }

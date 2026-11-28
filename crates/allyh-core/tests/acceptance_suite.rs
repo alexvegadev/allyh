@@ -20,9 +20,10 @@ fn make_config(repo_dir: &std::path::Path, db_dir: &std::path::Path, scope_id: &
         repo_root: repo_dir.to_path_buf(),
         storage: StorageConfig::from_local_path(db_dir),
         scope_id: scope_id.to_string(),
-        auto_cargo_check: false,
+        auto_verify: false,
         idle_optimize_interval: Duration::from_secs(60),
         enable_fs_watcher: false,
+        extra_mcp_servers: Vec::new(),
     }
 }
 
@@ -417,4 +418,575 @@ async fn test_skills_progressive_disclosure_and_actor_commands() {
 
     cmd_tx.send(UserCommand::Shutdown).unwrap();
 }
+
+/// Milestone 1 Polyglot Acceptance Suite:
+/// Verifies end-to-end indexing, RepoGraph ego-graphs, monorepo toolchain detection,
+/// out-of-tree `RepoProfile` custom verification gating `TaskStatus::Verified`,
+/// and backward-compatible `HarnessSpec` / `CompletionInterlock` deserialization.
+#[tokio::test]
+async fn polyglot_monorepo_acceptance_suite() {
+    use allyh_core::{CompletionInterlock, CompletionInterlockPolicy, HarnessSpec, InterlockDecision};
+    use allyh_memory::{RepoProfile, TaskStatus};
+    use allyh_tools::{EditByHashArgs, InspectSymbolArgs, RunVerificationArgs};
+
+    let tmp = TempDir::new().expect("tempdir");
+    let db_dir = tmp.path().join("db");
+    let repo_dir = tmp.path().join("poly_monorepo");
+
+    std::fs::create_dir_all(repo_dir.join("backend/src")).unwrap();
+    std::fs::create_dir_all(repo_dir.join("web/src")).unwrap();
+    std::fs::create_dir_all(repo_dir.join("ml")).unwrap();
+    std::fs::create_dir_all(repo_dir.join("svc")).unwrap();
+
+    std::fs::write(
+        repo_dir.join("backend/Cargo.toml"),
+        "[package]\nname = \"backend\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo_dir.join("backend/src/lib.rs"),
+        "pub fn health_check() -> bool { true }\n",
+    )
+    .unwrap();
+    std::fs::write(repo_dir.join("web/tsconfig.json"), "{}").unwrap();
+    std::fs::write(
+        repo_dir.join("web/src/client.ts"),
+        "export function fetchStatus(): string { return 'ok'; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo_dir.join("web/src/App.tsx"),
+        "import { fetchStatus } from './client';\nexport function StatusBanner() { return <span>{fetchStatus()}</span>; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo_dir.join("ml/pyproject.toml"),
+        "[project]\nname = \"ml\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo_dir.join("ml/score.py"),
+        "def compute_score(x: int) -> int:\n    return normalize(x)\n\ndef normalize(v: int) -> int:\n    return v * 2\n",
+    )
+    .unwrap();
+    std::fs::write(repo_dir.join("svc/go.mod"), "module example.com/svc\n").unwrap();
+    std::fs::write(
+        repo_dir.join("svc/main.go"),
+        "package main\n\ntype Engine struct{}\nfunc (e *Engine) Start() int { return boot() }\nfunc boot() int { return 1 }\n",
+    )
+    .unwrap();
+
+    let mut cfg = make_config(&repo_dir, &db_dir, "default");
+    cfg.auto_verify = true;
+    let mut orch = AllyHOrchestrator::initialize(cfg, offline_router(), None)
+        .await
+        .expect("init polyglot orchestrator");
+
+    // 1. Inspector detects all four languages & toolchains automatically
+    let snap = orch.inspector_snapshot().await.expect("snap");
+    for lang in ["Rust", "TypeScript", "Python", "Go"] {
+        assert!(
+            snap.detected_languages.iter().any(|l| l == lang),
+            "expected language {lang} in {:?}",
+            snap.detected_languages
+        );
+    }
+    assert_eq!(snap.detected_toolchains.len(), 4);
+
+    // 2. Inspect polyglot symbols with accurate 1-hop ego-graphs and language tags
+    let tsx_inspect = orch
+        .toolset()
+        .inspect_tool()
+        .execute(InspectSymbolArgs {
+            query: "StatusBanner".into(),
+            hops: Some(1),
+            start_line: None,
+            end_line: None,
+        })
+        .await
+        .expect("inspect tsx");
+    assert_eq!(tsx_inspect.matched_files[0].language, "tsx");
+    assert!(
+        tsx_inspect
+            .ego_graph
+            .hop1_neighbors
+            .iter()
+            .any(|e| e.to_symbol == "fetchStatus")
+    );
+
+    let py_inspect = orch
+        .toolset()
+        .inspect_tool()
+        .execute(InspectSymbolArgs {
+            query: "compute_score".into(),
+            hops: Some(1),
+            start_line: None,
+            end_line: None,
+        })
+        .await
+        .expect("inspect py");
+    assert_eq!(py_inspect.matched_files[0].language, "python");
+    assert!(
+        py_inspect
+            .ego_graph
+            .hop1_neighbors
+            .iter()
+            .any(|e| e.to_symbol == "normalize")
+    );
+
+    let go_inspect = orch
+        .toolset()
+        .inspect_tool()
+        .execute(InspectSymbolArgs {
+            query: "Engine.Start".into(),
+            hops: Some(1),
+            start_line: None,
+            end_line: None,
+        })
+        .await
+        .expect("inspect go");
+    assert_eq!(go_inspect.matched_files[0].language, "go");
+    assert!(
+        go_inspect
+            .ego_graph
+            .hop1_neighbors
+            .iter()
+            .any(|e| e.to_symbol == "boot")
+    );
+
+    // 3. Configure out-of-tree RepoProfile custom verifier (no dotfiles written into repo!)
+    let pass_cmd = "echo verified-ok";
+    let mut profile = RepoProfile::empty(orch.repo_id(), orch.scope_id());
+    profile.check_command = Some(pass_cmd.into());
+    profile.test_command = Some(pass_cmd.into());
+    orch.save_repo_profile(profile).await.expect("save profile");
+    assert!(!repo_dir.join(".allyh.toml").exists());
+
+    // 4. Approve a plan, edit a TypeScript file with auto-verify, and verify the LanceDB task
+    orch.propose_plan(AllyHOrchestrator::build_quick_plan("Update web client"));
+    let tasks = orch.approve_plan().await.expect("approve plan");
+    let task_id = tasks[0].id.clone();
+
+    let client_inspect = orch
+        .toolset()
+        .inspect_tool()
+        .execute(InspectSymbolArgs {
+            query: "web/src/client.ts".into(),
+            hops: Some(1),
+            start_line: None,
+            end_line: None,
+        })
+        .await
+        .expect("inspect client.ts");
+    let hash = client_inspect.matched_files[0].sha256_hash.clone();
+
+    let edit_out = orch
+        .toolset()
+        .edit_tool()
+        .execute(EditByHashArgs {
+            file_path: "web/src/client.ts".into(),
+            expected_sha256: Some(hash),
+            target_snippet: Some("'ok'".into()),
+            replacement_snippet: Some("'healthy'".into()),
+            hunks: None,
+            full_content: None,
+            create_if_missing: None,
+            target_scope: None,
+            toolchain: None,
+        })
+        .await
+        .expect("edit web/src/client.ts");
+    assert!(
+        edit_out
+            .verification
+            .as_ref()
+            .is_some_and(|v| v.success && v.toolchain == "custom")
+    );
+
+    let verify_out = orch
+        .toolset()
+        .verify_tool()
+        .execute(RunVerificationArgs {
+            kind: Some("test".into()),
+            target: None,
+            test_filter: None,
+            toolchain: None,
+            affected_file: Some("web/src/client.ts".into()),
+            task_id: Some(task_id.clone()),
+        })
+        .await
+        .expect("run_verification");
+    assert_eq!(verify_out.verified_task_id.as_deref(), Some(task_id.as_str()));
+
+    let updated_tasks = orch
+        .store()
+        .list_tasks(orch.repo_id(), orch.scope_id())
+        .await
+        .expect("list tasks");
+    assert_eq!(updated_tasks[0].status, TaskStatus::Verified);
+
+    // 5. Legacy HarnessSpec JSON (`auto_cargo_check`) + CompletionInterlock (`verification` payload)
+    let mut legacy_json = serde_json::to_value(HarnessSpec::default_seed()).unwrap();
+    legacy_json["tools"].as_object_mut().unwrap().remove("auto_verify");
+    legacy_json["tools"]["auto_cargo_check"] = serde_json::json!(false);
+    let parsed_legacy: HarnessSpec =
+        serde_json::from_value(legacy_json).expect("legacy auto_cargo_check alias must deserialize");
+    assert!(!parsed_legacy.tools.auto_verify);
+
+    let mut interlock = CompletionInterlock::new(CompletionInterlockPolicy {
+        enabled: true,
+        max_consecutive_rejections: 2,
+        require_verification_after_edits: true,
+        reject_on_recent_tool_error: true,
+        quality_audit_notice: None,
+        budget_reminder_ratio: None,
+    });
+    interlock.observe_tool_round(&[allyh_tools::ToolExecutionRecord {
+        tool_name: "edit_by_hash".into(),
+        compact_header: "edit_by_hash(web/src/client.ts) -> custom check: PASS".into(),
+        succeeded: true,
+        output_text: String::new(),
+        output_json: serde_json::json!({ "verification": { "success": true } }),
+    }]);
+    assert_eq!(interlock.check_completion("Done"), InterlockDecision::Allow);
+}
+
+#[tokio::test]
+async fn test_atomic_plan_checkpoint_diff_and_rollback() {
+    use allyh_tools::{EditByHashArgs, InspectSymbolArgs};
+
+    let tmp = TempDir::new().expect("tempdir");
+    let db_dir = tmp.path().join("db");
+    let repo_dir = tmp.path().join("repo");
+    std::fs::create_dir_all(repo_dir.join("src")).unwrap();
+    let lib_path = repo_dir.join("src/lib.rs");
+    let orig_code = "pub fn answer() -> i32 { 42 }\n";
+    std::fs::write(&lib_path, orig_code).unwrap();
+
+    let mut orch = AllyHOrchestrator::initialize(
+        make_config(&repo_dir, &db_dir, "default"),
+        offline_router(),
+        None,
+    )
+    .await
+    .expect("init");
+
+    // Approving a plan automatically captures an out-of-tree checkpoint.
+    orch.propose_plan(AllyHOrchestrator::build_quick_plan("Refactor answer"));
+    orch.approve_plan().await.expect("approve");
+    let snap = orch.inspector_snapshot().await.expect("snap");
+    assert_eq!(snap.active_checkpoint_label.as_deref(), Some("Refactor answer"));
+
+    // Modify existing file AND create a new file.
+    let inspected = orch
+        .toolset()
+        .inspect_tool()
+        .execute(InspectSymbolArgs {
+            query: "src/lib.rs".into(),
+            hops: Some(1),
+            start_line: None,
+            end_line: None,
+        })
+        .await
+        .expect("inspect");
+    orch.toolset()
+        .edit_tool()
+        .execute(EditByHashArgs {
+            file_path: "src/lib.rs".into(),
+            expected_sha256: Some(inspected.matched_files[0].sha256_hash.clone()),
+            target_snippet: Some("42".into()),
+            replacement_snippet: Some("99".into()),
+            hunks: None,
+            full_content: None,
+            create_if_missing: None,
+            target_scope: None,
+            toolchain: None,
+        })
+        .await
+        .expect("edit existing");
+    orch.toolset()
+        .edit_tool()
+        .execute(EditByHashArgs {
+            file_path: "src/extra.rs".into(),
+            expected_sha256: None,
+            target_snippet: None,
+            replacement_snippet: None,
+            hunks: None,
+            full_content: Some("pub fn extra() {}\n".into()),
+            create_if_missing: Some(true),
+            target_scope: None,
+            toolchain: None,
+        })
+        .await
+        .expect("create extra");
+
+    let diff = orch.checkpoint_diff().expect("checkpoint diff");
+    assert!(diff.has_changes());
+    assert_eq!(diff.modified_files, vec!["src/lib.rs"]);
+    assert_eq!(diff.created_files, vec!["src/extra.rs"]);
+    assert!(diff.unified_diff.contains("+pub fn answer() -> i32 { 99 }"));
+
+    // Rollback restores modified file byte-for-byte AND removes newly created file.
+    let rollback = orch
+        .rollback_checkpoint()
+        .await
+        .expect("rollback")
+        .expect("rollback report");
+    assert_eq!(rollback.restored_files, vec!["src/lib.rs"]);
+    assert_eq!(rollback.removed_files, vec!["src/extra.rs"]);
+    assert_eq!(std::fs::read_to_string(&lib_path).unwrap(), orig_code);
+    assert!(!repo_dir.join("src/extra.rs").exists());
+    assert!(!orch.checkpoint_diff().unwrap().has_changes());
+}
+
+fn init_git_repo_with_commit(repo_dir: &std::path::Path, files: &[(&str, &str)]) {
+    let repo = git2::Repository::init(repo_dir).expect("git init");
+    for (rel, content) in files {
+        let full = repo_dir.join(rel);
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent).expect("mkdir");
+        }
+        std::fs::write(&full, content).expect("write seed file");
+    }
+    let mut index = repo.index().expect("index");
+    index
+        .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+        .expect("add_all");
+    index.write().expect("write index");
+    let tree_id = index.write_tree().expect("write_tree");
+    let tree = repo.find_tree(tree_id).expect("find_tree");
+    let sig = git2::Signature::now("AllyH Test", "test@allyh.local").expect("sig");
+    repo.commit(Some("HEAD"), &sig, &sig, "initial commit", &tree, &[])
+        .expect("initial commit");
+}
+
+#[tokio::test]
+async fn test_headless_ci_audit_catches_invariant_drift_and_run_streams_jsonl() {
+    use allyh_core::{HeadlessMode, audit_repo_against_base, run_headless_turn};
+    use allyh_memory::CandidateDecision;
+
+    let tmp = TempDir::new().expect("tempdir");
+    let db_dir = tmp.path().join("ci_db");
+    let repo_dir = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).expect("mkdir repo");
+
+    init_git_repo_with_commit(
+        &repo_dir,
+        &[
+            ("crates/allyh-core/src/lib.rs", "pub fn ok() -> bool { true }\n"),
+            ("crates/allyh-tui/src/main.rs", "fn main() {}\n"),
+        ],
+    );
+
+    let mut orch = AllyHOrchestrator::initialize(
+        make_config(&repo_dir, &db_dir, "default"),
+        offline_router(),
+        None,
+    )
+    .await
+    .expect("init orchestrator");
+
+    // Persist an architectural invariant in LanceDB.
+    orch.commit_decision(CandidateDecision {
+        topic: "error-handling".into(),
+        rule_statement: "Use thiserror in allyh-core and anyhow only in allyh-tui".into(),
+        rationale: "Libraries must return typed errors".into(),
+        affected_paths: vec!["crates/allyh-core".into()],
+    })
+    .await
+    .expect("commit invariant");
+
+    // Introduce a deliberate violation in allyh-core + a compliant use in allyh-tui.
+    std::fs::write(
+        repo_dir.join("crates/allyh-core/src/lib.rs"),
+        "use anyhow::Result;\npub fn ok() -> Result<bool> { Ok(true) }\n",
+    )
+    .expect("write violating edit");
+    std::fs::write(
+        repo_dir.join("crates/allyh-tui/src/main.rs"),
+        "use anyhow::Result;\nfn main() -> Result<()> { Ok(()) }\n",
+    )
+    .expect("write allowed tui edit");
+
+    let audit = audit_repo_against_base(
+        orch.store(),
+        &repo_dir,
+        orch.repo_id(),
+        orch.scope_id(),
+        "HEAD",
+    )
+    .await
+    .expect("audit");
+    assert!(!audit.passed, "audit must fail when invariant is breached");
+    assert_eq!(audit.violations.len(), 1);
+    assert_eq!(audit.violations[0].file_path, "crates/allyh-core/src/lib.rs");
+
+    // Headless Discovery-Only run streams structured events and keeps writes locked.
+    let run_report = run_headless_turn(
+        &mut orch,
+        &repo_dir,
+        "Audit error handling in crates/allyh-core/src/lib.rs",
+        HeadlessMode::DiscoveryOnly,
+        false,
+        false,
+    )
+    .await
+    .expect("headless run");
+    assert!(run_report.passed);
+    assert!(!orch.toolset().writes_enabled());
+    assert!(run_report.events.len() >= 3);
+    for ev in &run_report.events {
+        let line = serde_json::to_string(ev).expect("serialize JSONL event");
+        assert!(line.starts_with('{') && line.ends_with('}'));
+    }
+}
+
+#[tokio::test]
+async fn test_multi_agent_worktree_isolation_cross_scope_warning_and_promotion() {
+    use allyh_env::WorktreeManager;
+    use allyh_memory::{CandidateDecision, HeuristicConflictJudge, MemoryConsolidator};
+
+    let tmp = TempDir::new().expect("tempdir");
+    let shared_db = tmp.path().join("shared_team_db");
+    let main_repo = tmp.path().join("main_repo");
+    let wt_dest = tmp.path().join("wt_task_auth");
+    std::fs::create_dir_all(&main_repo).expect("mkdir main");
+
+    init_git_repo_with_commit(
+        &main_repo,
+        &[("src/auth.rs", "pub fn verify_token() -> bool { false }\n")],
+    );
+
+    // 1. Spawn isolated Git worktree for agent scope `task-auth`
+    let wt = WorktreeManager::create_scoped_worktree(
+        &main_repo,
+        "task-auth",
+        Some("HEAD"),
+        Some(&wt_dest),
+    )
+    .expect("create scoped worktree");
+    assert!(wt.path.exists());
+    assert_eq!(wt.branch, "allyh/task-auth");
+
+    let listed = WorktreeManager::list_worktrees(&main_repo).expect("list worktrees");
+    assert!(listed.len() >= 2);
+
+    // 2. Initialize main (`team`) and worktree (`task-auth`) orchestrators on ONE shared LanceDB URI
+    let mut team_orch = AllyHOrchestrator::initialize(
+        make_config(&main_repo, &shared_db, "team"),
+        offline_router(),
+        None,
+    )
+    .await
+    .expect("init team orchestrator");
+
+    let mut agent_orch = AllyHOrchestrator::initialize(
+        make_config(&wt.path, &shared_db, "task-auth"),
+        offline_router(),
+        None,
+    )
+    .await
+    .expect("init agent worktree orchestrator");
+
+    // Both main checkout and linked git worktree MUST share the exact same canonical repo_id!
+    assert_eq!(team_orch.repo_id(), agent_orch.repo_id());
+
+    // Seed an older rule in `team`
+    team_orch
+        .commit_decision(CandidateDecision {
+            topic: "auth-tokens".into(),
+            rule_statement: "Use HS256 shared secret for JWT signing".into(),
+            rationale: "Initial prototype".into(),
+            affected_paths: vec!["src/auth.rs".into()],
+        })
+        .await
+        .expect("seed team rule");
+
+    // 3. Agent edits `src/auth.rs` inside its isolated worktree without touching main checkout!
+    std::fs::write(
+        wt.path.join("src/auth.rs"),
+        "pub fn verify_token() -> bool { true }\n",
+    )
+    .expect("agent edit in worktree");
+    assert!(
+        std::fs::read_to_string(main_repo.join("src/auth.rs"))
+            .unwrap()
+            .contains("false"),
+        "main worktree must remain untouched by isolated agent edits"
+    );
+
+    // Agent refreshes its scope snapshot -> team scope refreshes and sees cross-scope warning!
+    let _ = agent_orch.refresh_env(false).await.expect("agent refresh");
+    let team_delta = team_orch.refresh_env(false).await.expect("team refresh");
+    assert!(
+        team_delta
+            .cross_scope_claims
+            .iter()
+            .any(|c| c.other_scope_id == "task-auth" && c.file_path == "src/auth.rs" && c.diverged),
+        "expected cross-scope overlap warning in team EnvDelta, got: {:?}",
+        team_delta.cross_scope_claims
+    );
+    assert!(
+        team_delta
+            .render_for_preamble()
+            .contains("Cross-agent scope overlap")
+    );
+
+    // 4. Agent discovers a new architectural invariant + reusable skill, then promotes to `team`
+    agent_orch
+        .commit_decision(CandidateDecision {
+            topic: "auth-tokens".into(),
+            rule_statement: "Use Ed25519 asymmetric signatures for JWT signing".into(),
+            rationale: "Key rotation and zero shared secret exposure".into(),
+            affected_paths: vec!["src/auth.rs".into()],
+        })
+        .await
+        .expect("agent decision");
+    agent_orch
+        .save_skill(
+            "verify-jwt-flow",
+            "Verify JWT token signatures",
+            "Check Ed25519 key verification in src/auth.rs",
+            vec!["jwt".into(), "auth".into()],
+        )
+        .await
+        .expect("agent skill");
+
+    let consolidator = MemoryConsolidator::new(
+        team_orch.store().clone(),
+        Arc::new(HeuristicConflictJudge),
+    );
+    let promo = consolidator
+        .promote_scope(team_orch.repo_id(), "task-auth", "team", true)
+        .await
+        .expect("promote scope");
+    assert_eq!(promo.decisions_updated, 1);
+    assert_eq!(promo.skills_promoted, 1);
+
+    // Team scope now has Ed25519 active and HS256 superseded bi-temporally + promoted skill!
+    let team_active = team_orch
+        .store()
+        .list_active_decisions(team_orch.repo_id(), "team")
+        .await
+        .expect("team active");
+    assert_eq!(team_active.len(), 1);
+    assert!(team_active[0].rule_statement.contains("Ed25519"));
+
+    let team_all = team_orch
+        .store()
+        .list_all_decisions(team_orch.repo_id(), "team")
+        .await
+        .expect("team all");
+    assert_eq!(team_all.len(), 2);
+    assert!(team_all
+        .iter()
+        .any(|d| d.rule_statement.contains("HS256") && d.invalid_at.is_some() && d.superseded_by.is_some()));
+
+    let team_skills = team_orch.list_skills().await.expect("team skills");
+    assert!(team_skills.iter().any(|s| s.name == "verify-jwt-flow"));
+
+    // Cleanly remove the isolated worktree
+    let _ = WorktreeManager::remove_worktree(&main_repo, "task-auth", true).expect("remove wt");
+}
+
 

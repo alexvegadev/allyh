@@ -1,8 +1,9 @@
 use std::path::PathBuf;
 
 use allyh_core::{AllyHOrchestrator, ControlGateState, InspectorSnapshot, UiEvent, UserCommand};
-use allyh_memory::{WorkerStatus, load_skill_markdown_file};
-use allyh_tools::ToolExecutionRecord;
+use allyh_env::CheckpointDiffReport;
+use allyh_memory::{RepoProfile, WorkerStatus, load_skill_markdown_file};
+use allyh_tools::{PendingCommandApproval, ToolExecutionRecord, parse_mcp_server_spec};
 use crossterm::event::KeyCode;
 use ratatui::style::Style;
 use tui_textarea::TextArea;
@@ -19,12 +20,20 @@ pub const COMMANDS: &[SlashCommand] = &[
     SlashCommand::new("/plan", "<goal>", "Propose a change for approval"),
     SlashCommand::new("/model", "[spec]", "Show or switch the reasoning model"),
     SlashCommand::new("/memories", "", "List active project decisions"),
+    SlashCommand::new("/timeline", "", "Browse active & superseded decision history"),
+    SlashCommand::new("/sessions", "[cmd]", "Browse or resume prior repository sessions"),
     SlashCommand::new("/skills", "[cmd]", "List, show, pin, import, or remove skills"),
+    SlashCommand::new("/sim", "[cmd]", "Inspect SIM ledger, problems, or active harness"),
     SlashCommand::new("/pin", "[id]", "Pin or unpin a decision"),
     SlashCommand::new("/invalidate", "[id]", "Retire a decision"),
     SlashCommand::new("/db-status", "", "Inspect storage and table counts"),
+    SlashCommand::new("/config", "[cmd]", "Inspect or override polyglot verification config"),
+    SlashCommand::new("/lsp", "[cmd]", "Show LSP bridge status or restart servers"),
+    SlashCommand::new("/mcp", "[cmd]", "Inspect or manage external MCP servers"),
+    SlashCommand::new("/diff", "", "Show unified diff since pre-plan checkpoint"),
+    SlashCommand::new("/rollback", "", "Restore workspace to pre-plan checkpoint"),
     SlashCommand::new("/compact", "", "Compact conversation history"),
-    SlashCommand::new("/refresh", "", "Rescan files and run cargo check"),
+    SlashCommand::new("/refresh", "", "Rescan files and run project check"),
     SlashCommand::new("/help", "", "Show commands and shortcuts"),
     SlashCommand::new("/quit", "", "Close the session"),
 ];
@@ -117,9 +126,13 @@ pub struct AppState {
     pub focus: FocusPane,
     pub chat_scroll: Scroll,
     pub plan_scroll: Scroll,
+    pub diff_scroll: Scroll,
+    pub active_diff_modal: Option<CheckpointDiffReport>,
+    pub diff_side_by_side: bool,
     pub command_index: usize,
     pub commands_dismissed: bool,
     pub selected_memory_idx: usize,
+    pub pending_command_approval: Option<PendingCommandApproval>,
     pub should_quit: bool,
     pub busy: bool,
 }
@@ -138,9 +151,13 @@ impl AppState {
                 ..Scroll::default()
             },
             plan_scroll: Scroll::default(),
+            diff_scroll: Scroll::default(),
+            active_diff_modal: None,
+            diff_side_by_side: false,
             command_index: 0,
             commands_dismissed: false,
             selected_memory_idx: 0,
+            pending_command_approval: None,
             should_quit: false,
             busy: false,
         }
@@ -150,7 +167,46 @@ impl AppState {
         matches!(
             self.inspector.gate_state,
             ControlGateState::PlanApproval { .. }
-        )
+        ) || self.pending_command_approval.is_some()
+            || self.active_diff_modal.is_some()
+    }
+
+    /// Return the most relevant copyable snippet (active diff modal, expanded tool card,
+    /// latest fenced code block, or latest tool card/reply) for one-key clipboard copy.
+    pub fn latest_copyable_snippet(&self) -> Option<(&'static str, String)> {
+        if let Some(ref diff) = self.active_diff_modal
+            && !diff.unified_diff.trim().is_empty()
+        {
+            return Some(("checkpoint diff", diff.unified_diff.clone()));
+        }
+        for entry in self.entries.iter().rev() {
+            if let ChatEntry::ToolCard { record, expanded: true } = entry
+                && !record.output_text.trim().is_empty()
+            {
+                return Some(("tool output", record.output_text.clone()));
+            }
+        }
+        for entry in self.entries.iter().rev() {
+            match entry {
+                ChatEntry::Assistant { text, .. } => {
+                    if let Some(code) = extract_last_fenced_code_block(text) {
+                        return Some(("code block", code));
+                    }
+                }
+                ChatEntry::ToolCard { record, .. } if !record.output_text.trim().is_empty() => {
+                    return Some(("tool output", record.output_text.clone()));
+                }
+                _ => {}
+            }
+        }
+        for entry in self.entries.iter().rev() {
+            if let ChatEntry::Assistant { text, .. } = entry
+                && !text.trim().is_empty()
+            {
+                return Some(("assistant reply", text.clone()));
+            }
+        }
+        None
     }
 
     pub fn cycle_focus(&mut self, reverse: bool) {
@@ -255,7 +311,10 @@ impl AppState {
                     Some(UserCommand::ProposePlan(plan))
                 }
                 "memories" => Some(UserCommand::RequestMemories),
+                "timeline" => Some(UserCommand::RequestTimeline),
+                "sessions" | "session" => self.parse_sessions_command(arg),
                 "skills" | "skill" => self.parse_skills_command(cmd.as_str(), arg),
+                "sim" => self.parse_sim_command(arg),
                 "invalidate" => {
                     if arg.is_empty() {
                         if let Some(id) = self.selected_memory_id() {
@@ -306,6 +365,11 @@ impl AppState {
                     }
                 }
                 "db-status" => Some(UserCommand::RequestDbStatus),
+                "config" => self.parse_config_command(arg),
+                "lsp" => self.parse_lsp_command(arg),
+                "mcp" => self.parse_mcp_command(arg),
+                "diff" => Some(UserCommand::RequestCheckpointDiff),
+                "rollback" => Some(UserCommand::RollbackCheckpoint),
                 "compact" => Some(UserCommand::CompactNow),
                 "refresh" => Some(UserCommand::RefreshEnv {
                     run_build_check: true,
@@ -443,6 +507,89 @@ impl AppState {
                     )));
                 }
             }
+            UiEvent::Timeline(decisions) => {
+                if decisions.is_empty() {
+                    self.entries.push(ChatEntry::System(
+                        "No architectural decisions recorded in this repository partition yet."
+                            .to_string(),
+                    ));
+                } else {
+                    let rows = decisions
+                        .iter()
+                        .map(|d| {
+                            let short = &d.id[..d.id.len().min(8)];
+                            let state = match (&d.invalid_at, &d.superseded_by) {
+                                (Some(inv), Some(by)) => format!(
+                                    "SUPERSEDED {} -> `{}`",
+                                    inv.format("%Y-%m-%d %H:%M"),
+                                    &by[..by.len().min(8)]
+                                ),
+                                (Some(inv), None) => {
+                                    format!("INVALIDATED {}", inv.format("%Y-%m-%d %H:%M"))
+                                }
+                                (None, _) => "ACTIVE".to_string(),
+                            };
+                            format!(
+                                "- `{short}` [{state}] [{}] {} — _{}_ (valid {})",
+                                d.topic,
+                                d.rule_statement,
+                                d.rationale,
+                                d.valid_at.format("%Y-%m-%d %H:%M")
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    self.entries.push(ChatEntry::System(format!(
+                        "### Bi-Temporal Memory Timeline ({})\n{rows}",
+                        decisions.len()
+                    )));
+                }
+            }
+            UiEvent::SessionsList {
+                current_session_id,
+                sessions,
+            } => {
+                if sessions.is_empty() {
+                    self.entries.push(ChatEntry::System(
+                        "No prior sessions recorded for this repository partition.".to_string(),
+                    ));
+                } else {
+                    let rows = sessions
+                        .iter()
+                        .take(12)
+                        .map(|s| {
+                            let short = &s.session_id[..s.session_id.len().min(8)];
+                            let cur = if s.session_id == current_session_id {
+                                " [CURRENT]"
+                            } else {
+                                ""
+                            };
+                            let cache_pct = if s.input_tokens > 0 {
+                                ((s.cached_input_tokens as f64 / s.input_tokens as f64) * 100.0)
+                                    .round() as u64
+                            } else {
+                                0
+                            };
+                            let summary = if s.rolling_summary.trim().is_empty() {
+                                "No summary yet".to_string()
+                            } else {
+                                let first = s.rolling_summary.lines().next().unwrap_or("");
+                                first.chars().take(72).collect::<String>()
+                            };
+                            format!(
+                                "- `{short}`{cur} ({}, cache {cache_pct}%, ${:.3}) — {summary}",
+                                s.started_at.format("%Y-%m-%d %H:%M"),
+                                s.estimated_cost_usd
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    self.entries.push(ChatEntry::System(format!(
+                        "### Repository Sessions ({})\n{rows}\n\n_Use `/sessions resume <id-prefix>` to restore a prior session's rolling context._",
+                        sessions.len()
+                    )));
+                }
+            }
             UiEvent::SkillsList { skills, pinned_ids } => {
                 if skills.is_empty() {
                     self.entries.push(ChatEntry::System(
@@ -503,13 +650,133 @@ impl AppState {
                     skill.instructions
                 )));
             }
+            UiEvent::SimSummary {
+                ledger,
+                active_harness_label,
+                active_harness_hash,
+            } => {
+                let mut msg = format!(
+                    "### Self-Improvement Memory (SIM)\n\
+                     - **Active Harness:** `{active_harness_label}` (sha256: `{}`)\n",
+                    &active_harness_hash[..active_harness_hash.len().min(12)]
+                );
+                match ledger {
+                    Some(l) => {
+                        msg.push_str(&format!(
+                            "- **Latest Run:** `{}` (`{}`) | mode: `{}` | rounds: {}\n\
+                             - **Context:** domain=`{}` | benchmark=`{}` | policy=`{}`\n\
+                             - **Entries:** {} problem(s) | {} attempt(s) | {} alias(es)",
+                            &l.run.run_id[..l.run.run_id.len().min(8)],
+                            l.run.arm_name,
+                            l.run.memory_mode,
+                            l.run.rounds_completed,
+                            l.run.domain,
+                            l.run.benchmark,
+                            l.run.policy_model,
+                            l.problems.len(),
+                            l.total_attempts(),
+                            l.aliases.len()
+                        ));
+                        if let Some(ref carried) = l.run.carried_from_run_id {
+                            msg.push_str(&format!(
+                                "\n- **Carried From:** `{carried}` (domain: `{}`)",
+                                l.run.carried_from_domain.as_deref().unwrap_or("—")
+                            ));
+                        }
+                        msg.push_str(
+                            "\n\n_Use `/sim list`, `/sim show <P-id>`, `/sim harness`, or `allyh sim evolve --suite <path>`._",
+                        );
+                    }
+                    None => {
+                        msg.push_str(
+                            "- **Latest Run:** none yet\n\n_Run `allyh sim evolve --suite <path>` to start source RSI or `allyh sim import <sim.json>` to load a ledger._",
+                        );
+                    }
+                }
+                self.entries.push(ChatEntry::System(msg));
+            }
+            UiEvent::SimProblems(ledger) => match ledger {
+                Some(l) if !l.problems.is_empty() => {
+                    let rendered = l
+                        .problems
+                        .iter()
+                        .map(|p| {
+                            let pred: usize = p.attempts.iter().map(|a| a.predicted.len()).sum();
+                            let fixed: usize = p.attempts.iter().map(|a| a.fixed.len()).sum();
+                            format!(
+                                "- `{}` (r{}, `{}`): {} — {} attempt(s), {fixed}/{pred} predicted fixed",
+                                p.id,
+                                p.opened_round,
+                                p.origin_domain,
+                                p.name,
+                                p.attempts.len()
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    self.entries.push(ChatEntry::System(format!(
+                        "### SIM Problem Ledger ({})\n{rendered}\n\n_Use `/sim show <P-id>` for full attempt rationales and outcomes._",
+                        l.problems.len()
+                    )));
+                }
+                _ => {
+                    self.entries.push(ChatEntry::System(
+                        "No SIM problems recorded for this repository partition yet.".to_string(),
+                    ));
+                }
+            },
+            UiEvent::SimProblemDetail {
+                problem,
+                resolved_from,
+            } => {
+                let alias_note = resolved_from
+                    .map(|src| format!(" _(resolved alias `{src}` → `{}`)_", problem.id))
+                    .unwrap_or_default();
+                let mut lines = vec![format!(
+                    "### SIM Problem `{}`{alias_note}\n- **Root Cause:** {}\n- **Opened:** round {} (origin: `{}`)",
+                    problem.id, problem.name, problem.opened_round, problem.origin_domain
+                )];
+                for a in &problem.attempts {
+                    lines.push(format!(
+                        "\n#### Round {} [{}] — score {:.2} ({}/{}) | `{}` / `{}`",
+                        a.round, a.sample, a.score, a.passed, a.total, a.domain, a.policy_model
+                    ));
+                    lines.push(format!("- **What:** {}", a.what));
+                    if !a.files.is_empty() {
+                        lines.push(format!("- **Files:** {}", a.files.join(", ")));
+                    }
+                    lines.push(format!(
+                        "- **Predicted:** [{}] | **Fixed:** [{}] | **Missed:** [{}]",
+                        a.predicted.join(", "),
+                        a.fixed.join(", "),
+                        a.missed.join(", ")
+                    ));
+                }
+                self.entries.push(ChatEntry::System(lines.join("\n")));
+            }
+            UiEvent::ActiveHarnessDetail {
+                label,
+                version_id,
+                spec,
+            } => {
+                let id_str = version_id.as_deref().unwrap_or("default-seed");
+                let json = spec.canonical_json().unwrap_or_default();
+                self.entries.push(ChatEntry::System(format!(
+                    "### Active Harness: `{label}`\n- **Version ID:** `{id_str}`\n- **Interlock Enabled:** {} (max rejections: {})\n- **Max Tool Rounds:** {} | **Decision Top-K:** {}\n\n```json\n{json}\n```",
+                    spec.completion_interlock.enabled,
+                    spec.completion_interlock.max_consecutive_rejections,
+                    spec.tools.max_tool_rounds,
+                    spec.retrieval.decision_top_k
+                )));
+            }
             UiEvent::DbStatus(report) => {
                 self.entries.push(ChatEntry::System(format!(
                     "### LanceDB Status ({})\n\
                      - URI: `{}`\n\
                      - Repo Partition: `{}` | Scope: `{}`\n\
                      - Sessions: {} | Active Rules: {} | Superseded/Invalidated: {}\n\
-                     - Tasks: {} | Skills: {} | Code Graph Snapshots: {}",
+                     - Tasks: {} | Skills: {} | Code Graph Snapshots: {}\n\
+                     - Harness Versions: {} | SIM Runs: {} | SIM Problems: {} | SIM Attempts: {}",
                     report.backend_label,
                     report.uri,
                     &report.repo_id[..report.repo_id.len().min(12)],
@@ -520,7 +787,162 @@ impl AppState {
                     report.tasks_count,
                     report.skills_count,
                     report.code_snapshots_count,
+                    report.harness_versions_count,
+                    report.sim_runs_count,
+                    report.sim_problems_count,
+                    report.sim_attempts_count,
                 )));
+            }
+            UiEvent::RepoProfileDetail {
+                profile,
+                detected_languages,
+                detected_toolchains,
+            } => {
+                let langs = if detected_languages.is_empty() {
+                    "none".to_string()
+                } else {
+                    detected_languages.join(", ")
+                };
+                let tools = if detected_toolchains.is_empty() {
+                    "none".to_string()
+                } else {
+                    detected_toolchains.join(", ")
+                };
+                let mut msg = format!(
+                    "### Repository Polyglot Profile (Out-of-Tree LanceDB)\n\
+                     - **Detected Languages:** {langs}\n\
+                     - **Detected Toolchains:** {tools}"
+                );
+                if let Some(p) = profile {
+                    msg.push_str(&format!(
+                        "\n- **Check Override:** `{}`\n\
+                         - **Lint Override:** `{}`\n\
+                         - **Test Override:** `{}`\n\
+                         - **Extra Ignore Globs:** {}",
+                        p.check_command.as_deref().unwrap_or("auto"),
+                        p.lint_command.as_deref().unwrap_or("auto"),
+                        p.test_command.as_deref().unwrap_or("auto"),
+                        if p.extra_ignore_globs.is_empty() {
+                            "none".to_string()
+                        } else {
+                            p.extra_ignore_globs.join(", ")
+                        }
+                    ));
+                } else {
+                    msg.push_str("\n- **Custom Overrides:** none (automatic detection)");
+                }
+                msg.push_str(
+                    "\n\n_Use `/config set-check <cmd>`, `/config set-lint <cmd>`, `/config set-test <cmd>`, or `/config reset`._",
+                );
+                self.entries.push(ChatEntry::System(msg));
+            }
+            UiEvent::LspStatus(statuses) => {
+                if statuses.is_empty() {
+                    self.entries.push(ChatEntry::System(
+                        "### LSP Semantic Bridge\n\
+                         No LSP binaries detected on PATH (`rust-analyzer`, `vtsls`, `pyright`, `gopls`, `clangd`).\n\
+                         _Using tree-sitter RepoGraph + CLI verifiers seamlessly._"
+                            .to_string(),
+                    ));
+                } else {
+                    let rows = statuses
+                        .iter()
+                        .map(|s| {
+                            let err_note = s
+                                .last_error
+                                .as_deref()
+                                .map(|e| format!(" — error: {e}"))
+                                .unwrap_or_default();
+                            format!(
+                                "- `{}` (`{}`) [{}] — {} open doc(s), {} diag file(s), {} restart(s){err_note}",
+                                s.server_name,
+                                s.family,
+                                s.state.as_str(),
+                                s.open_documents,
+                                s.cached_diagnostic_files,
+                                s.restart_count
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    self.entries.push(ChatEntry::System(format!(
+                        "### LSP Semantic Bridge ({})\n{rows}\n\n\
+                         _Use `/lsp restart [lang]` to restart an LSP server._",
+                        statuses.len()
+                    )));
+                }
+            }
+            UiEvent::CheckpointDiff(maybe_diff) => match maybe_diff {
+                None => {
+                    self.entries.push(ChatEntry::System(
+                        "No active checkpoint yet. Approve a plan with `/plan <goal>` to capture an automatic pre-execution checkpoint.".to_string(),
+                    ));
+                }
+                Some(report) if !report.has_changes() => {
+                    self.entries.push(ChatEntry::System(format!(
+                        "### Checkpoint Diff (`{}`)\nWorkspace matches checkpoint cleanly (0 changed files).",
+                        report.checkpoint_label
+                    )));
+                }
+                Some(report) => {
+                    self.diff_scroll = Scroll::default();
+                    self.active_diff_modal = Some(report.clone());
+                    self.entries.push(ChatEntry::System(format!(
+                        "### Checkpoint Diff (`{}`)\n- **Summary:** {}\n\n```diff\n{}\n```\n\n_Run `/rollback` to restore all files to this checkpoint._",
+                        report.checkpoint_label,
+                        report.compact_summary(),
+                        report.unified_diff
+                    )));
+                }
+            },
+            UiEvent::CommandApprovalRequested(req) => {
+                self.pending_command_approval = Some(req);
+            }
+            UiEvent::McpStatus(statuses) => {
+                if statuses.is_empty() {
+                    self.entries.push(ChatEntry::System(
+                        "### External MCP Servers\n\
+                         No MCP servers connected for this repository partition.\n\
+                         _Use `/mcp add <name> <http-url-or-command>` or `allyh mcp add` to mount external tools._"
+                            .to_string(),
+                    ));
+                } else {
+                    let rows = statuses
+                        .iter()
+                        .map(|s| {
+                            let state = if s.connected { "connected" } else { "disconnected" };
+                            let err_note = s
+                                .last_error
+                                .as_deref()
+                                .map(|e| format!(" — error: {e}"))
+                                .unwrap_or_default();
+                            let tools_preview = if s.tools.is_empty() {
+                                "0 tools".to_string()
+                            } else {
+                                format!(
+                                    "{} tool(s): {}",
+                                    s.tool_count,
+                                    s.tools
+                                        .iter()
+                                        .take(5)
+                                        .cloned()
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                )
+                            };
+                            format!(
+                                "- `{}` (`{}`) [{state}] — `{}` ({tools_preview}){err_note}",
+                                s.name, s.transport, s.target
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    self.entries.push(ChatEntry::System(format!(
+                        "### External MCP Servers ({})\n{rows}\n\n\
+                         _Use `/mcp add <name> <url-or-cmd>` or `/mcp remove <name>`. Mutating MCP tools are enforced by the Control Gate._",
+                        statuses.len()
+                    )));
+                }
             }
             UiEvent::SystemNotice(msg) => {
                 self.entries.push(ChatEntry::System(msg));
@@ -641,4 +1063,272 @@ impl AppState {
                 .to_string(),
         ));
     }
+
+    fn parse_sim_command(&mut self, arg: &str) -> Option<UserCommand> {
+        let trimmed = arg.trim();
+        if trimmed.is_empty() {
+            return Some(UserCommand::RequestSimSummary);
+        }
+
+        let mut parts = trimmed.splitn(2, char::is_whitespace);
+        let sub = parts.next().unwrap_or("").to_ascii_lowercase();
+        let rest = parts.next().unwrap_or("").trim();
+
+        match sub.as_str() {
+            "status" | "summary" => Some(UserCommand::RequestSimSummary),
+            "list" | "ls" | "problems" => Some(UserCommand::RequestSimProblems),
+            "show" | "view" | "problem" => {
+                if rest.is_empty() {
+                    self.entries.push(ChatEntry::System(
+                        "Usage: /sim show <problem-id> (e.g. `/sim show P1`)".to_string(),
+                    ));
+                    None
+                } else {
+                    Some(UserCommand::ShowSimProblem(rest.to_string()))
+                }
+            }
+            "export" => {
+                let raw_path = rest.trim_matches(|c| c == '"' || c == '\'').trim();
+                let target = if raw_path.is_empty() {
+                    self.repo_root.join("sim-ledger.json")
+                } else {
+                    let candidate = PathBuf::from(raw_path);
+                    if candidate.is_absolute() {
+                        candidate
+                    } else {
+                        self.repo_root.join(candidate)
+                    }
+                };
+                Some(UserCommand::ExportSim(target))
+            }
+            "harness" | "spec" => Some(UserCommand::ShowActiveHarness),
+            "use" => {
+                if rest.is_empty() {
+                    self.entries.push(ChatEntry::System(
+                        "Usage: /sim use <harness-version-id-or-label>".to_string(),
+                    ));
+                    None
+                } else {
+                    Some(UserCommand::UseHarness(rest.to_string()))
+                }
+            }
+            "help" => {
+                self.push_sim_usage();
+                None
+            }
+            other if other.starts_with('p') && other[1..].chars().all(|c| c.is_ascii_digit()) => {
+                Some(UserCommand::ShowSimProblem(trimmed.to_string()))
+            }
+            _ => {
+                self.push_sim_usage();
+                None
+            }
+        }
+    }
+
+    fn push_sim_usage(&mut self) {
+        self.entries.push(ChatEntry::System(
+            "### SIM Commands\n\
+             - `/sim`  Show active harness version and latest SIM run summary\n\
+             - `/sim list`  List recurring harness problems (`P1..Pn`)\n\
+             - `/sim show <P-id>`  View full attempt history, rationales, and outcomes\n\
+             - `/sim harness`  Inspect active `HarnessSpec` configuration\n\
+             - `/sim use <id>`  Activate a stored evolved harness version\n\
+             - `/sim export [path]`  Export canonical Appendix D.3 SIM JSON\n\n\
+             _Run multi-round optimization via CLI: `allyh sim evolve --suite <path>` or `allyh sim continue --from-run <id> --suite <path>`._"
+                .to_string(),
+        ));
+    }
+
+    fn parse_config_command(&mut self, arg: &str) -> Option<UserCommand> {
+        let trimmed = arg.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("show") {
+            return Some(UserCommand::RequestRepoProfile);
+        }
+        let mut parts = trimmed.splitn(2, char::is_whitespace);
+        let sub = parts.next().unwrap_or("").to_ascii_lowercase();
+        let rest = parts.next().unwrap_or("").trim();
+
+        match sub.as_str() {
+            "reset" | "clear" => Some(UserCommand::ResetRepoProfile),
+            "set-check" | "check" => {
+                if rest.is_empty() {
+                    self.entries.push(ChatEntry::System(
+                        "Usage: /config set-check <command>".to_string(),
+                    ));
+                    return None;
+                }
+                let mut profile =
+                    RepoProfile::empty(&self.inspector.repo_id, &self.inspector.scope_id);
+                profile.check_command = Some(rest.to_string());
+                Some(UserCommand::SaveRepoProfile(profile))
+            }
+            "set-lint" | "lint" => {
+                if rest.is_empty() {
+                    self.entries.push(ChatEntry::System(
+                        "Usage: /config set-lint <command>".to_string(),
+                    ));
+                    return None;
+                }
+                let mut profile =
+                    RepoProfile::empty(&self.inspector.repo_id, &self.inspector.scope_id);
+                profile.lint_command = Some(rest.to_string());
+                Some(UserCommand::SaveRepoProfile(profile))
+            }
+            "set-test" | "test" => {
+                if rest.is_empty() {
+                    self.entries.push(ChatEntry::System(
+                        "Usage: /config set-test <command>".to_string(),
+                    ));
+                    return None;
+                }
+                let mut profile =
+                    RepoProfile::empty(&self.inspector.repo_id, &self.inspector.scope_id);
+                profile.test_command = Some(rest.to_string());
+                Some(UserCommand::SaveRepoProfile(profile))
+            }
+            _ => {
+                self.entries.push(ChatEntry::System(
+                    "### Config Commands (Out-of-Tree LanceDB RepoProfile)\n\
+                     - `/config`  Show detected languages, toolchains, and overrides\n\
+                     - `/config set-check <cmd>`  Set a custom check/type-check command\n\
+                     - `/config set-lint <cmd>`  Set a custom lint command\n\
+                     - `/config set-test <cmd>`  Set a custom test command\n\
+                     - `/config reset`  Restore automatic polyglot detection"
+                        .to_string(),
+                ));
+                None
+            }
+        }
+    }
+
+    fn parse_lsp_command(&mut self, arg: &str) -> Option<UserCommand> {
+        let trimmed = arg.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("status") {
+            return Some(UserCommand::RequestLspStatus);
+        }
+        let mut parts = trimmed.splitn(2, char::is_whitespace);
+        let sub = parts.next().unwrap_or("").to_ascii_lowercase();
+        let rest = parts.next().unwrap_or("").trim();
+
+        match sub.as_str() {
+            "restart" => {
+                let fam = (!rest.is_empty()).then(|| rest.to_string());
+                Some(UserCommand::RestartLsp(fam))
+            }
+            _ => {
+                self.entries.push(ChatEntry::System(
+                    "### LSP Commands\n\
+                     - `/lsp` or `/lsp status`  Show discovered/running LSP servers\n\
+                     - `/lsp restart [lang]`  Restart all LSP servers or one language family (e.g. `rust`, `typescript`, `python`, `go`)"
+                        .to_string(),
+                ));
+                None
+            }
+        }
+    }
+
+    fn parse_mcp_command(&mut self, arg: &str) -> Option<UserCommand> {
+        let trimmed = arg.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("status") {
+            return Some(UserCommand::RequestMcpStatus);
+        }
+        let mut parts = trimmed.splitn(2, char::is_whitespace);
+        let sub = parts.next().unwrap_or("").to_ascii_lowercase();
+        let rest = parts.next().unwrap_or("").trim();
+
+        match sub.as_str() {
+            "add" => {
+                let mut add_parts = rest.splitn(2, char::is_whitespace);
+                let name = add_parts.next().unwrap_or("").trim();
+                let target = add_parts.next().unwrap_or("").trim();
+                if name.is_empty() || target.is_empty() {
+                    self.entries.push(ChatEntry::System(
+                        "Usage: `/mcp add <name> <http-url-or-command>`\n\
+                         Examples:\n\
+                         - `/mcp add docs https://mcp.example.com/rpc`\n\
+                         - `/mcp add fs npx -y @modelcontextprotocol/server-filesystem .`"
+                            .to_string(),
+                    ));
+                    return None;
+                }
+                let spec = format!("{name}={target}");
+                match parse_mcp_server_spec(&spec) {
+                    Ok(cfg) => Some(UserCommand::AddMcpServer(cfg)),
+                    Err(err) => {
+                        self.entries.push(ChatEntry::Error(format!(
+                            "Invalid MCP server spec: {err}"
+                        )));
+                        None
+                    }
+                }
+            }
+            "remove" | "rm" | "delete" => {
+                if rest.is_empty() {
+                    self.entries.push(ChatEntry::System(
+                        "Usage: `/mcp remove <name>`".to_string(),
+                    ));
+                    None
+                } else {
+                    Some(UserCommand::RemoveMcpServer(rest.to_string()))
+                }
+            }
+            _ => {
+                self.entries.push(ChatEntry::System(
+                    "### MCP Commands\n\
+                     - `/mcp` or `/mcp status`  List connected external MCP servers and mounted tools\n\
+                     - `/mcp add <name> <url-or-cmd>`  Connect & persist an MCP server in out-of-tree LanceDB\n\
+                     - `/mcp remove <name>`  Disconnect & remove a configured MCP server\n\n\
+                     _Run AllyH itself as an MCP server for external editors with `allyh mcp serve`._"
+                        .to_string(),
+                ));
+                None
+            }
+        }
+    }
+
+    fn parse_sessions_command(&mut self, arg: &str) -> Option<UserCommand> {
+        let trimmed = arg.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("list") || trimmed.eq_ignore_ascii_case("ls") {
+            return Some(UserCommand::RequestSessions);
+        }
+        let mut parts = trimmed.splitn(2, char::is_whitespace);
+        let sub = parts.next().unwrap_or("").to_ascii_lowercase();
+        let rest = parts.next().unwrap_or("").trim();
+        match sub.as_str() {
+            "resume" | "load" | "open" => {
+                if rest.is_empty() {
+                    self.entries.push(ChatEntry::System(
+                        "Usage: `/sessions resume <session-id-prefix>`".to_string(),
+                    ));
+                    None
+                } else {
+                    Some(UserCommand::ResumeSession(rest.to_string()))
+                }
+            }
+            _ => Some(UserCommand::ResumeSession(trimmed.to_string())),
+        }
+    }
+}
+
+fn extract_last_fenced_code_block(markdown: &str) -> Option<String> {
+    let mut in_block = false;
+    let mut current = Vec::new();
+    let mut last_block = None;
+    for line in markdown.lines() {
+        if line.trim_start().starts_with("```") {
+            if !in_block {
+                in_block = true;
+                current.clear();
+            } else {
+                in_block = false;
+                if !current.is_empty() {
+                    last_block = Some(current.join("\n"));
+                }
+            }
+        } else if in_block {
+            current.push(line);
+        }
+    }
+    last_block
 }

@@ -1,12 +1,12 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 use allyh_memory::CodeGraphSnapshot;
 use serde::{Deserialize, Serialize};
-use tree_sitter::{Node, Parser};
 
-use crate::error::{EnvError, Result};
+use crate::error::Result;
+use crate::lang::LanguageRegistry;
 
-/// Kind of Rust symbol extracted by the `tree-sitter` RepoGraph indexer.
+/// Kind of source symbol extracted by AllyH's polyglot `tree-sitter` RepoGraph indexer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SymbolKind {
@@ -19,6 +19,13 @@ pub enum SymbolKind {
     Const,
     Static,
     TypeAlias,
+    Class,
+    Interface,
+    Method,
+    Namespace,
+    Variable,
+    Component,
+    Macro,
 }
 
 impl SymbolKind {
@@ -33,6 +40,13 @@ impl SymbolKind {
             Self::Const => "const",
             Self::Static => "static",
             Self::TypeAlias => "type",
+            Self::Class => "class",
+            Self::Interface => "interface",
+            Self::Method => "method",
+            Self::Namespace => "namespace",
+            Self::Variable => "var",
+            Self::Component => "component",
+            Self::Macro => "macro",
         }
     }
 }
@@ -62,6 +76,9 @@ pub struct EgoGraph {
     pub center_definitions: Vec<EgoNode>,
     pub hop1_neighbors: Vec<EgoEdge>,
     pub hop2_neighbors: Vec<EgoEdge>,
+    /// Optional provenance tag when edges were semantically resolved via LSP (e.g. `"lsp:rust-analyzer"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,7 +103,12 @@ impl EgoGraph {
             return String::new();
         }
         let mut out = Vec::new();
-        out.push(format!("### RepoGraph Ego-Graph: `{}`", self.center));
+        let source_tag = self
+            .semantic_source
+            .as_deref()
+            .map(|src| format!(" [{src}]"))
+            .unwrap_or_default();
+        out.push(format!("### RepoGraph Ego-Graph: `{}`{source_tag}", self.center));
         for def in &self.center_definitions {
             out.push(format!(
                 "- DEF `{}` ({}) in `{}:{}-{}` :: `{}`",
@@ -120,34 +142,10 @@ impl EgoGraph {
     }
 }
 
-/// Lightweight `tree-sitter` indexer for Rust source files.
-pub struct RustIndexer;
+/// Polyglot RepoGraph query engine operating over LanceDB [`CodeGraphSnapshot`]s.
+pub struct RepoGraph;
 
-impl RustIndexer {
-    /// Parse Rust source text and extract symbols, signatures, local references, and `use` dependencies.
-    pub fn index_source(source: &str) -> Result<FileGraph> {
-        let mut parser = Parser::new();
-        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
-        parser
-            .set_language(&language)
-            .map_err(|e| EnvError::TreeSitter(e.to_string()))?;
-
-        let tree = parser
-            .parse(source, None)
-            .ok_or_else(|| EnvError::TreeSitter("failed to parse Rust source".to_string()))?;
-
-        let bytes = source.as_bytes();
-        let mut symbols = Vec::new();
-        let mut deps = BTreeSet::new();
-
-        walk_items(tree.root_node(), bytes, None, &mut symbols, &mut deps);
-
-        Ok(FileGraph {
-            symbols,
-            dependencies: deps.into_iter().collect(),
-        })
-    }
-
+impl RepoGraph {
     /// Build a 1-hop / 2-hop RepoGraph ego-graph around a symbol name or file path from LanceDB snapshots.
     pub fn build_ego_graph(
         snapshots: &[CodeGraphSnapshot],
@@ -161,10 +159,23 @@ impl RustIndexer {
         for snap in snapshots {
             let syms: Vec<SymbolInfo> = serde_json::from_str(&snap.symbols_json).unwrap_or_default();
             for sym in &syms {
+                let full_key = sym.name.to_ascii_lowercase();
                 symbol_index
-                    .entry(sym.name.to_ascii_lowercase())
+                    .entry(full_key.clone())
                     .or_default()
                     .push((snap.file_path.clone(), sym.clone()));
+
+                // Also index unqualified member/method names (`Class.method` -> `method`, `Type::fn` -> `fn`)
+                // so polyglot call-site references resolve cleanly across files.
+                if let Some(short) = unqualified_symbol_key(&full_key)
+                    && short != full_key
+                    && short.len() >= 3
+                {
+                    symbol_index
+                        .entry(short.to_string())
+                        .or_default()
+                        .push((snap.file_path.clone(), sym.clone()));
+                }
             }
             parsed.push((snap.file_path.clone(), syms, snap.dependencies.clone()));
         }
@@ -180,10 +191,15 @@ impl RustIndexer {
                 if (!query_lower.is_empty()
                     && (sym_lower == query_lower
                         || sym_lower.contains(&query_lower)
-                        || query_lower.contains(&sym_lower) && sym_lower.len() >= 4))
+                        || (query_lower.contains(&sym_lower) && sym_lower.len() >= 4)))
                     || file_matches
                 {
-                    center_names.insert(sym_lower);
+                    center_names.insert(sym_lower.clone());
+                    if let Some(short) = unqualified_symbol_key(&sym_lower)
+                        && short.len() >= 3
+                    {
+                        center_names.insert(short.to_string());
+                    }
                     center_defs.push(EgoNode {
                         file_path: file.clone(),
                         symbol: sym.clone(),
@@ -192,6 +208,10 @@ impl RustIndexer {
             }
         }
         center_defs.truncate(8);
+        let center_def_keys: HashSet<(String, String)> = center_defs
+            .iter()
+            .map(|d| (d.file_path.clone(), d.symbol.name.clone()))
+            .collect();
 
         let mut hop1_edges: Vec<EgoEdge> = Vec::new();
         let mut hop1_names: HashSet<String> = HashSet::new();
@@ -207,6 +227,9 @@ impl RustIndexer {
                     }
                     if let Some(targets) = symbol_index.get(&key) {
                         for (target_file, target_sym) in targets {
+                            if target_file == &def.file_path && target_sym.name == def.symbol.name {
+                                continue;
+                            }
                             let edge_key = (
                                 def.file_path.clone(),
                                 def.symbol.name.clone(),
@@ -214,7 +237,7 @@ impl RustIndexer {
                                 target_sym.name.clone(),
                             );
                             if seen_edges.insert(edge_key) {
-                                hop1_names.insert(key.clone());
+                                hop1_names.insert(target_sym.name.to_ascii_lowercase());
                                 hop1_edges.push(EgoEdge {
                                     from_file: def.file_path.clone(),
                                     from_symbol: def.symbol.name.clone(),
@@ -237,25 +260,31 @@ impl RustIndexer {
                     }
                     for ref_name in &sym.references {
                         let ref_key = ref_name.to_ascii_lowercase();
-                        if center_names.contains(&ref_key) {
-                            if let Some(targets) = symbol_index.get(&ref_key) {
-                                for (target_file, target_sym) in targets {
-                                    let edge_key = (
-                                        file.clone(),
-                                        sym.name.clone(),
-                                        target_file.clone(),
-                                        target_sym.name.clone(),
-                                    );
-                                    if seen_edges.insert(edge_key) {
-                                        hop1_names.insert(sym_key.clone());
-                                        hop1_edges.push(EgoEdge {
-                                            from_file: file.clone(),
-                                            from_symbol: sym.name.clone(),
-                                            to_file: target_file.clone(),
-                                            to_symbol: target_sym.name.clone(),
-                                            relation: "calls_or_uses".to_string(),
-                                        });
-                                    }
+                        if center_names.contains(&ref_key)
+                            && let Some(targets) = symbol_index.get(&ref_key)
+                        {
+                            for (target_file, target_sym) in targets {
+                                if !center_def_keys.contains(&(target_file.clone(), target_sym.name.clone())) {
+                                    continue;
+                                }
+                                if target_file == file && target_sym.name == sym.name {
+                                    continue;
+                                }
+                                let edge_key = (
+                                    file.clone(),
+                                    sym.name.clone(),
+                                    target_file.clone(),
+                                    target_sym.name.clone(),
+                                );
+                                if seen_edges.insert(edge_key) {
+                                    hop1_names.insert(sym_key.clone());
+                                    hop1_edges.push(EgoEdge {
+                                        from_file: file.clone(),
+                                        from_symbol: sym.name.clone(),
+                                        to_file: target_file.clone(),
+                                        to_symbol: target_sym.name.clone(),
+                                        relation: "calls_or_uses".to_string(),
+                                    });
                                 }
                             }
                         }
@@ -276,6 +305,9 @@ impl RustIndexer {
                             }
                             if let Some(targets) = symbol_index.get(&ref_key) {
                                 for (target_file, target_sym) in targets {
+                                    if target_file == file && target_sym.name == sym.name {
+                                        continue;
+                                    }
                                     let edge_key = (
                                         file.clone(),
                                         sym.name.clone(),
@@ -304,238 +336,33 @@ impl RustIndexer {
             center_definitions: center_defs,
             hop1_neighbors: hop1_edges,
             hop2_neighbors: hop2_edges,
+            semantic_source: None,
         }
     }
 }
 
-fn walk_items(
-    node: Node<'_>,
-    source: &[u8],
-    impl_prefix: Option<&str>,
-    symbols: &mut Vec<SymbolInfo>,
-    deps: &mut BTreeSet<String>,
-) {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        match child.kind() {
-            "use_declaration" => {
-                if let Ok(text) = child.utf8_text(source) {
-                    let cleaned = text
-                        .trim()
-                        .trim_start_matches("pub ")
-                        .trim_start_matches("use ")
-                        .trim_end_matches(';')
-                        .trim()
-                        .to_string();
-                    if !cleaned.is_empty() {
-                        deps.insert(cleaned);
-                    }
-                }
-            }
-            "function_item" => {
-                if let Some(name) = field_text(child, "name", source) {
-                    let full_name = match impl_prefix {
-                        Some(prefix) => format!("{prefix}::{name}"),
-                        None => name,
-                    };
-                    symbols.push(build_symbol_info(child, SymbolKind::Function, full_name, source));
-                }
-            }
-            "struct_item" => {
-                if let Some(name) = field_text(child, "name", source) {
-                    symbols.push(build_symbol_info(child, SymbolKind::Struct, name, source));
-                }
-            }
-            "enum_item" => {
-                if let Some(name) = field_text(child, "name", source) {
-                    symbols.push(build_symbol_info(child, SymbolKind::Enum, name, source));
-                }
-            }
-            "trait_item" => {
-                if let Some(name) = field_text(child, "name", source) {
-                    symbols.push(build_symbol_info(child, SymbolKind::Trait, name.clone(), source));
-                    if let Some(body) = child.child_by_field_name("body") {
-                        walk_items(body, source, Some(&name), symbols, deps);
-                    }
-                }
-            }
-            "impl_item" => {
-                let type_name = field_text(child, "type", source)
-                    .map(|t| simplify_type_name(&t))
-                    .unwrap_or_else(|| "impl".to_string());
-                let trait_name = field_text(child, "trait", source).map(|t| simplify_type_name(&t));
-                let impl_label = match trait_name {
-                    Some(tr) => format!("{tr} for {type_name}"),
-                    None => type_name.clone(),
-                };
-                symbols.push(build_symbol_info(child, SymbolKind::Impl, impl_label, source));
-                if let Some(body) = child.child_by_field_name("body") {
-                    walk_items(body, source, Some(&type_name), symbols, deps);
-                }
-            }
-            "mod_item" => {
-                if let Some(name) = field_text(child, "name", source) {
-                    symbols.push(build_symbol_info(child, SymbolKind::Module, name.clone(), source));
-                    if let Some(body) = child.child_by_field_name("body") {
-                        walk_items(body, source, Some(&name), symbols, deps);
-                    }
-                }
-            }
-            "const_item" => {
-                if let Some(name) = field_text(child, "name", source) {
-                    symbols.push(build_symbol_info(child, SymbolKind::Const, name, source));
-                }
-            }
-            "static_item" => {
-                if let Some(name) = field_text(child, "name", source) {
-                    symbols.push(build_symbol_info(child, SymbolKind::Static, name, source));
-                }
-            }
-            "type_item" => {
-                if let Some(name) = field_text(child, "name", source) {
-                    symbols.push(build_symbol_info(child, SymbolKind::TypeAlias, name, source));
-                }
-            }
-            _ => {}
-        }
-    }
+fn unqualified_symbol_key(sym: &str) -> Option<&str> {
+    sym.rsplit_once("::")
+        .or_else(|| sym.rsplit_once('.'))
+        .map(|(_, short)| short)
 }
 
-fn build_symbol_info(node: Node<'_>, kind: SymbolKind, name: String, source: &[u8]) -> SymbolInfo {
-    let start_line = node.start_position().row + 1;
-    let end_line = node.end_position().row + 1;
-    let signature = extract_signature(node, source);
-    let mut refs = BTreeSet::new();
-    collect_references(node, source, &mut refs);
-    refs.remove(&name);
-    if let Some((_, short)) = name.rsplit_once("::") {
-        refs.remove(short);
+/// Backward-compatible wrapper preserving [`RustIndexer::index_source`] and [`RustIndexer::build_ego_graph`].
+pub struct RustIndexer;
+
+impl RustIndexer {
+    /// Parse Rust source text and extract symbols, signatures, local references, and `use` dependencies.
+    pub fn index_source(source: &str) -> Result<FileGraph> {
+        let (_, graph) = LanguageRegistry::default_all().index_path("lib.rs", source)?;
+        Ok(graph)
     }
 
-    SymbolInfo {
-        name,
-        kind,
-        start_line,
-        end_line,
-        signature,
-        references: refs.into_iter().take(40).collect(),
+    /// Build a 1-hop / 2-hop RepoGraph ego-graph around a symbol name or file path from LanceDB snapshots.
+    pub fn build_ego_graph(
+        snapshots: &[CodeGraphSnapshot],
+        query_symbol: &str,
+        max_hops: usize,
+    ) -> EgoGraph {
+        RepoGraph::build_ego_graph(snapshots, query_symbol, max_hops)
     }
-}
-
-fn extract_signature(node: Node<'_>, source: &[u8]) -> String {
-    let Ok(text) = node.utf8_text(source) else {
-        return String::new();
-    };
-    let head = text.split('{').next().unwrap_or(text);
-    let collapsed = head
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
-    if collapsed.len() > 140 {
-        let cut = collapsed
-            .char_indices()
-            .take_while(|(idx, _)| *idx <= 137)
-            .last()
-            .map(|(idx, _)| idx)
-            .unwrap_or(0);
-        format!("{}...", &collapsed[..cut])
-    } else {
-        collapsed
-    }
-}
-
-fn collect_references(node: Node<'_>, source: &[u8], refs: &mut BTreeSet<String>) {
-    match node.kind() {
-        "type_identifier" => {
-            if let Ok(text) = node.utf8_text(source) {
-                if !is_builtin_type(text) && text.len() >= 2 {
-                    refs.insert(text.to_string());
-                }
-            }
-        }
-        "call_expression" => {
-            if let Some(func) = node.child_by_field_name("function")
-                && let Ok(text) = func.utf8_text(source)
-            {
-                let cleaned = text.trim();
-                if let Some(ident) = cleaned.rsplit("::").next().or(Some(cleaned)) {
-                    let ident = ident.rsplit('.').next().unwrap_or(ident);
-                    if ident.len() >= 3 && !is_noise_ident(ident) {
-                        refs.insert(ident.to_string());
-                    }
-                }
-                if cleaned.contains("::") && cleaned.len() <= 64 {
-                    refs.insert(cleaned.to_string());
-                }
-            }
-        }
-        _ => {}
-    }
-
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_references(child, source, refs);
-    }
-}
-
-fn field_text(node: Node<'_>, field: &str, source: &[u8]) -> Option<String> {
-    node.child_by_field_name(field)?
-        .utf8_text(source)
-        .ok()
-        .map(|s| s.trim().to_string())
-}
-
-fn simplify_type_name(raw: &str) -> String {
-    raw.split('<')
-        .next()
-        .unwrap_or(raw)
-        .trim()
-        .to_string()
-}
-
-fn is_builtin_type(t: &str) -> bool {
-    matches!(
-        t,
-        "String"
-            | "Vec"
-            | "Option"
-            | "Result"
-            | "Box"
-            | "Arc"
-            | "Rc"
-            | "Self"
-            | "HashMap"
-            | "HashSet"
-            | "BTreeMap"
-            | "BTreeSet"
-            | "Path"
-            | "PathBuf"
-    )
-}
-
-fn is_noise_ident(ident: &str) -> bool {
-    matches!(
-        ident,
-        "new"
-            | "default"
-            | "clone"
-            | "into"
-            | "from"
-            | "unwrap"
-            | "expect"
-            | "to_string"
-            | "as_str"
-            | "iter"
-            | "into_iter"
-            | "collect"
-            | "push"
-            | "len"
-            | "is_empty"
-            | "map"
-            | "filter"
-            | "ok"
-            | "err"
-    )
 }

@@ -275,6 +275,89 @@ impl MemoryConsolidator {
             }
         }
     }
+
+    /// Promote all active bi-temporal architectural decisions (and optionally skills) from
+    /// `from_scope` into `to_scope` on the same `repo_id`, routing every decision through the
+    /// conflict gate (`ADD` / `UPDATE` / `NOOP`) so target history remains coherent.
+    pub async fn promote_scope(
+        &self,
+        repo_id: &str,
+        from_scope: &str,
+        to_scope: &str,
+        include_skills: bool,
+    ) -> Result<ScopePromotionReport> {
+        let decisions = self.store.list_active_decisions(repo_id, from_scope).await?;
+        let mut decisions_added = 0usize;
+        let mut decisions_updated = 0usize;
+        let mut decisions_noop = 0usize;
+        let mut outcomes = Vec::new();
+
+        for dec in decisions {
+            let outcome = self
+                .consolidate_decision(
+                    repo_id,
+                    to_scope,
+                    CandidateDecision {
+                        topic: dec.topic,
+                        rule_statement: dec.rule_statement,
+                        rationale: format!("{} [promoted from scope `{from_scope}`]", dec.rationale),
+                        affected_paths: dec.affected_paths,
+                    },
+                )
+                .await?;
+            match outcome.action {
+                ConsolidationAction::Add => decisions_added += 1,
+                ConsolidationAction::Update { .. } => decisions_updated += 1,
+                ConsolidationAction::Noop { .. } | ConsolidationAction::Invalidate { .. } => {
+                    decisions_noop += 1
+                }
+            }
+            outcomes.push(outcome);
+        }
+
+        let mut skills_promoted = 0usize;
+        if include_skills {
+            let skills = self.store.list_skills(repo_id, from_scope).await?;
+            for skill in skills {
+                let _ = self
+                    .store
+                    .save_skill(
+                        repo_id,
+                        to_scope,
+                        &skill.name,
+                        &skill.description,
+                        &skill.instructions,
+                        skill.triggers,
+                    )
+                    .await?;
+                skills_promoted += 1;
+            }
+        }
+
+        Ok(ScopePromotionReport {
+            repo_id: repo_id.to_string(),
+            from_scope: from_scope.to_string(),
+            to_scope: to_scope.to_string(),
+            decisions_added,
+            decisions_updated,
+            decisions_noop,
+            skills_promoted,
+            outcomes,
+        })
+    }
+}
+
+/// Summary of promoting bi-temporal decisions and skills between scopes on a shared LanceDB store.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScopePromotionReport {
+    pub repo_id: String,
+    pub from_scope: String,
+    pub to_scope: String,
+    pub decisions_added: usize,
+    pub decisions_updated: usize,
+    pub decisions_noop: usize,
+    pub skills_promoted: usize,
+    pub outcomes: Vec<ConsolidationOutcome>,
 }
 
 /// Live status reported by the asynchronous sleep-time compute worker.

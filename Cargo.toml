@@ -5,6 +5,7 @@ members = [
     "crates/allyh-env",
     "crates/allyh-tools",
     "crates/allyh-core",
+    "crates/allyh-sim",
     "crates/allyh-tui",
 ]
 
@@ -47,6 +48,12 @@ notify = "8"
 git2 = { version = "0.20", default-features = false }
 tree-sitter = "0.25"
 tree-sitter-rust = "0.24"
+tree-sitter-typescript = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-go = "0.23"
+ignore = "0.4"
+regex = "1"
 walkdir = "2"
 similar = "2"
 
@@ -63,3 +70,4 @@ allyh-memory = { path = "crates/allyh-memory" }
 allyh-env = { path = "crates/allyh-env" }
 allyh-tools = { path = "crates/allyh-tools" }
 allyh-core = { path = "crates/allyh-core" }
+allyh-sim = { path = "crates/allyh-sim" }
