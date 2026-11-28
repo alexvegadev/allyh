@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use allyh_core::{AllyHOrchestrator, ControlGateState, InspectorSnapshot, UiEvent, UserCommand};
+use allyh_env::CheckpointDiffReport;
 use allyh_memory::{RepoProfile, WorkerStatus, load_skill_markdown_file};
 use allyh_tools::{PendingCommandApproval, ToolExecutionRecord, parse_mcp_server_spec};
 use crossterm::event::KeyCode;
@@ -19,6 +20,8 @@ pub const COMMANDS: &[SlashCommand] = &[
     SlashCommand::new("/plan", "<goal>", "Propose a change for approval"),
     SlashCommand::new("/model", "[spec]", "Show or switch the reasoning model"),
     SlashCommand::new("/memories", "", "List active project decisions"),
+    SlashCommand::new("/timeline", "", "Browse active & superseded decision history"),
+    SlashCommand::new("/sessions", "[cmd]", "Browse or resume prior repository sessions"),
     SlashCommand::new("/skills", "[cmd]", "List, show, pin, import, or remove skills"),
     SlashCommand::new("/sim", "[cmd]", "Inspect SIM ledger, problems, or active harness"),
     SlashCommand::new("/pin", "[id]", "Pin or unpin a decision"),
@@ -123,6 +126,9 @@ pub struct AppState {
     pub focus: FocusPane,
     pub chat_scroll: Scroll,
     pub plan_scroll: Scroll,
+    pub diff_scroll: Scroll,
+    pub active_diff_modal: Option<CheckpointDiffReport>,
+    pub diff_side_by_side: bool,
     pub command_index: usize,
     pub commands_dismissed: bool,
     pub selected_memory_idx: usize,
@@ -145,6 +151,9 @@ impl AppState {
                 ..Scroll::default()
             },
             plan_scroll: Scroll::default(),
+            diff_scroll: Scroll::default(),
+            active_diff_modal: None,
+            diff_side_by_side: false,
             command_index: 0,
             commands_dismissed: false,
             selected_memory_idx: 0,
@@ -159,6 +168,45 @@ impl AppState {
             self.inspector.gate_state,
             ControlGateState::PlanApproval { .. }
         ) || self.pending_command_approval.is_some()
+            || self.active_diff_modal.is_some()
+    }
+
+    /// Return the most relevant copyable snippet (active diff modal, expanded tool card,
+    /// latest fenced code block, or latest tool card/reply) for one-key clipboard copy.
+    pub fn latest_copyable_snippet(&self) -> Option<(&'static str, String)> {
+        if let Some(ref diff) = self.active_diff_modal
+            && !diff.unified_diff.trim().is_empty()
+        {
+            return Some(("checkpoint diff", diff.unified_diff.clone()));
+        }
+        for entry in self.entries.iter().rev() {
+            if let ChatEntry::ToolCard { record, expanded: true } = entry
+                && !record.output_text.trim().is_empty()
+            {
+                return Some(("tool output", record.output_text.clone()));
+            }
+        }
+        for entry in self.entries.iter().rev() {
+            match entry {
+                ChatEntry::Assistant { text, .. } => {
+                    if let Some(code) = extract_last_fenced_code_block(text) {
+                        return Some(("code block", code));
+                    }
+                }
+                ChatEntry::ToolCard { record, .. } if !record.output_text.trim().is_empty() => {
+                    return Some(("tool output", record.output_text.clone()));
+                }
+                _ => {}
+            }
+        }
+        for entry in self.entries.iter().rev() {
+            if let ChatEntry::Assistant { text, .. } = entry
+                && !text.trim().is_empty()
+            {
+                return Some(("assistant reply", text.clone()));
+            }
+        }
+        None
     }
 
     pub fn cycle_focus(&mut self, reverse: bool) {
@@ -263,6 +311,8 @@ impl AppState {
                     Some(UserCommand::ProposePlan(plan))
                 }
                 "memories" => Some(UserCommand::RequestMemories),
+                "timeline" => Some(UserCommand::RequestTimeline),
+                "sessions" | "session" => self.parse_sessions_command(arg),
                 "skills" | "skill" => self.parse_skills_command(cmd.as_str(), arg),
                 "sim" => self.parse_sim_command(arg),
                 "invalidate" => {
@@ -454,6 +504,89 @@ impl AppState {
                     self.entries.push(ChatEntry::System(format!(
                         "### Active LanceDB Invariants ({})\n{rendered}",
                         list.len()
+                    )));
+                }
+            }
+            UiEvent::Timeline(decisions) => {
+                if decisions.is_empty() {
+                    self.entries.push(ChatEntry::System(
+                        "No architectural decisions recorded in this repository partition yet."
+                            .to_string(),
+                    ));
+                } else {
+                    let rows = decisions
+                        .iter()
+                        .map(|d| {
+                            let short = &d.id[..d.id.len().min(8)];
+                            let state = match (&d.invalid_at, &d.superseded_by) {
+                                (Some(inv), Some(by)) => format!(
+                                    "SUPERSEDED {} -> `{}`",
+                                    inv.format("%Y-%m-%d %H:%M"),
+                                    &by[..by.len().min(8)]
+                                ),
+                                (Some(inv), None) => {
+                                    format!("INVALIDATED {}", inv.format("%Y-%m-%d %H:%M"))
+                                }
+                                (None, _) => "ACTIVE".to_string(),
+                            };
+                            format!(
+                                "- `{short}` [{state}] [{}] {} — _{}_ (valid {})",
+                                d.topic,
+                                d.rule_statement,
+                                d.rationale,
+                                d.valid_at.format("%Y-%m-%d %H:%M")
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    self.entries.push(ChatEntry::System(format!(
+                        "### Bi-Temporal Memory Timeline ({})\n{rows}",
+                        decisions.len()
+                    )));
+                }
+            }
+            UiEvent::SessionsList {
+                current_session_id,
+                sessions,
+            } => {
+                if sessions.is_empty() {
+                    self.entries.push(ChatEntry::System(
+                        "No prior sessions recorded for this repository partition.".to_string(),
+                    ));
+                } else {
+                    let rows = sessions
+                        .iter()
+                        .take(12)
+                        .map(|s| {
+                            let short = &s.session_id[..s.session_id.len().min(8)];
+                            let cur = if s.session_id == current_session_id {
+                                " [CURRENT]"
+                            } else {
+                                ""
+                            };
+                            let cache_pct = if s.input_tokens > 0 {
+                                ((s.cached_input_tokens as f64 / s.input_tokens as f64) * 100.0)
+                                    .round() as u64
+                            } else {
+                                0
+                            };
+                            let summary = if s.rolling_summary.trim().is_empty() {
+                                "No summary yet".to_string()
+                            } else {
+                                let first = s.rolling_summary.lines().next().unwrap_or("");
+                                first.chars().take(72).collect::<String>()
+                            };
+                            format!(
+                                "- `{short}`{cur} ({}, cache {cache_pct}%, ${:.3}) — {summary}",
+                                s.started_at.format("%Y-%m-%d %H:%M"),
+                                s.estimated_cost_usd
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    self.entries.push(ChatEntry::System(format!(
+                        "### Repository Sessions ({})\n{rows}\n\n_Use `/sessions resume <id-prefix>` to restore a prior session's rolling context._",
+                        sessions.len()
                     )));
                 }
             }
@@ -752,6 +885,8 @@ impl AppState {
                     )));
                 }
                 Some(report) => {
+                    self.diff_scroll = Scroll::default();
+                    self.active_diff_modal = Some(report.clone());
                     self.entries.push(ChatEntry::System(format!(
                         "### Checkpoint Diff (`{}`)\n- **Summary:** {}\n\n```diff\n{}\n```\n\n_Run `/rollback` to restore all files to this checkpoint._",
                         report.checkpoint_label,
@@ -1151,4 +1286,49 @@ impl AppState {
             }
         }
     }
+
+    fn parse_sessions_command(&mut self, arg: &str) -> Option<UserCommand> {
+        let trimmed = arg.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("list") || trimmed.eq_ignore_ascii_case("ls") {
+            return Some(UserCommand::RequestSessions);
+        }
+        let mut parts = trimmed.splitn(2, char::is_whitespace);
+        let sub = parts.next().unwrap_or("").to_ascii_lowercase();
+        let rest = parts.next().unwrap_or("").trim();
+        match sub.as_str() {
+            "resume" | "load" | "open" => {
+                if rest.is_empty() {
+                    self.entries.push(ChatEntry::System(
+                        "Usage: `/sessions resume <session-id-prefix>`".to_string(),
+                    ));
+                    None
+                } else {
+                    Some(UserCommand::ResumeSession(rest.to_string()))
+                }
+            }
+            _ => Some(UserCommand::ResumeSession(trimmed.to_string())),
+        }
+    }
+}
+
+fn extract_last_fenced_code_block(markdown: &str) -> Option<String> {
+    let mut in_block = false;
+    let mut current = Vec::new();
+    let mut last_block = None;
+    for line in markdown.lines() {
+        if line.trim_start().starts_with("```") {
+            if !in_block {
+                in_block = true;
+                current.clear();
+            } else {
+                in_block = false;
+                if !current.is_empty() {
+                    last_block = Some(current.join("\n"));
+                }
+            }
+        } else if in_block {
+            current.push(line);
+        }
+    }
+    last_block
 }

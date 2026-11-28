@@ -19,12 +19,14 @@ pub struct GitLogEntry {
     pub summary: String,
 }
 
-/// Structured working-tree / staged diff report returned by [`GitTracker::diff`].
+/// Structured working-tree / staged / branch diff report returned by [`GitTracker::diff`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GitDiffReport {
     pub files_changed: usize,
     pub insertions: usize,
     pub deletions: usize,
+    #[serde(default)]
+    pub changed_files: Vec<String>,
     pub patch: String,
     pub truncated: bool,
 }
@@ -64,14 +66,23 @@ impl GitTracker {
     }
 
     /// Return the canonical identifier used to derive `repo_id` (origin URL if present,
-    /// otherwise canonicalized repository root path).
+    /// otherwise canonicalized main repository root — shared across all `git worktree`s).
     pub fn canonical_repo_identifier(&self) -> String {
-        if let Ok(repo) = Repository::discover(&self.repo_root)
-            && let Ok(remote) = repo.find_remote("origin")
-            && let Some(url) = remote.url()
-            && !url.trim().is_empty()
-        {
-            return url.trim().to_string();
+        if let Ok(repo) = Repository::discover(&self.repo_root) {
+            if let Ok(remote) = repo.find_remote("origin")
+                && let Some(url) = remote.url()
+                && !url.trim().is_empty()
+            {
+                return url.trim().to_string();
+            }
+            // For linked git worktrees without an origin remote, resolve to the common main
+            // repository directory so every worktree shares the exact same `repo_id` partition.
+            if repo.is_worktree()
+                && let Some(common_parent) = repo.commondir().parent()
+            {
+                let canonical = canonicalize_normalized(common_parent);
+                return path_to_slash_string(&canonical);
+            }
         }
         let canonical = canonicalize_normalized(&self.repo_root);
         path_to_slash_string(&canonical)
@@ -305,10 +316,91 @@ impl GitTracker {
             true
         });
 
+        let mut changed_files = Vec::new();
+        for delta in diff.deltas() {
+            if let Some(p) = delta.new_file().path().or_else(|| delta.old_file().path()) {
+                let s = path_to_slash_string(p);
+                if !changed_files.contains(&s) {
+                    changed_files.push(s);
+                }
+            }
+        }
+        changed_files.sort();
+
         Ok(GitDiffReport {
             files_changed: stats.files_changed(),
             insertions: stats.insertions(),
             deletions: stats.deletions(),
+            changed_files,
+            patch: lines.join("\n"),
+            truncated,
+        })
+    }
+
+    /// Compute structured unified diff from a base Git ref (e.g. `main`, `HEAD~1`, or commit SHA)
+    /// to the current working tree (including committed branch changes and staged/unstaged edits).
+    pub fn diff_against_base(&self, base_ref: &str, max_chars: usize) -> Result<GitDiffReport> {
+        let repo = Repository::discover(&self.repo_root)
+            .map_err(|e| EnvError::Command(format!("not a git repository: {e}")))?;
+        let base_obj = repo
+            .revparse_single(base_ref.trim())
+            .map_err(|e| EnvError::Command(format!("unknown base ref '{base_ref}': {e}")))?;
+        let base_tree = base_obj
+            .peel_to_tree()
+            .map_err(|e| EnvError::Command(format!("failed to peel '{base_ref}' to tree: {e}")))?;
+
+        let mut opts = DiffOptions::new();
+        opts.context_lines(2)
+            .include_untracked(true)
+            .recurse_untracked_dirs(true)
+            .show_untracked_content(true);
+
+        let diff = repo
+            .diff_tree_to_workdir_with_index(Some(&base_tree), Some(&mut opts))
+            .map_err(|e| EnvError::Command(format!("git diff against '{base_ref}' failed: {e}")))?;
+        let stats = diff
+            .stats()
+            .map_err(|e| EnvError::Command(format!("git diff stats failed: {e}")))?;
+
+        let mut changed_files = Vec::new();
+        for delta in diff.deltas() {
+            if let Some(p) = delta.new_file().path().or_else(|| delta.old_file().path()) {
+                let s = path_to_slash_string(p);
+                if !s.starts_with("target/") && !s.starts_with(".git/") && !changed_files.contains(&s)
+                {
+                    changed_files.push(s);
+                }
+            }
+        }
+        changed_files.sort();
+
+        let cap = max_chars.clamp(512, 64_000);
+        let mut lines = Vec::new();
+        let mut chars = 0usize;
+        let mut truncated = false;
+        let _ = diff.print(git2::DiffFormat::Patch, |_delta, _hunk, line| {
+            if chars >= cap {
+                truncated = true;
+                return false;
+            }
+            if let Ok(text) = std::str::from_utf8(line.content()) {
+                let origin = line.origin();
+                let formatted = if matches!(origin, '+' | '-' | ' ') {
+                    format!("{origin}{}", text.trim_end_matches(['\r', '\n']))
+                } else {
+                    text.trim_end_matches(['\r', '\n']).to_string()
+                };
+                chars += formatted.len() + 1;
+                lines.push(formatted);
+            }
+            true
+        });
+
+        Ok(GitDiffReport {
+            files_changed: stats.files_changed(),
+            insertions: stats.insertions(),
+            deletions: stats.deletions(),
+            changed_files,
             patch: lines.join("\n"),
             truncated,
         })

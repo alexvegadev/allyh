@@ -44,12 +44,25 @@ pub struct OutOfBandEdit {
     pub diff_summary: String,
 }
 
+/// Cross-agent file overlap detected when another active `scope_id` sharing the same
+/// LanceDB `repo_id` has modified or claimed a file also present/dirty in this workspace.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CrossScopeClaim {
+    pub other_scope_id: String,
+    pub file_path: String,
+    pub other_sha256: String,
+    pub local_sha256: Option<String>,
+    pub diverged: bool,
+}
+
 /// Structured environment delta computed before every agent turn.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EnvDelta {
     pub generated_at: Option<DateTime<Utc>>,
     pub git: GitState,
     pub out_of_band_edits: Vec<OutOfBandEdit>,
+    #[serde(default)]
+    pub cross_scope_claims: Vec<CrossScopeClaim>,
     pub recent_fs_events: Vec<FsChangeEvent>,
     pub reindexed_files: Vec<String>,
     pub build_status: Option<String>,
@@ -105,6 +118,22 @@ impl EnvDelta {
             lines.push("- Out-of-band manual edits detected (SHA-256 mismatch):".to_string());
             for edit in &self.out_of_band_edits {
                 lines.push(format!("  - `{}`: {}", edit.file_path, edit.diff_summary));
+            }
+        }
+        if !self.cross_scope_claims.is_empty() {
+            lines.push(
+                "- Cross-agent scope overlap warnings (shared LanceDB partition):".to_string(),
+            );
+            for claim in self.cross_scope_claims.iter().take(10) {
+                let status = if claim.diverged {
+                    "diverged SHA-256"
+                } else {
+                    "active claim"
+                };
+                lines.push(format!(
+                    "  - `{}` also touched by scope `{}` ({status})",
+                    claim.file_path, claim.other_scope_id
+                ));
             }
         }
         if !self.git.diff_summary.is_empty() && self.out_of_band_edits.is_empty() {
@@ -573,10 +602,52 @@ impl EnvironmentMonitor {
 
         let active_lsp_servers = self.lsp.active_badges(&detected_languages).await;
 
+        // Cross-agent hash/claim awareness across sibling scopes sharing the same LanceDB repo_id.
+        let mut cross_scope_claims = Vec::new();
+        if let Ok(other_snaps) = self
+            .store
+            .list_other_scope_code_snapshots(&self.repo_id, &self.scope_id)
+            .await
+            && !other_snaps.is_empty()
+        {
+            let local_latest: HashMap<String, String> = self
+                .store
+                .list_code_snapshots(&self.repo_id, &self.scope_id)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|s| (s.file_path, s.sha256_hash))
+                .collect();
+            let dirty_set: HashSet<&str> = git
+                .dirty_files
+                .iter()
+                .chain(git.untracked_files.iter())
+                .map(String::as_str)
+                .collect();
+
+            for other in other_snaps {
+                let local_hash = local_latest.get(&other.file_path).cloned();
+                let diverged = local_hash
+                    .as_deref()
+                    .is_some_and(|lh| lh != other.sha256_hash);
+                let local_dirty = dirty_set.contains(other.file_path.as_str());
+                if diverged || local_dirty {
+                    cross_scope_claims.push(CrossScopeClaim {
+                        other_scope_id: other.scope_id,
+                        file_path: other.file_path,
+                        other_sha256: other.sha256_hash,
+                        local_sha256: local_hash,
+                        diverged,
+                    });
+                }
+            }
+        }
+
         Ok(EnvDelta {
             generated_at: Some(Utc::now()),
             git,
             out_of_band_edits,
+            cross_scope_claims,
             recent_fs_events,
             reindexed_files,
             build_status,

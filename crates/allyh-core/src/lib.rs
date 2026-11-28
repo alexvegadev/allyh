@@ -1,6 +1,7 @@
 //! AllyH core orchestrator, control gates, hybrid router, dynamic preamble assembler,
 //! non-destructive history compaction, and bi-temporal memory consolidation.
 
+pub mod audit;
 pub mod compaction;
 pub mod consolidation;
 pub mod error;
@@ -12,6 +13,10 @@ pub mod orchestrator;
 pub mod preamble;
 pub mod router;
 
+pub use audit::{
+    ArchitecturalAuditReport, AuditViolation, HeadlessMode, HeadlessRunReport, HeadlessStreamEvent,
+    audit_diff_against_invariants, audit_repo_against_base, run_headless_turn,
+};
 pub use compaction::{CompactingHistory, HistoryUnit};
 pub use consolidation::{
     LocalLlmConflictJudge, extract_candidate_decisions, extract_heuristic_decisions,

@@ -85,6 +85,7 @@ dependencies = [
  "allyh-memory",
  "async-trait",
  "chrono",
+ "dirs",
  "git2",
  "hex",
  "ignore",

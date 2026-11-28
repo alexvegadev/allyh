@@ -12,6 +12,7 @@ pub mod path;
 pub mod search;
 pub mod verify;
 pub mod watcher;
+pub mod worktree;
 
 pub use cargo::{
     CargoRunner, CargoVerificationReport, CompilerDiagnostic, VerificationKind,
@@ -51,6 +52,7 @@ pub use verify::{
     VerificationTarget,
 };
 pub use watcher::{
-    EnvDelta, EnvironmentMonitor, FsChangeEvent, LiveFsWatcher, OutOfBandEdit, normalize_rel_path,
-    summarize_text_diff,
+    CrossScopeClaim, EnvDelta, EnvironmentMonitor, FsChangeEvent, LiveFsWatcher, OutOfBandEdit,
+    normalize_rel_path, summarize_text_diff,
 };
+pub use worktree::{WorktreeInfo, WorktreeManager};

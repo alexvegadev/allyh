@@ -19,7 +19,8 @@ pub use config::{
 };
 pub use consolidator::{
     CandidateDecision, ConflictJudge, ConsolidationAction, ConsolidationOutcome,
-    HeuristicConflictJudge, MemoryConsolidator, SleepJob, SleepTimeWorkerHandle, WorkerStatus,
+    HeuristicConflictJudge, MemoryConsolidator, ScopePromotionReport, SleepJob,
+    SleepTimeWorkerHandle, WorkerStatus,
 };
 pub use embeddings::{
     DEFAULT_LOCAL_EMBEDDING_BASE_URL, DEFAULT_LOCAL_EMBEDDING_MODEL,

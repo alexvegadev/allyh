@@ -9,11 +9,11 @@ use allyh_env::{
     PlanCheckpoint, RollbackReport,
 };
 use allyh_memory::{
-    CandidateDecision, ConsolidationOutcome, DbStatusReport, DeterministicHashEmbedder,
-    EmbeddingProvider, HarnessVersionRecord, McpServerConfig, MemoryConsolidator, MemoryStore,
-    RepoProfile, ScoredDecision, SessionRecord, SimExportDocument, SimLedger, SimProblemEntry,
-    SimRunRecord, SkillRecord, SleepJob, SleepTimeWorkerHandle, StorageConfig, TaskRecord,
-    WorkerStatus, compute_repo_id,
+    ArchitecturalDecision, CandidateDecision, ConsolidationOutcome, DbStatusReport,
+    DeterministicHashEmbedder, EmbeddingProvider, HarnessVersionRecord, McpServerConfig,
+    MemoryConsolidator, MemoryStore, RepoProfile, ScoredDecision, SessionRecord, SimExportDocument,
+    SimLedger, SimProblemEntry, SimRunRecord, SkillRecord, SleepJob, SleepTimeWorkerHandle,
+    StorageConfig, TaskRecord, WorkerStatus, compute_repo_id,
 };
 use allyh_tools::{AciToolset, McpServerStatus, PendingCommandApproval, ToolExecutionRecord};
 use chrono::Utc;
@@ -41,6 +41,8 @@ pub struct InspectorSnapshot {
     pub git_branch: String,
     pub dirty_files: Vec<String>,
     pub out_of_band_edits: Vec<String>,
+    #[serde(default)]
+    pub cross_scope_warnings: Vec<String>,
     #[serde(default)]
     pub detected_languages: Vec<String>,
     #[serde(default)]
@@ -89,6 +91,9 @@ pub enum UserCommand {
     },
     RecordDecision(CandidateDecision),
     RequestMemories,
+    RequestTimeline,
+    RequestSessions,
+    ResumeSession(String),
     RequestSkills,
     ShowSkill(String),
     PinSkill(String),
@@ -137,6 +142,11 @@ pub enum UiEvent {
     InspectorUpdated(InspectorSnapshot),
     WorkerStatusChanged(WorkerStatus),
     MemoriesList(Vec<ScoredDecision>),
+    Timeline(Vec<ArchitecturalDecision>),
+    SessionsList {
+        current_session_id: String,
+        sessions: Vec<SessionRecord>,
+    },
     SkillsList {
         skills: Vec<SkillRecord>,
         pinned_ids: HashSet<String>,
@@ -746,6 +756,12 @@ impl AllyHOrchestrator {
             .iter()
             .map(|e| format!("{}: {}", e.file_path, e.diff_summary))
             .collect();
+        let cross_scope_warnings = self
+            .last_env_delta
+            .cross_scope_claims
+            .iter()
+            .map(|c| format!("{} ({})", c.file_path, c.other_scope_id))
+            .collect();
 
         let active_lsp_servers = self
             .env
@@ -766,6 +782,7 @@ impl AllyHOrchestrator {
             git_branch: self.last_env_delta.git.branch.clone(),
             dirty_files: self.last_env_delta.git.dirty_files.clone(),
             out_of_band_edits: oob,
+            cross_scope_warnings,
             detected_languages: self.last_env_delta.detected_languages.clone(),
             detected_toolchains: self.last_env_delta.detected_toolchains.clone(),
             active_lsp_servers,
@@ -1281,6 +1298,80 @@ impl AllyHOrchestrator {
                             let _ = ui_tx.send(UiEvent::Error(err.to_string()));
                         }
                     },
+                    UserCommand::RequestTimeline => {
+                        match self
+                            .store
+                            .list_all_decisions(&self.repo_id, &self.scope_id)
+                            .await
+                        {
+                            Ok(all) => {
+                                let _ = ui_tx.send(UiEvent::Timeline(all));
+                            }
+                            Err(err) => {
+                                let _ = ui_tx.send(UiEvent::Error(err.to_string()));
+                            }
+                        }
+                    }
+                    UserCommand::RequestSessions => {
+                        match self
+                            .store
+                            .list_sessions(&self.repo_id, &self.scope_id)
+                            .await
+                        {
+                            Ok(sessions) => {
+                                let _ = ui_tx.send(UiEvent::SessionsList {
+                                    current_session_id: self.session_id.clone(),
+                                    sessions,
+                                });
+                            }
+                            Err(err) => {
+                                let _ = ui_tx.send(UiEvent::Error(err.to_string()));
+                            }
+                        }
+                    }
+                    UserCommand::ResumeSession(prefix) => {
+                        match self
+                            .store
+                            .get_session_by_prefix(&self.repo_id, &self.scope_id, &prefix)
+                            .await
+                        {
+                            Ok(Some(target)) => {
+                                self.session_id = target.session_id.clone();
+                                self.session_started_at = target.started_at;
+                                self.session_telemetry = SessionTelemetry {
+                                    input_tokens: target.input_tokens,
+                                    output_tokens: target.output_tokens,
+                                    cached_input_tokens: target.cached_input_tokens,
+                                    cache_creation_tokens: target.cache_creation_tokens,
+                                    estimated_cost_usd: target.estimated_cost_usd,
+                                };
+                                let mut restored =
+                                    CompactingHistory::new(target.rolling_summary.clone());
+                                restored.apply_policy(
+                                    self.active_harness.compaction.keep_recent_units,
+                                    self.active_harness.compaction.compaction_ratio,
+                                    self.active_harness.compaction.max_rollup_chars,
+                                );
+                                self.history = restored;
+                                let _ = ui_tx.send(UiEvent::SystemNotice(format!(
+                                    "Resumed session `{}` (started {}, rolling summary loaded).",
+                                    &target.session_id[..target.session_id.len().min(8)],
+                                    target.started_at.format("%Y-%m-%d %H:%M UTC"),
+                                )));
+                                if let Ok(snap) = self.inspector_snapshot().await {
+                                    let _ = ui_tx.send(UiEvent::InspectorUpdated(snap));
+                                }
+                            }
+                            Ok(None) => {
+                                let _ = ui_tx.send(UiEvent::Error(format!(
+                                    "Session '{prefix}' not found for this repository partition."
+                                )));
+                            }
+                            Err(err) => {
+                                let _ = ui_tx.send(UiEvent::Error(err.to_string()));
+                            }
+                        }
+                    }
                     UserCommand::RequestSkills => match self.list_skills().await {
                         Ok(skills) => {
                             let _ = ui_tx.send(UiEvent::SkillsList {

@@ -331,6 +331,23 @@ impl MemoryStore {
         Ok(self.list_sessions(repo_id, scope_id).await?.into_iter().next())
     }
 
+    /// Look up a prior session by exact `session_id` or unique prefix within `(repo_id, scope_id)`.
+    pub async fn get_session_by_prefix(
+        &self,
+        repo_id: &str,
+        scope_id: &str,
+        id_or_prefix: &str,
+    ) -> Result<Option<SessionRecord>> {
+        let needle = id_or_prefix.trim();
+        if needle.is_empty() {
+            return Ok(None);
+        }
+        let sessions = self.list_sessions(repo_id, scope_id).await?;
+        Ok(sessions
+            .into_iter()
+            .find(|s| s.session_id == needle || s.session_id.starts_with(needle)))
+    }
+
     // -----------------------------------------------------------------------
     // Architectural Decisions (Bi-Temporal + Hybrid Search)
     // -----------------------------------------------------------------------
@@ -856,6 +873,39 @@ impl MemoryStore {
             snapshots.extend(batch_to_snapshots(batch)?);
         }
         snapshots.sort_by(|a, b| a.file_path.cmp(&b.file_path));
+        Ok(snapshots)
+    }
+
+    /// List code snapshots recorded by *other* scopes sharing the same `repo_id` in LanceDB.
+    /// Used for cross-agent hash/claim overlap awareness in multi-agent worktree workflows.
+    pub async fn list_other_scope_code_snapshots(
+        &self,
+        repo_id: &str,
+        exclude_scope_id: &str,
+    ) -> Result<Vec<CodeGraphSnapshot>> {
+        let table = self.open_table(TABLE_CODE_GRAPH_SNAPSHOTS).await?;
+        let filter = format!(
+            "repo_id = '{}' AND scope_id != '{}'",
+            escape_sql_literal(repo_id),
+            escape_sql_literal(exclude_scope_id)
+        );
+        let batches = table
+            .query()
+            .only_if(filter)
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let mut snapshots = Vec::new();
+        for batch in &batches {
+            snapshots.extend(batch_to_snapshots(batch)?);
+        }
+        snapshots.sort_by(|a, b| {
+            a.file_path
+                .cmp(&b.file_path)
+                .then_with(|| a.scope_id.cmp(&b.scope_id))
+        });
         Ok(snapshots)
     }
 

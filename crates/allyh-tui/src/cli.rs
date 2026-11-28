@@ -64,6 +64,123 @@ pub enum CliCommand {
     Lsp(LspArgs),
     /// Run AllyH as an MCP server or manage external MCP server connections.
     Mcp(McpArgs),
+    /// Execute a prompt or task spec headlessly for CI/CD pipelines.
+    Run(RunArgs),
+    /// Audit a Git diff against active LanceDB architectural invariants (non-zero exit on breach).
+    Audit(AuditArgs),
+    /// Inspect bi-temporal memory timelines and promote verified decisions across scopes.
+    Memory(MemoryArgs),
+    /// Manage isolated Git worktrees for parallel scoped multi-agent execution.
+    Worktree(WorktreeArgs),
+}
+
+/// Options for `allyh run`.
+#[derive(Debug, Clone, Args)]
+pub struct RunArgs {
+    /// Inline prompt to execute headlessly (mutually exclusive with `--task-file`).
+    #[arg(conflicts_with = "task_file")]
+    pub prompt: Option<String>,
+    /// Read prompt / task spec from a file (mutually exclusive with inline prompt).
+    #[arg(long, conflicts_with = "prompt")]
+    pub task_file: Option<PathBuf>,
+    /// Execution mode (`discovery-only` or `execute`).
+    #[arg(long, default_value = "discovery-only")]
+    pub mode: String,
+    /// Required with `--mode execute` to approve plan execution non-interactively.
+    #[arg(long, default_value_t = false)]
+    pub auto_approve: bool,
+    /// Output format (`text` or `jsonl`).
+    #[arg(long, default_value = "text")]
+    pub output: String,
+    /// Skip post-execution toolchain verification check.
+    #[arg(long, default_value_t = false)]
+    pub no_verify: bool,
+}
+
+/// Options for `allyh audit`.
+#[derive(Debug, Clone, Args)]
+pub struct AuditArgs {
+    /// Base Git ref to diff against (e.g. `main`, `origin/main`, `HEAD~1`).
+    #[arg(long, default_value = "HEAD")]
+    pub base: String,
+    /// Emit machine-readable JSON audit report.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+/// Options for `allyh memory`.
+#[derive(Debug, Clone, Args)]
+pub struct MemoryArgs {
+    #[command(subcommand)]
+    pub action: MemoryCommand,
+}
+
+/// Subcommands under `allyh memory`.
+#[derive(Debug, Clone, Subcommand)]
+pub enum MemoryCommand {
+    /// Promote verified architectural decisions and skills from one scope to another through the conflict gate.
+    Promote {
+        /// Source scope identifier (e.g. `task-42`).
+        #[arg(long)]
+        from: String,
+        /// Target shared scope identifier (e.g. `team` or `default`).
+        #[arg(long)]
+        to: String,
+        /// Skip promoting skills (promote architectural decisions only).
+        #[arg(long, default_value_t = false)]
+        no_skills: bool,
+        /// Emit machine-readable JSON report.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Show the full bi-temporal timeline of active and superseded architectural decisions.
+    Timeline {
+        /// Emit machine-readable JSON array.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+}
+
+/// Options for `allyh worktree`.
+#[derive(Debug, Clone, Args)]
+pub struct WorktreeArgs {
+    #[command(subcommand)]
+    pub action: WorktreeCommand,
+}
+
+/// Subcommands under `allyh worktree`.
+#[derive(Debug, Clone, Subcommand)]
+pub enum WorktreeCommand {
+    /// Create an isolated Git worktree bound to an agent `scope_id`.
+    Create {
+        /// Scope identifier for the new worktree (e.g. `task-auth`).
+        scope: String,
+        /// Optional base Git ref (defaults to `HEAD`).
+        #[arg(long)]
+        base: Option<String>,
+        /// Optional explicit destination path (defaults to out-of-tree AllyH worktrees dir).
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Output machine-readable JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// List active Git worktrees for this repository.
+    #[command(visible_alias = "ls")]
+    List {
+        /// Output machine-readable JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Remove an isolated worktree by scope name, branch, or path.
+    #[command(visible_aliases = ["rm", "delete"])]
+    Remove {
+        /// Scope ID, branch name, or path of the worktree to remove.
+        target: String,
+        /// Force removal even if the worktree contains modified files.
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
 }
 
 /// Options for `allyh mcp`.
@@ -869,6 +986,74 @@ mod tests {
                     ..
                 }
             })) if p == "polyglot"
+        ));
+    }
+
+    #[test]
+    fn parses_ci_audit_memory_and_worktree_subcommands() {
+        let run = CliArgs::try_parse_from([
+            "allyh",
+            "run",
+            "Review error handling",
+            "--mode",
+            "execute",
+            "--auto-approve",
+            "--output",
+            "jsonl",
+        ])
+        .expect("parse allyh run");
+        assert!(matches!(
+            run.command,
+            Some(CliCommand::Run(RunArgs {
+                prompt: Some(ref p),
+                ref mode,
+                auto_approve: true,
+                ref output,
+                ..
+            })) if p == "Review error handling" && mode == "execute" && output == "jsonl"
+        ));
+
+        let audit = CliArgs::try_parse_from(["allyh", "audit", "--base", "main", "--json"])
+            .expect("parse allyh audit");
+        assert!(matches!(
+            audit.command,
+            Some(CliCommand::Audit(AuditArgs { ref base, json: true })) if base == "main"
+        ));
+
+        let promote = CliArgs::try_parse_from([
+            "allyh",
+            "memory",
+            "promote",
+            "--from",
+            "task-1",
+            "--to",
+            "team",
+            "--json",
+        ])
+        .expect("parse memory promote");
+        assert!(matches!(
+            promote.command,
+            Some(CliCommand::Memory(MemoryArgs {
+                action: MemoryCommand::Promote {
+                    ref from,
+                    ref to,
+                    json: true,
+                    ..
+                }
+            })) if from == "task-1" && to == "team"
+        ));
+
+        let wt = CliArgs::try_parse_from(["allyh", "worktree", "create", "task-auth", "--base", "main"])
+            .expect("parse worktree create");
+        assert!(matches!(
+            wt.command,
+            Some(CliCommand::Worktree(WorktreeArgs {
+                action: WorktreeCommand::Create {
+                    ref scope,
+                    base: Some(ref b),
+                    ..
+                }
+            })) if scope == "task-auth" && b == "main"
         ));
     }
 }

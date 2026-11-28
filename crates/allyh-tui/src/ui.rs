@@ -1,4 +1,5 @@
 use allyh_core::{ControlGateState, ProposedPlan};
+use allyh_env::CheckpointDiffReport;
 use allyh_memory::TaskStatus;
 use allyh_tools::PendingCommandApproval;
 use ratatui::Frame;
@@ -51,6 +52,15 @@ pub fn render(frame: &mut Frame<'_>, app: &mut AppState, highlighter: &MarkdownH
         render_command_approval(frame, area, pending);
     } else if let ControlGateState::PlanApproval { plan } = &app.inspector.gate_state {
         render_plan(frame, area, plan, &mut app.plan_scroll);
+    } else if let Some(diff_report) = app.active_diff_modal.clone() {
+        render_diff_modal(
+            frame,
+            area,
+            &diff_report,
+            app.diff_side_by_side,
+            &mut app.diff_scroll,
+            highlighter,
+        );
     } else {
         render_commands(frame, body, app);
     }
@@ -133,6 +143,10 @@ fn render_chat(
                     Span::styled(if *expanded { "▾ Tool" } else { "▸ Tool" }, bold(AMBER)),
                     Span::styled(format!("  {label}  "), ink(color)),
                     Span::styled(&record.compact_header, ink(TEXT)),
+                    Span::styled(
+                        if *expanded { "  [Ctrl+Y copy]" } else { "" },
+                        ink(MUTED),
+                    ),
                 ]));
                 if *expanded {
                     lines.extend(
@@ -300,6 +314,12 @@ fn render_inspector(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
                 format!("{} edited", snapshot.out_of_band_edits.len()),
             ),
         );
+    }
+    if !snapshot.cross_scope_warnings.is_empty() {
+        workspace.push(field(
+            "Overlap",
+            format!("{} scope(s)", snapshot.cross_scope_warnings.len()),
+        ));
     }
     let tasks = &snapshot.active_tasks;
     let memories = &snapshot.activated_memories;
@@ -604,6 +624,90 @@ fn render_command_approval(frame: &mut Frame<'_>, screen: Rect, req: &PendingCom
             Span::styled(" D/Esc  Deny ", bold(TEXT).bg(EDGE)),
         ]),
         actions,
+    );
+}
+
+fn render_diff_modal(
+    frame: &mut Frame<'_>,
+    screen: Rect,
+    report: &CheckpointDiffReport,
+    side_by_side: bool,
+    scroll: &mut Scroll,
+    highlighter: &MarkdownHighlighter,
+) {
+    let mode_label = if side_by_side { "Side-by-Side" } else { "Unified" };
+    let title = format!("Checkpoint Diff Viewer · {} ({mode_label})", report.checkpoint_label);
+    let width = screen.width.saturating_sub(4).max(40);
+    let height = screen.height.saturating_sub(4).max(10);
+    let area = centered(screen, width, height);
+    let block = panel(&title, MINT).style(ink(TEXT).bg(PANEL));
+    let inner = block.inner(area);
+    let [summary_area, content_area, actions_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Fill(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+
+    frame.buffer_mut().set_style(screen, ink(MUTED).bg(CANVAS));
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    frame.render_widget(
+        Line::styled(report.compact_summary(), ink(MUTED)),
+        summary_area,
+    );
+
+    if side_by_side && content_area.width >= 60 {
+        let mut left_lines = Vec::new();
+        let mut right_lines = Vec::new();
+        for raw in report.unified_diff.lines() {
+            if let Some(removed) = raw.strip_prefix('-') {
+                left_lines.push(Line::styled(format!("- {removed}"), ink(RED)));
+                right_lines.push(Line::styled("", ink(MUTED)));
+            } else if let Some(added) = raw.strip_prefix('+') {
+                left_lines.push(Line::styled("", ink(MUTED)));
+                right_lines.push(Line::styled(format!("+ {added}"), ink(MINT)));
+            } else if raw.starts_with("@@") || raw.starts_with("diff ") {
+                left_lines.push(Line::styled(raw.to_string(), bold(BLUE)));
+                right_lines.push(Line::styled(raw.to_string(), bold(BLUE)));
+            } else {
+                left_lines.push(Line::styled(raw.to_string(), ink(TEXT)));
+                right_lines.push(Line::styled(raw.to_string(), ink(TEXT)));
+            }
+        }
+        let max_rows = left_lines.len().max(right_lines.len());
+        scroll.measure(max_rows, content_area.height);
+        let [left_col, right_col] =
+            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .spacing(1)
+                .areas(content_area);
+        frame.render_widget(
+            Paragraph::new(left_lines).scroll((scroll.top, 0)),
+            left_col,
+        );
+        frame.render_widget(
+            Paragraph::new(right_lines).scroll((scroll.top, 0)),
+            right_col,
+        );
+    } else {
+        let fenced = format!("```diff\n{}\n```", report.unified_diff);
+        let rendered_lines = highlighter.render_markdown(&fenced, ink(TEXT));
+        let para = Paragraph::new(rendered_lines).wrap(Wrap { trim: false });
+        scroll.measure(para.line_count(content_area.width), content_area.height);
+        frame.render_widget(para.scroll((scroll.top, 0)), content_area);
+    }
+
+    frame.render_widget(
+        Line::from(vec![
+            Span::styled(" S  Toggle View ", bold(CANVAS).bg(BLUE)),
+            Span::raw(" "),
+            Span::styled(" Y  Copy Diff ", bold(CANVAS).bg(MINT)),
+            Span::raw(" "),
+            Span::styled(" ↑↓/Wheel Scroll ", ink(MUTED)),
+            Span::raw(" "),
+            Span::styled(" Esc/Q  Close ", bold(TEXT).bg(EDGE)),
+        ]),
+        actions_area,
     );
 }
 

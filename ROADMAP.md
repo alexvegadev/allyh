@@ -147,29 +147,29 @@ This roadmap defines the highest-leverage capabilities to evolve AllyH from a **
 
 ---
 
-## Milestone 6: Headless CI Mode, Multi-Agent Worktrees & TUI Coherence Upgrades (`v0.8.0`)
+## Milestone 6: Headless CI Mode, Multi-Agent Worktrees & TUI Coherence Upgrades (`v0.8.0`) — Completed
 
 **Goal:** Unlock automated pipelines and parallel multi-agent workflows built on AllyH's S3/object-store LanceDB backend, while elevating the interactive TUI.
 
 ### 6.1 Headless / CI Execution Mode (`allyh-tui`, `allyh-core`)
-- [ ] **Add `allyh run` non-interactive subcommand:**
-  - [ ] Execute a prompt or structured task spec headlessly with `--output jsonl` streaming tool records, diagnostics, and verification proofs.
-  - [ ] Support `--mode discovery-only` (safe PR reviewer / architectural invariant auditor) and `--mode execute --auto-approve` (CI autofix with mandatory passing `VerificationProof`).
-- [ ] **PR Architectural Drift Check (`allyh audit --base main`):** Compare a Git diff against active bi-temporal `architectural_decisions` in LanceDB and emit a structured violation report (exit code non-zero on invariant breach) for GitHub Actions / GitLab CI.
+- [x] **Add `allyh run` non-interactive subcommand:**
+  - [x] Execute a prompt or structured task spec headlessly with `--output jsonl` streaming tool records, diagnostics, and verification proofs.
+  - [x] Support `--mode discovery-only` (safe PR reviewer / architectural invariant auditor) and `--mode execute --auto-approve` (CI autofix with mandatory passing `VerificationProof`).
+- [x] **PR Architectural Drift Check (`allyh audit --base main`):** Compare a Git diff against active bi-temporal `architectural_decisions` in LanceDB and emit a structured violation report (exit code non-zero on invariant breach) for GitHub Actions / GitLab CI.
 
 ### 6.2 Multi-Agent Coordination over Shared LanceDB (`allyh-core`, `allyh-memory`, `allyh-env`)
-- [ ] **Isolated `git worktree` execution per agent scope:** Spawn parallel scoped sub-agents (`scope_id = task-<id>`) in isolated Git worktrees backed by one shared LanceDB URI (`local` or `s3://`).
-- [ ] **Bi-temporal Decision Promotion (`allyh memory promote --from <scope> --to team`):** Promote verified architectural decisions and newly discovered skills from an agent's private scope into a shared team scope through the conflict gate.
-- [ ] **Cross-agent hash/claim awareness:** Warn in `EnvDelta` when another active scope sharing the same LanceDB URI has modified or claimed overlapping files.
+- [x] **Isolated `git worktree` execution per agent scope:** Spawn parallel scoped sub-agents (`scope_id = task-<id>`) in isolated Git worktrees backed by one shared LanceDB URI (`local` or `s3://`).
+- [x] **Bi-temporal Decision Promotion (`allyh memory promote --from <scope> --to team`):** Promote verified architectural decisions and newly discovered skills from an agent's private scope into a shared team scope through the conflict gate.
+- [x] **Cross-agent hash/claim awareness:** Warn in `EnvDelta` when another active scope sharing the same LanceDB URI has modified or claimed overlapping files.
 
 ### 6.3 TUI Coherence & Inspection Upgrades (`allyh-tui`)
-- [ ] **Interactive Diff Modal:** Side-by-side / unified `syntect` diff viewer for proposed edits and checkpoint review.
-- [ ] **Bi-Temporal Memory Timeline (`/timeline`):** Browse active *and* superseded (`invalid_at IS NOT NULL`) decisions, showing supersession chains (`superseded_by`) and rationale evolution.
-- [ ] **Session Browser & Resume (`/sessions`):** List prior sessions for the repository, inspect rolling summaries, and resume or fork from a previous session cleanly.
-- [ ] **Mouse scroll & copy-friendly Tool Cards:** Optional mouse-wheel scrolling in Chat/Inspector panes and one-key clipboard copy of code blocks or diagnostics.
+- [x] **Interactive Diff Modal:** Side-by-side / unified `syntect` diff viewer for proposed edits and checkpoint review.
+- [x] **Bi-Temporal Memory Timeline (`/timeline`):** Browse active *and* superseded (`invalid_at IS NOT NULL`) decisions, showing supersession chains (`superseded_by`) and rationale evolution.
+- [x] **Session Browser & Resume (`/sessions`):** List prior sessions for the repository, inspect rolling summaries, and resume or fork from a previous session cleanly.
+- [x] **Mouse scroll & copy-friendly Tool Cards:** Optional mouse-wheel scrolling in Chat/Inspector panes and one-key clipboard copy of code blocks or diagnostics.
 
 ### Milestone 6 Acceptance Criteria
-- [ ] End-to-end headless CI test verifying `allyh audit` catches a deliberate architectural invariant violation on a diff, plus a multi-scope shared-LanceDB test verifying isolated worktree edits and conflict-gated decision promotion.
+- [x] End-to-end headless CI test verifying `allyh audit` catches a deliberate architectural invariant violation on a diff, plus a multi-scope shared-LanceDB test verifying isolated worktree edits and conflict-gated decision promotion.
 
 ---
 
