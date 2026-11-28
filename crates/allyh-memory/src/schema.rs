@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use arrow_array::builder::{FixedSizeListBuilder, Float32Builder, ListBuilder, StringBuilder};
 use arrow_array::{
-    Array, BooleanArray, FixedSizeListArray, Float32Array, ListArray, RecordBatch, StringArray,
-    TimestampMicrosecondArray, UInt32Array, UInt64Array,
+    Array, BooleanArray, FixedSizeListArray, Float32Array, Float64Array, ListArray, RecordBatch,
+    StringArray, TimestampMicrosecondArray, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use chrono::{DateTime, Utc};
@@ -26,7 +26,7 @@ pub const TABLE_SIM_PROBLEMS: &str = "sim_problems";
 pub const TABLE_SIM_ATTEMPTS: &str = "sim_attempts";
 
 /// Episodic session summary record stored in `sessions`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionRecord {
     pub session_id: String,
     pub repo_id: String,
@@ -35,6 +35,16 @@ pub struct SessionRecord {
     pub ended_at: Option<DateTime<Utc>>,
     pub rolling_summary: String,
     pub token_budget_used: u64,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cached_input_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_tokens: u64,
+    #[serde(default)]
+    pub estimated_cost_usd: f64,
 }
 
 /// Bi-temporal architectural invariant stored in `architectural_decisions`.
@@ -487,6 +497,11 @@ pub fn sessions_schema() -> SchemaRef {
         Field::new("ended_at", timestamp_utc(), true),
         Field::new("rolling_summary", DataType::Utf8, false),
         Field::new("token_budget_used", DataType::UInt64, false),
+        Field::new("input_tokens", DataType::UInt64, false),
+        Field::new("output_tokens", DataType::UInt64, false),
+        Field::new("cached_input_tokens", DataType::UInt64, false),
+        Field::new("cache_creation_tokens", DataType::UInt64, false),
+        Field::new("estimated_cost_usd", DataType::Float64, false),
     ]))
 }
 
@@ -733,6 +748,14 @@ pub fn sessions_to_batch(records: &[SessionRecord]) -> Result<RecordBatch> {
     let summaries =
         StringArray::from_iter_values(records.iter().map(|r| r.rolling_summary.as_str()));
     let budgets = UInt64Array::from_iter_values(records.iter().map(|r| r.token_budget_used));
+    let input_tokens = UInt64Array::from_iter_values(records.iter().map(|r| r.input_tokens));
+    let output_tokens = UInt64Array::from_iter_values(records.iter().map(|r| r.output_tokens));
+    let cached_input_tokens =
+        UInt64Array::from_iter_values(records.iter().map(|r| r.cached_input_tokens));
+    let cache_creation_tokens =
+        UInt64Array::from_iter_values(records.iter().map(|r| r.cache_creation_tokens));
+    let estimated_cost_usd =
+        Float64Array::from_iter_values(records.iter().map(|r| r.estimated_cost_usd));
 
     Ok(RecordBatch::try_new(
         schema,
@@ -744,6 +767,11 @@ pub fn sessions_to_batch(records: &[SessionRecord]) -> Result<RecordBatch> {
             Arc::new(ended_at),
             Arc::new(summaries),
             Arc::new(budgets),
+            Arc::new(input_tokens),
+            Arc::new(output_tokens),
+            Arc::new(cached_input_tokens),
+            Arc::new(cache_creation_tokens),
+            Arc::new(estimated_cost_usd),
         ],
     )?)
 }
@@ -756,6 +784,13 @@ pub fn batch_to_sessions(batch: &RecordBatch) -> Result<Vec<SessionRecord>> {
     let ended_at = col_ts(batch, "ended_at")?;
     let summaries = col_str(batch, "rolling_summary")?;
     let budgets = col_u64(batch, "token_budget_used")?;
+    let input_tokens = col_u64(batch, "input_tokens").ok();
+    let output_tokens = col_u64(batch, "output_tokens").ok();
+    let cached_input_tokens = col_u64(batch, "cached_input_tokens").ok();
+    let cache_creation_tokens = col_u64(batch, "cache_creation_tokens").ok();
+    let estimated_cost_usd = batch
+        .column_by_name("estimated_cost_usd")
+        .and_then(|c| c.as_any().downcast_ref::<Float64Array>());
 
     let mut out = Vec::with_capacity(batch.num_rows());
     for i in 0..batch.num_rows() {
@@ -771,6 +806,14 @@ pub fn batch_to_sessions(batch: &RecordBatch) -> Result<Vec<SessionRecord>> {
             },
             rolling_summary: summaries.value(i).to_string(),
             token_budget_used: budgets.value(i),
+            input_tokens: input_tokens.map(|c| c.value(i)).unwrap_or(0),
+            output_tokens: output_tokens.map(|c| c.value(i)).unwrap_or(0),
+            cached_input_tokens: cached_input_tokens.map(|c| c.value(i)).unwrap_or(0),
+            cache_creation_tokens: cache_creation_tokens.map(|c| c.value(i)).unwrap_or(0),
+            estimated_cost_usd: estimated_cost_usd
+                .filter(|c| !c.is_null(i))
+                .map(|c| c.value(i))
+                .unwrap_or(0.0),
         });
     }
     Ok(out)

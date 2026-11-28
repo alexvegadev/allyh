@@ -87,6 +87,26 @@ impl MemoryStore {
                 .create_empty_table(TABLE_SESSIONS, sessions_schema())
                 .execute()
                 .await?;
+        } else if let Ok(table) = self.open_table(TABLE_SESSIONS).await
+            && let Ok(schema) = table.schema().await
+        {
+            let mut missing_cols = Vec::new();
+            for (col, expr) in [
+                ("input_tokens", "CAST(0 AS BIGINT UNSIGNED)"),
+                ("output_tokens", "CAST(0 AS BIGINT UNSIGNED)"),
+                ("cached_input_tokens", "CAST(0 AS BIGINT UNSIGNED)"),
+                ("cache_creation_tokens", "CAST(0 AS BIGINT UNSIGNED)"),
+                ("estimated_cost_usd", "CAST(0.0 AS DOUBLE)"),
+            ] {
+                if schema.field_with_name(col).is_err() {
+                    missing_cols.push((col.to_string(), expr.to_string()));
+                }
+            }
+            if !missing_cols.is_empty() {
+                let _ = table
+                    .add_columns(NewColumnTransform::SqlExpressions(missing_cols), None)
+                    .await;
+            }
         }
         if !existing.iter().any(|n| n == TABLE_ARCHITECTURAL_DECISIONS) {
             self.connection

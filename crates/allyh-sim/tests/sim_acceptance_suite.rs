@@ -50,6 +50,7 @@ impl BenchmarkEvaluator for SyntheticHarnessEvaluator {
                     error_trace: (!passed).then(|| format!("failure in {}", task.id)),
                     tool_calls: 1,
                     duration_ms: 1,
+                    estimated_tokens: 500,
                 });
             }
         }
@@ -213,7 +214,7 @@ async fn five_step_sim_and_crsi_acceptance_suite() {
         store.clone(),
         Arc::new(SyntheticHarnessEvaluator),
         spy_proposer,
-        Arc::new(HeuristicSimSelector),
+        Arc::new(HeuristicSimSelector::default()),
     );
 
     let source_policy = ModelProfile::offline_mock("source-model-v1");
@@ -564,4 +565,85 @@ async fn five_step_sim_and_crsi_acceptance_suite() {
     // Sanity check `SimProblemRef` JSON format used in prompts
     let ex = serde_json::to_string(&SimProblemRef::Existing("P1".into())).unwrap();
     assert!(ex.contains("\"kind\":\"existing\""));
+}
+
+#[tokio::test]
+async fn test_polyglot_presets_and_live_session_trace_harvesting() {
+    use allyh_memory::{SessionRecord, TaskRecord, TaskStatus};
+    use allyh_sim::{harvest_sessions_into_sim, list_suite_presets, polyglot_suite_preset};
+    use chrono::Utc;
+
+    // 1. Verify all polyglot presets generate valid disjoint splits.
+    for &lang in list_suite_presets() {
+        let suite = polyglot_suite_preset(lang).expect("preset");
+        let (evo, held) = suite.split().expect("split");
+        assert!(!evo.is_empty() && !held.is_empty());
+    }
+
+    // 2. Seed out-of-tree sessions and failed/recovered tasks in LanceDB and harvest into SIM.
+    let tmp = TempDir::new().expect("tempdir");
+    let db_dir = tmp.path().join("harvest_db");
+    let store = MemoryStore::connect(
+        StorageConfig::from_local_path(&db_dir),
+        Arc::new(DeterministicHashEmbedder),
+    )
+    .await
+    .expect("connect");
+    let repo_id = compute_repo_id("/repos/harvest-demo");
+
+    store
+        .upsert_task(&TaskRecord {
+            id: "task-err-1".into(),
+            repo_id: repo_id.clone(),
+            scope_id: DEFAULT_SCOPE_ID.into(),
+            parent_id: None,
+            title: "Fix borrow checker error in router".into(),
+            acceptance_criteria: vec!["cargo check passes".into()],
+            status: TaskStatus::Verified,
+            last_error_trace: Some("error[E0502]: cannot borrow `router` as mutable".into()),
+            updated_at: Utc::now(),
+        })
+        .await
+        .expect("upsert task");
+
+    store
+        .upsert_session(&SessionRecord {
+            session_id: "sess-harvest-1".into(),
+            repo_id: repo_id.clone(),
+            scope_id: DEFAULT_SCOPE_ID.into(),
+            started_at: Utc::now(),
+            ended_at: None,
+            rolling_summary: "Hit stale hash mismatch during edit_by_hash; re-inspected and fixed."
+                .into(),
+            token_budget_used: 42_000,
+            input_tokens: 95_000,
+            output_tokens: 4_000,
+            cached_input_tokens: 10_000,
+            cache_creation_tokens: 5_000,
+            estimated_cost_usd: 0.31,
+        })
+        .await
+        .expect("upsert session");
+
+    let first = harvest_sessions_into_sim(&store, &repo_id, DEFAULT_SCOPE_ID, None, "claude-sonnet-4-6")
+        .await
+        .expect("harvest #1");
+    assert_eq!(first.sessions_scanned, 1);
+    assert_eq!(first.tasks_scanned, 1);
+    assert_eq!(first.problems_opened, 2);
+    assert_eq!(first.attempts_recorded, 2);
+
+    // Harvesting again is idempotent (no duplicate attempts recorded).
+    let second = harvest_sessions_into_sim(&store, &repo_id, DEFAULT_SCOPE_ID, None, "claude-sonnet-4-6")
+        .await
+        .expect("harvest #2");
+    assert_eq!(second.attempts_recorded, 0);
+
+    let ledger = store
+        .load_sim_ledger(&repo_id, DEFAULT_SCOPE_ID, "session-harvest")
+        .await
+        .expect("load harvested ledger")
+        .expect("ledger exists");
+    assert_eq!(ledger.problems.len(), 2);
+    assert_eq!(ledger.total_attempts(), 2);
 }

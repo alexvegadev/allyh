@@ -12,7 +12,9 @@ mod update;
 
 use std::io;
 
-use allyh_core::{AllyHOrchestrator, HybridRouter, ModelProfile, OrchestratorConfig, UserCommand};
+use allyh_core::{
+    AllyHOrchestrator, HybridRouter, ModelProfile, OrchestratorConfig, ReasoningEffort, UserCommand,
+};
 use allyh_env::canonicalize_normalized;
 use allyh_memory::{EmbeddingProfile, StorageConfig};
 use anyhow::{Context, Result};
@@ -148,6 +150,11 @@ async fn main() -> Result<()> {
     let mut router = HybridRouter::from_env();
     if let Some(spec) = &args.model {
         router.set_primary(ModelProfile::parse_spec(spec).context("invalid --model spec")?);
+    }
+    if let Some(effort_spec) = &args.reasoning_effort {
+        let effort = ReasoningEffort::parse_spec(effort_spec)
+            .context("invalid --reasoning-effort value")?;
+        router.set_reasoning_effort(Some(effort));
     }
     if let Some(spec) = &args.worker_model {
         router.set_local_worker(
@@ -410,6 +417,10 @@ mod tests {
             worker_status: WorkerStatus::Idle,
             tokens_used: 18_400,
             token_budget: 128_000,
+            session_input_tokens: 0,
+            session_output_tokens: 0,
+            session_cached_tokens: 0,
+            session_cost_usd: 0.0,
         }
     }
 
@@ -999,5 +1010,26 @@ mod tests {
         assert!(rendered.contains("2 connected"));
         assert!(rendered.contains("External MCP Servers (1)"));
         assert!(rendered.contains("mcp__docs__search"));
+    }
+
+    #[test]
+    fn test_status_bar_displays_prompt_cache_and_cost_telemetry() {
+        let mut snap = sample_snapshot(ControlGateState::Discovery);
+        snap.session_input_tokens = 20_000;
+        snap.session_output_tokens = 1_500;
+        snap.session_cached_tokens = 15_000;
+        snap.session_cost_usd = 0.034;
+
+        let mut app = AppState::new(snap, "allyh".into());
+        let highlighter = MarkdownHighlighter::new();
+        let rendered = screen(&mut app, &highlighter, 120, 36);
+        assert!(
+            rendered.contains("Cache 75%"),
+            "status bar should display prompt cache hit ratio, got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("$0.034"),
+            "status bar should display estimated session USD cost, got:\n{rendered}"
+        );
     }
 }

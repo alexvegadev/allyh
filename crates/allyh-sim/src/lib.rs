@@ -10,7 +10,9 @@
 
 pub mod error;
 pub mod eval;
+pub mod harvest;
 pub mod manifest;
+pub mod presets;
 pub mod proposer;
 pub mod runner;
 pub mod selector;
@@ -21,10 +23,13 @@ pub use eval::{
     EvalSuiteSpec, EvalTask, EvolveSplit, HeldOutSplit, TaskRolloutResult,
     UnifiedMultiModelEvaluator,
 };
+pub use harvest::{SessionHarvestReport, harvest_sessions_into_sim};
 pub use manifest::{CandidateProposal, ChangeManifest, RoundHistoryEntry, RunHistory};
+pub use presets::{SUITE_PRESET_NAMES, list_suite_presets, polyglot_suite_preset};
 pub use proposer::{HeuristicSimProposer, LlmSimProposer, SimProposer};
 pub use runner::{CrsiConfig, CrsiRunReport, CrsiRunner, RoundSummary};
 pub use selector::{
-    EvaluatedCandidate, HeuristicSimSelector, LlmSimSelector, ScreeningDecision, SelectionVerdict,
-    SimSelector,
+    CandidateObjectiveBreakdown, EvaluatedCandidate, HeuristicSimSelector, LlmSimSelector,
+    MultiObjectiveWeights, ScreeningDecision, SelectionVerdict, SimSelector,
+    evaluate_multi_objective,
 };

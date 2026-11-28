@@ -9,7 +9,8 @@ use allyh_memory::{
 };
 use allyh_sim::{
     AllyHRuntimeEvaluator, BenchmarkEvaluator, CommandHarnessEvaluator, CrsiConfig, CrsiRunner,
-    EvalSuiteSpec, LlmSimProposer, LlmSimSelector,
+    EvalSuiteSpec, LlmSimProposer, LlmSimSelector, harvest_sessions_into_sim,
+    polyglot_suite_preset,
 };
 use anyhow::{Context, Result, bail};
 
@@ -260,6 +261,7 @@ pub async fn run_cli(
         }
         SimCommand::Evolve {
             suite,
+            preset,
             arm,
             rounds,
             candidates,
@@ -270,8 +272,15 @@ pub async fn run_cli(
             activate,
             json,
         } => {
-            let suite_spec = EvalSuiteSpec::load_file(&suite)
-                .with_context(|| format!("failed to load suite '{}'", suite.display()))?;
+            let suite_spec = match (suite, preset) {
+                (Some(path), None) => EvalSuiteSpec::load_file(&path)
+                    .with_context(|| format!("failed to load suite '{}'", path.display()))?,
+                (None, Some(lang)) => polyglot_suite_preset(&lang)?,
+                (None, None) => bail!(
+                    "specify either `--suite <path.json>` or `--preset <rust|typescript|python|go|polyglot>`"
+                ),
+                (Some(_), Some(_)) => bail!("cannot specify both `--suite` and `--preset`"),
+            };
             let (evolve_split, _held_out) = suite_spec.split()?;
             let memory_mode = SimMemoryMode::parse(&mode)?;
             let optimizer_profile = match optimizer_model.as_deref() {
@@ -428,6 +437,58 @@ pub async fn run_cli(
                 rec.round,
                 rec.policy_model
             );
+            Ok(())
+        }
+        SimCommand::Preset { lang, out } => {
+            let suite = polyglot_suite_preset(&lang)?;
+            let rendered = serde_json::to_string_pretty(&suite)?;
+            if let Some(path) = out {
+                if let Some(parent) = path.parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&path, rendered)
+                    .with_context(|| format!("failed to write preset '{}'", path.display()))?;
+                println!(
+                    "Wrote `{}` preset ({} tasks) to '{}'.",
+                    suite.name,
+                    suite.tasks.len(),
+                    path.display()
+                );
+            } else {
+                println!("{rendered}");
+            }
+            Ok(())
+        }
+        SimCommand::Harvest { run, json } => {
+            let report = harvest_sessions_into_sim(
+                &store,
+                &repo_id,
+                scope_id,
+                run.as_deref(),
+                &router.primary().model_id,
+            )
+            .await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "SIM Session Harvest — run `{}` ({})",
+                    &report.run_id[..report.run_id.len().min(8)],
+                    report.arm_name
+                );
+                println!(
+                    "Scanned:   {} session(s) | {} task(s)",
+                    report.sessions_scanned, report.tasks_scanned
+                );
+                println!(
+                    "Harvested: {} new problem(s) | {} attempt(s) | IDs: [{}]",
+                    report.problems_opened,
+                    report.attempts_recorded,
+                    report.problem_ids.join(", ")
+                );
+            }
             Ok(())
         }
     }

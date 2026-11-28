@@ -29,5 +29,6 @@ pub use orchestrator::{
 };
 pub use preamble::{AssembledPreamble, DynamicPreambleAssembler, PreambleInputs, estimate_tokens};
 pub use router::{
-    CompletionBackend, HybridRouter, ModelProfile, ModelProviderKind, RigCompletionBackend,
+    CompletionBackend, CompletionCallOptions, HybridRouter, ModelPricing, ModelProfile,
+    ModelProviderKind, ReasoningEffort, RigCompletionBackend, SessionTelemetry,
 };

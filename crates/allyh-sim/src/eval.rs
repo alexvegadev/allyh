@@ -143,6 +143,9 @@ pub struct TaskRolloutResult {
     pub error_trace: Option<String>,
     pub tool_calls: usize,
     pub duration_ms: u64,
+    /// Total tokens consumed during this rollout (input + output; 0 if unreported).
+    #[serde(default)]
+    pub estimated_tokens: u64,
 }
 
 /// Aggregated evaluation feedback `F_t` returned by executing a harness on a task split.
@@ -222,6 +225,33 @@ impl EvalFeedback {
             .iter()
             .filter_map(|(id, &rate)| (rate < 1.0).then_some(id.clone()))
             .collect()
+    }
+
+    /// Mean total tokens consumed per rollout across this evaluation split.
+    pub fn mean_tokens(&self) -> f64 {
+        if self.rollouts.is_empty() {
+            return 0.0;
+        }
+        let sum: u64 = self.rollouts.iter().map(|r| r.estimated_tokens).sum();
+        sum as f64 / self.rollouts.len() as f64
+    }
+
+    /// Mean ACI/MCP tool calls per rollout across this evaluation split.
+    pub fn mean_tool_calls(&self) -> f64 {
+        if self.rollouts.is_empty() {
+            return 0.0;
+        }
+        let sum: usize = self.rollouts.iter().map(|r| r.tool_calls).sum();
+        sum as f64 / self.rollouts.len() as f64
+    }
+
+    /// Mean wall-clock duration in milliseconds per rollout across this evaluation split.
+    pub fn mean_duration_ms(&self) -> f64 {
+        if self.rollouts.is_empty() {
+            return 0.0;
+        }
+        let sum: u64 = self.rollouts.iter().map(|r| r.duration_ms).sum();
+        sum as f64 / self.rollouts.len() as f64
     }
 
     /// Check ex-ante `predicted` task fixes against ex-post measured evolve outcomes,
@@ -354,6 +384,7 @@ impl BenchmarkEvaluator for AllyHRuntimeEvaluator {
                             error_trace: Some(err.to_string()),
                             tool_calls: 0,
                             duration_ms,
+                            estimated_tokens: 0,
                         });
                     }
                 }
@@ -442,6 +473,13 @@ impl AllyHRuntimeEvaluator {
             }
         }
 
+        let total_tokens = turn.turn_telemetry.input_tokens + turn.turn_telemetry.output_tokens;
+        let estimated_tokens = if total_tokens > 0 {
+            total_tokens
+        } else {
+            turn.preamble.estimated_tokens
+        };
+
         Ok(TaskRolloutResult {
             task_id: task.id.clone(),
             rollout_idx,
@@ -455,6 +493,7 @@ impl AllyHRuntimeEvaluator {
             },
             tool_calls: turn.tool_records.len(),
             duration_ms: 0,
+            estimated_tokens,
         })
     }
 }

@@ -124,26 +124,26 @@ This roadmap defines the highest-leverage capabilities to evolve AllyH from a **
 
 ---
 
-## Milestone 5: Provider Ecosystem, Prompt Caching & Cost-Aware SIM/CRSI (`v0.7.0`)
+## Milestone 5: Provider Ecosystem, Prompt Caching & Cost-Aware SIM/CRSI (`v0.7.0`) — Completed
 
 **Goal:** Broaden model provider choice, drastically reduce per-turn token cost using AllyH's deterministic preamble layout, and upgrade SIM/CRSI to optimize real-world coding metrics.
 
 ### 5.1 Expanded Providers & Prefix Prompt Caching (`allyh-core`)
-- [ ] **Add native providers in `HybridRouter` (`crates/allyh-core/src/router.rs`):**
-  - [ ] Google Gemini (`gemini:<model>`)
-  - [ ] OpenRouter (`openrouter:<org/model>`)
-  - [ ] OpenAI Responses API & reasoning effort controls (`--reasoning-effort low|medium|high`)
-  - [ ] Optional feature-gated enterprise providers (AWS Bedrock / Vertex AI)
-- [ ] **Cache-aware preamble partitioning (`crates/allyh-core/src/preamble.rs`):** Split `DynamicPreambleAssembler` output into a **stable prefix** (operating rules, pinned invariants, skills catalog, stable domain guidance) and a **volatile suffix** (`EnvDelta`, active task error trace, per-turn ego-graphs), emitting provider cache breakpoints (`cache_control` for Anthropic, prefix alignment for OpenAI/Gemini).
-- [ ] **Token, cache-hit, and cost telemetry:** Track input/output/cached tokens and estimated session USD cost in `sessions` (LanceDB) and display them in the TUI status bar.
+- [x] **Add native providers in `HybridRouter` (`crates/allyh-core/src/router.rs`):**
+  - [x] Google Gemini (`gemini:<model>`)
+  - [x] OpenRouter (`openrouter:<org/model>`)
+  - [x] OpenAI Responses API & reasoning effort controls (`--reasoning-effort low|medium|high`)
+  - [x] Optional feature-gated enterprise providers (AWS Bedrock / Vertex AI)
+- [x] **Cache-aware preamble partitioning (`crates/allyh-core/src/preamble.rs`):** Split `DynamicPreambleAssembler` output into a **stable prefix** (operating rules, pinned invariants, skills catalog, stable domain guidance) and a **volatile suffix** (`EnvDelta`, active task error trace, per-turn ego-graphs), emitting provider cache breakpoints (`cache_control` for Anthropic, prefix alignment for OpenAI/Gemini).
+- [x] **Token, cache-hit, and cost telemetry:** Track input/output/cached tokens and estimated session USD cost in `sessions` (LanceDB) and display them in the TUI status bar.
 
 ### 5.2 Polyglot & Cost-Aware SIM / CRSI (`allyh-sim`, `allyh-core`)
-- [ ] **Multi-objective Selector in `allyh-sim` (`crates/allyh-sim/src/selector.rs`):** Incorporate token budget, tool-round efficiency, and latency alongside pass rate when ranking candidate `HarnessSpec` patches.
-- [ ] **Polyglot benchmark suite presets (`crates/allyh-sim`):** Provide ready-to-run `EvalSuiteSpec` templates for Rust, TypeScript, Python, and Go tasks so users can run `allyh sim evolve` on their own repo's test suites.
-- [ ] **Live session trace harvesting (`allyh sim harvest`):** Optionally distill real failed/recovered interactive TUI sessions (stored out-of-tree) into candidate SIM problem diagnoses (`P1..Pn`) during sleep-time compute.
+- [x] **Multi-objective Selector in `allyh-sim` (`crates/allyh-sim/src/selector.rs`):** Incorporate token budget, tool-round efficiency, and latency alongside pass rate when ranking candidate `HarnessSpec` patches.
+- [x] **Polyglot benchmark suite presets (`crates/allyh-sim`):** Provide ready-to-run `EvalSuiteSpec` templates for Rust, TypeScript, Python, and Go tasks so users can run `allyh sim evolve` on their own repo's test suites.
+- [x] **Live session trace harvesting (`allyh sim harvest`):** Optionally distill real failed/recovered interactive TUI sessions (stored out-of-tree) into candidate SIM problem diagnoses (`P1..Pn`) during sleep-time compute.
 
 ### Milestone 5 Acceptance Criteria
-- [ ] Unit tests verifying stable-prefix byte invariance across turns when only `EnvDelta` changes, accurate cache/cost accounting in `sessions`, and multi-objective SIM selector regression tests.
+- [x] Unit tests verifying stable-prefix byte invariance across turns when only `EnvDelta` changes, accurate cache/cost accounting in `sessions`, and multi-objective SIM selector regression tests.
 
 ---
 

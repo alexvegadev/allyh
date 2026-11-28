@@ -29,7 +29,7 @@ use crate::gate::{ControlGate, ControlGateState, ProposedPlan, ProposedTaskSpec}
 use crate::harness::HarnessSpec;
 use crate::interlock::{CompletionInterlock, InterlockDecision};
 use crate::preamble::{AssembledPreamble, DynamicPreambleAssembler, PreambleInputs};
-use crate::router::{HybridRouter, ModelProfile};
+use crate::router::{CompletionCallOptions, HybridRouter, ModelProfile, SessionTelemetry};
 
 /// Live snapshot pushed to the TUI Coherence Inspector sidebar & status bar.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,6 +64,14 @@ pub struct InspectorSnapshot {
     pub worker_status: WorkerStatus,
     pub tokens_used: u64,
     pub token_budget: u64,
+    #[serde(default)]
+    pub session_input_tokens: u64,
+    #[serde(default)]
+    pub session_output_tokens: u64,
+    #[serde(default)]
+    pub session_cached_tokens: u64,
+    #[serde(default)]
+    pub session_cost_usd: f64,
 }
 
 /// Commands dispatched from the TUI (or programmatic client) to the core orchestrator actor.
@@ -174,6 +182,7 @@ pub struct TurnOutcome {
     pub env_delta: EnvDelta,
     pub tool_records: Vec<ToolExecutionRecord>,
     pub consolidated_decisions: Vec<ConsolidationOutcome>,
+    pub turn_telemetry: SessionTelemetry,
 }
 
 /// Configuration for initializing an [`AllyHOrchestrator`] session.
@@ -206,6 +215,7 @@ impl OrchestratorConfig {
 /// Control Gate, hybrid model routing, history compaction, and sleep-time consolidation.
 pub struct AllyHOrchestrator {
     session_id: String,
+    session_started_at: chrono::DateTime<Utc>,
     repo_id: String,
     scope_id: String,
     turn_counter: u64,
@@ -224,6 +234,7 @@ pub struct AllyHOrchestrator {
     last_env_delta: EnvDelta,
     last_activated_memories: Vec<ScoredDecision>,
     last_preamble_tokens: u64,
+    session_telemetry: SessionTelemetry,
     active_checkpoint: Option<PlanCheckpoint>,
     _fs_watcher: Option<LiveFsWatcher>,
 }
@@ -295,14 +306,20 @@ impl AllyHOrchestrator {
         let initial_delta = env.sync_and_collect_delta(0, false).await?;
 
         let session_id = Uuid::new_v4().to_string();
+        let session_started_at = Utc::now();
         let initial_session = SessionRecord {
             session_id: session_id.clone(),
             repo_id: repo_id.clone(),
             scope_id: scope_id.clone(),
-            started_at: Utc::now(),
+            started_at: session_started_at,
             ended_at: None,
             rolling_summary: prior_summary.clone(),
             token_budget_used: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 0,
+            cache_creation_tokens: 0,
+            estimated_cost_usd: 0.0,
         };
         store.upsert_session(&initial_session).await?;
 
@@ -338,6 +355,7 @@ impl AllyHOrchestrator {
 
         Ok(Self {
             session_id,
+            session_started_at,
             repo_id,
             scope_id,
             turn_counter: 0,
@@ -356,6 +374,7 @@ impl AllyHOrchestrator {
             last_env_delta: initial_delta,
             last_activated_memories: initial_active,
             last_preamble_tokens: 0,
+            session_telemetry: SessionTelemetry::default(),
             active_checkpoint: None,
             _fs_watcher: fs_watcher,
         })
@@ -769,6 +788,10 @@ impl AllyHOrchestrator {
             worker_status: self.sleep_worker.status(),
             tokens_used: self.last_preamble_tokens + self.history.estimated_tokens(),
             token_budget: self.router.primary().context_window_tokens,
+            session_input_tokens: self.session_telemetry.input_tokens,
+            session_output_tokens: self.session_telemetry.output_tokens,
+            session_cached_tokens: self.session_telemetry.cached_input_tokens,
+            session_cost_usd: self.session_telemetry.estimated_cost_usd,
         })
     }
 
@@ -865,8 +888,19 @@ impl AllyHOrchestrator {
         let tool_defs = self.toolset.definitions();
         let mut tool_records = Vec::new();
         let mut final_text = String::new();
+        let mut turn_telemetry = SessionTelemetry::default();
         let max_rounds = self.active_harness.tools.max_tool_rounds.max(1);
         let mut interlock = CompletionInterlock::new(self.active_harness.completion_interlock.clone());
+        let call_options = CompletionCallOptions {
+            cache_key: Some(format!(
+                "allyh:{}:{}:{}",
+                &self.repo_id[..self.repo_id.len().min(12)],
+                self.scope_id,
+                &preamble.stable_prefix_hash[..preamble.stable_prefix_hash.len().min(16)]
+            )),
+            enable_prompt_cache: true,
+            reasoning_effort: None,
+        };
 
         for round in 0..max_rounds {
             let (tok_tx, mut tok_rx) = mpsc::unbounded_channel::<String>();
@@ -882,9 +916,19 @@ impl AllyHOrchestrator {
             let messages = self.history.messages();
             let response = self
                 .router
-                .run_primary(&preamble.text, &messages, &tool_defs, Some(tok_tx))
+                .run_primary_with_options(
+                    &preamble.text,
+                    &messages,
+                    &tool_defs,
+                    &call_options,
+                    Some(tok_tx),
+                )
                 .await?;
             let _ = forward_handle.await;
+
+            self.session_telemetry
+                .record_usage(self.router.primary(), &response.usage);
+            turn_telemetry.record_usage(self.router.primary(), &response.usage);
 
             let calls: Vec<_> = response.tool_calls().cloned().collect();
             let text = response.text();
@@ -999,15 +1043,20 @@ impl AllyHOrchestrator {
             self.sleep_worker.enqueue(SleepJob::OptimizeTables);
         }
 
-        // Persist updated session record out-of-tree.
+        // Persist updated session record (with cumulative cache & USD cost telemetry) out-of-tree.
         let session_record = SessionRecord {
             session_id: self.session_id.clone(),
             repo_id: self.repo_id.clone(),
             scope_id: self.scope_id.clone(),
-            started_at: Utc::now(),
+            started_at: self.session_started_at,
             ended_at: None,
             rolling_summary: self.history.rolling_summary().to_string(),
             token_budget_used: self.last_preamble_tokens + self.history.estimated_tokens(),
+            input_tokens: self.session_telemetry.input_tokens,
+            output_tokens: self.session_telemetry.output_tokens,
+            cached_input_tokens: self.session_telemetry.cached_input_tokens,
+            cache_creation_tokens: self.session_telemetry.cache_creation_tokens,
+            estimated_cost_usd: self.session_telemetry.estimated_cost_usd,
         };
         let _ = self.store.upsert_session(&session_record).await;
 
@@ -1027,6 +1076,7 @@ impl AllyHOrchestrator {
             env_delta,
             tool_records,
             consolidated_decisions,
+            turn_telemetry,
         })
     }
 

@@ -3,6 +3,12 @@ name = "allyh-core"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+bedrock = []
+vertex = []
+enterprise-providers = ["bedrock", "vertex"]
+
 [dependencies]
 tokio.workspace = true
 futures.workspace = true

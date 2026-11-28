@@ -24,9 +24,13 @@ pub struct CliArgs {
     #[arg(long, global = true, env = "ALLYH_SCOPE_ID", default_value = "default")]
     pub scope: String,
 
-    /// Primary reasoning model spec (e.g. `anthropic:claude-sonnet-4-6`, `openai:gpt-4o`, `local:qwen-35b@http://localhost:9931/v1`, `offline`).
+    /// Primary reasoning model spec (e.g. `anthropic:claude-sonnet-4-6`, `openai:gpt-5.2`, `gemini:gemini-2.5-pro`, `openrouter:anthropic/claude-sonnet-4`, `local:qwen-35b@http://localhost:9931/v1`, `offline`).
     #[arg(long, env = "ALLYH_MODEL")]
     pub model: Option<String>,
+
+    /// Reasoning effort level for reasoning-capable models (`low`, `medium`, or `high`).
+    #[arg(long, env = "ALLYH_REASONING_EFFORT", value_name = "LEVEL")]
+    pub reasoning_effort: Option<String>,
 
     /// Background local worker model spec (e.g. `local:qwen2.5-coder-9b@http://localhost:9931/v1`).
     #[arg(long, env = "ALLYH_WORKER_MODEL")]
@@ -230,8 +234,11 @@ pub enum SimCommand {
     /// Run source Recursive Self-Improvement (RSI) on an evaluation suite's disjoint evolve split.
     Evolve {
         /// Path to a JSON evaluation suite (`EvalSuiteSpec`).
-        #[arg(long)]
-        suite: PathBuf,
+        #[arg(long, conflicts_with = "preset")]
+        suite: Option<PathBuf>,
+        /// Built-in polyglot benchmark suite preset (`rust`, `typescript`, `python`, `go`, `polyglot`).
+        #[arg(long, conflicts_with = "suite")]
+        preset: Option<String>,
         /// Run arm label.
         #[arg(long, default_value = "source-rsi")]
         arm: String,
@@ -327,6 +334,23 @@ pub enum SimCommand {
     Use {
         /// Harness version ID prefix or label.
         version: String,
+    },
+    /// Generate a ready-to-run polyglot `EvalSuiteSpec` JSON preset (`rust`, `typescript`, `python`, `go`, `polyglot`).
+    Preset {
+        /// Preset language or `polyglot`.
+        lang: String,
+        /// Optional destination JSON file path (prints to stdout when omitted).
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+    },
+    /// Distill failed/recovered out-of-tree interactive sessions and task traces into SIM problem diagnoses.
+    Harvest {
+        /// Optional target SIM run ID or arm name (defaults to `session-harvest`).
+        #[arg(long)]
+        run: Option<String>,
+        /// Output machine-readable JSON report.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 }
 
@@ -791,6 +815,60 @@ mod tests {
             Some(CliCommand::Mcp(McpArgs {
                 action: McpCommand::Remove { ref name }
             })) if name == "github"
+        ));
+    }
+
+    #[test]
+    fn parses_reasoning_effort_and_sim_preset_harvest() {
+        let tui = CliArgs::try_parse_from([
+            "allyh",
+            "--model",
+            "gemini:gemini-2.5-pro",
+            "--reasoning-effort",
+            "high",
+        ])
+        .expect("parse reasoning effort");
+        assert_eq!(tui.model.as_deref(), Some("gemini:gemini-2.5-pro"));
+        assert_eq!(tui.reasoning_effort.as_deref(), Some("high"));
+
+        let preset = CliArgs::try_parse_from(["allyh", "sim", "preset", "typescript"])
+            .expect("parse sim preset");
+        assert!(matches!(
+            preset.command,
+            Some(CliCommand::Sim(SimArgs {
+                action: SimCommand::Preset { ref lang, out: None }
+            })) if lang == "typescript"
+        ));
+
+        let harvest = CliArgs::try_parse_from(["allyh", "sim", "harvest", "--json"])
+            .expect("parse sim harvest");
+        assert!(matches!(
+            harvest.command,
+            Some(CliCommand::Sim(SimArgs {
+                action: SimCommand::Harvest { run: None, json: true }
+            }))
+        ));
+
+        let evolve_preset = CliArgs::try_parse_from([
+            "allyh",
+            "sim",
+            "evolve",
+            "--preset",
+            "polyglot",
+            "--rounds",
+            "2",
+        ])
+        .expect("parse sim evolve --preset");
+        assert!(matches!(
+            evolve_preset.command,
+            Some(CliCommand::Sim(SimArgs {
+                action: SimCommand::Evolve {
+                    suite: None,
+                    preset: Some(ref p),
+                    rounds: 2,
+                    ..
+                }
+            })) if p == "polyglot"
         ));
     }
 }

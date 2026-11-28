@@ -25,7 +25,7 @@ async fn test_lancedb_bitemporal_isolation_and_task_gate() {
     let repo_a = compute_repo_id("/repos/alpha");
     let repo_b = compute_repo_id("/repos/beta");
 
-    // 1. Session persistence
+    // 1. Session persistence (including prompt-cache & cost telemetry)
     let session = SessionRecord {
         session_id: "sess-1".into(),
         repo_id: repo_a.clone(),
@@ -34,6 +34,11 @@ async fn test_lancedb_bitemporal_isolation_and_task_gate() {
         ended_at: None,
         rolling_summary: "Initialized workspace".into(),
         token_budget_used: 1200,
+        input_tokens: 18_500,
+        output_tokens: 1_250,
+        cached_input_tokens: 12_000,
+        cache_creation_tokens: 2_500,
+        estimated_cost_usd: 0.0425,
     };
     store.upsert_session(&session).await.expect("upsert session");
     let latest = store
@@ -42,6 +47,11 @@ async fn test_lancedb_bitemporal_isolation_and_task_gate() {
         .expect("latest")
         .expect("some session");
     assert_eq!(latest.session_id, "sess-1");
+    assert_eq!(latest.input_tokens, 18_500);
+    assert_eq!(latest.output_tokens, 1_250);
+    assert_eq!(latest.cached_input_tokens, 12_000);
+    assert_eq!(latest.cache_creation_tokens, 2_500);
+    assert!((latest.estimated_cost_usd - 0.0425).abs() < 1e-6);
 
     // 2. Write-gated bi-temporal consolidation
     let consolidator = MemoryConsolidator::new(store.clone(), Arc::new(HeuristicConflictJudge));

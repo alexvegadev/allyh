@@ -421,6 +421,22 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
             ink(TEXT),
         ),
     ]);
+    if area.width >= 96 && (info.session_input_tokens > 0 || info.session_cost_usd > 0.0) {
+        if info.session_input_tokens > 0 {
+            let pct = ((info.session_cached_tokens as f64 / info.session_input_tokens as f64)
+                .clamp(0.0, 1.0)
+                * 100.0)
+                .round() as u64;
+            stats.push_span(Span::styled(" Cache ", ink(MUTED)));
+            stats.push_span(Span::styled(format!("{pct}% "), ink(MINT)));
+        }
+        if info.session_cost_usd > 0.0 {
+            stats.push_span(Span::styled(
+                format!("${:.3} ", info.session_cost_usd),
+                ink(AMBER),
+            ));
+        }
+    }
     if area.width >= 72 {
         stats.push_span(Span::styled("  Worker ", ink(MUTED)));
         stats.push_span(Span::styled(
